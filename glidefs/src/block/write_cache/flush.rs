@@ -1619,62 +1619,15 @@ impl WriteCache<Active> {
                         break;
                     }
                     Err(e @ crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
-                        // Another writer moved the manifest. Distinguish a single-
-                        // attach FENCE (a strictly-newer composite token took the
-                        // volume — terminal) from a transient same-token race.
-                        let held = *self.inner.current_generation.lock();
-                        let held_lease = *self.inner.current_lease_revision.lock();
-                        let held_token =
-                            crate::block::fence::compose_token(held, held_lease);
-                        if held_token > 0 {
-                            match content_store.get_manifest(&self.inner.export_name).await {
-                                Ok(Some((data, _etag))) => {
-                                    if let Ok(s3_vm) =
-                                        crate::block::volume_manifest::VolumeManifest::deserialize(
-                                            &data,
-                                        )
-                                    {
-                                        let s3_token = crate::block::fence::compose_token(
-                                            s3_vm.generation,
-                                            s3_vm.lease_revision,
-                                        );
-                                        if s3_token > held_token {
-                                            // Superseded — we are fenced. Latch the
-                                            // flag so the write path rejects further
-                                            // guest writes, then return terminal so
-                                            // the scheduler stops. A strictly-newer
-                                            // composite covers BOTH a cross-node
-                                            // re-placement (higher generation) and a
-                                            // same-node re-fork (same generation,
-                                            // higher lease_revision).
-                                            self.inner.fenced.store(
-                                                true,
-                                                std::sync::atomic::Ordering::Release,
-                                            );
-                                            warn!(
-                                                export = %self.inner.export_name,
-                                                held,
-                                                held_lease,
-                                                superseded_by = s3_vm.generation,
-                                                superseded_by_lease = s3_vm.lease_revision,
-                                                "manifest sync FENCED: volume taken by a newer token"
-                                            );
-                                            return Err(CacheError::Fenced {
-                                                held,
-                                                superseded_by: s3_vm.generation,
-                                            });
-                                        }
-                                    }
-                                }
-                                // Couldn't read/parse S3 manifest — fall through to
-                                // the transient path (re-dirty + retry next cycle).
-                                Ok(None) | Err(_) => {}
-                            }
-                        }
-                        // Transient same-generation race (e.g. a concurrent flush).
-                        // Return Err: outer flush_dirty_inner re-dirties the SYNCING
-                        // blocks via flushing-file recovery and the next cycle retries.
-                        return Err(e.into());
+                        // Another writer moved the manifest. A strictly newer
+                        // token is a terminal FENCE; anything else is a
+                        // transient same-token race: return Err and the outer
+                        // flush_dirty_inner re-dirties the SYNCING blocks via
+                        // flushing-file recovery so the next cycle retries.
+                        return Err(self
+                            .fenced_by_newer_token(content_store)
+                            .await
+                            .unwrap_or_else(|| e.into()));
                     }
                     Err(e) => {
                         warn!(
@@ -1928,16 +1881,75 @@ impl WriteCache<Active> {
             // discoverable by cold readers.
             let manifest_bytes = volume_manifest.read().serialize()?;
             let expected_etag = self.inner.manifest_etag.lock().clone();
-            let new_etag = content_store
+            let new_etag = match content_store
                 .put_manifest(
                     &self.inner.export_name,
                     manifest_bytes,
                     expected_etag.as_deref(),
                 )
-                .await?;
+                .await
+            {
+                Ok(etag) => etag,
+                // The idle path (nothing dirty, nothing uploaded) reaches the
+                // manifest PUT without the atomic flush's fence check; classify
+                // here so an evacuated source's drain reports `Fenced`, not a
+                // raw ETag mismatch.
+                Err(e @ crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
+                    return Err(self
+                        .fenced_by_newer_token(content_store)
+                        .await
+                        .unwrap_or_else(|| e.into()));
+                }
+                Err(e) => return Err(e.into()),
+            };
             *self.inner.manifest_etag.lock() = new_etag;
         }
         Ok(stats)
+    }
+
+    /// After a manifest `PreconditionFailed`: is the S3 manifest owned by a
+    /// strictly newer composite fence token than the one this writer was
+    /// granted? If so latch `fenced` (the write path rejects further guest
+    /// writes) and return the terminal [`CacheError::Fenced`]. A strictly-newer
+    /// composite covers both a cross-node re-placement (higher generation) and
+    /// a same-node re-fork (same generation, higher lease_revision). `None`
+    /// means a transient same-token race (or an unreadable manifest): retry.
+    async fn fenced_by_newer_token(
+        &self,
+        content_store: &ContentStore,
+    ) -> Option<CacheError> {
+        let held = *self.inner.current_generation.lock();
+        let held_lease = *self.inner.current_lease_revision.lock();
+        let held_token = crate::block::fence::compose_token(held, held_lease);
+        if held_token == 0 {
+            return None;
+        }
+        let (data, _etag) = content_store
+            .get_manifest(&self.inner.export_name)
+            .await
+            .ok()
+            .flatten()?;
+        let s3_vm = crate::block::volume_manifest::VolumeManifest::deserialize(&data).ok()?;
+        let s3_token =
+            crate::block::fence::compose_token(s3_vm.generation, s3_vm.lease_revision);
+        if s3_token <= held_token {
+            return None;
+        }
+        self.inner
+            .fenced
+            .store(true, std::sync::atomic::Ordering::Release);
+        warn!(
+            export = %self.inner.export_name,
+            held,
+            held_lease,
+            superseded_by = s3_vm.generation,
+            superseded_by_lease = s3_vm.lease_revision,
+            "manifest sync FENCED: volume taken by a newer token"
+        );
+        Some(CacheError::Fenced {
+            held,
+            superseded_by: s3_vm.generation,
+        })
     }
 
     /// Take a point-in-time snapshot.

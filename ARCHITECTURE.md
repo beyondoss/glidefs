@@ -741,7 +741,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
 | `/api/exports/{name}/tag` | `POST` | Publish current manifest under a named alias without re-flushing. Body: `{"tag":"name"}`. |
 | `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check manifest existence (200/404). No data transfer, no running export required. |
-| `/api/exports/{name}/drain` | `POST` | Flush all dirty blocks to S3 (no versioned snapshot) |
+| `/api/exports/{name}/drain` | `POST` | Flush all dirty blocks to S3 (no versioned snapshot). Returns **409 Conflict** (`superseded: …`) when a newer fence token owns the volume (an evacuated source, a partitioned predecessor): nothing is written and nothing is retried; release the export with a retaining `DELETE` (no `?purge`), which abandons its teardown drain instead of retrying it. |
 | `/api/exports/{name}/promote` | `POST` | Toggle readonly → read-write |
 | `/api/exports/{name}/promote-base` | `POST` | Publish a snapshot's manifest under `bases/{base_name}` (no data re-upload) and register it in the image index. Body: `{"base_name":"...","sequence":N}`. Idempotent; the promoted base is forkable (`from: "image:<base_name>"`) and profileable like a blessed one. |
 | `/api/profile/{s3_prefix}/{name}` | `POST` | Start a background boot-set profile of `bases/{name}` (202). Body (all optional): `{"cmd","seed_paths","fs_type","runs","timeout_secs","force","untrusted","max_blocks"}`. `seed_paths` are faulted under the tracer before the entrypoint. 503 when the server has no `[profile]` config. |
