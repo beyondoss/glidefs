@@ -122,6 +122,7 @@ mod blktests {
             "block/008", // needs CPU hotplug (unavailable in CI VMs)
             "block/039", // needs null_blk kernel module
             "block/047", // needs null_blk kernel module
+            "block/046", // own in-kernel device (results/nodev); preadv EINVAL on runner kernel 7.0 — TODO #102
         ];
 
         // Stream subprocess output line-by-line instead of capturing the

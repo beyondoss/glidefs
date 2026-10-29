@@ -231,7 +231,8 @@ jobs:
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available"
-          sudo modprobe ublk_drv || echo "ublk_drv not available"
+          sudo modprobe ublk_drv
+          [ -e /dev/ublk-control ] || { echo "::error::/dev/ublk-control missing after modprobe ublk_drv"; exit 1; }
       - name: Install ublk udev rule
         run: |
           sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
@@ -334,7 +335,10 @@ jobs:
           sudo depmod -a
       - name: Load kernel modules
         run: |
-          sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+          # The transport under test: its tests skip silently without the device, so a missing
+          # module fails the job instead.
+          sudo modprobe ublk_drv
+          [ -e /dev/ublk-control ] || { echo "::error::/dev/ublk-control missing after modprobe ublk_drv"; exit 1; }
       - name: Install ublk udev rule
         run: |
           sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
