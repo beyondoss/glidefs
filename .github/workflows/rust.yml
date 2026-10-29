@@ -145,7 +145,9 @@ jobs:
       - name: Install kernel modules + build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
+          sudo apt-get install -y build-essential fio
+          # A runner kernel newer than the archive has no modules-extra package yet; its own modules are used.
+          sudo apt-get install -y linux-modules-extra-$(uname -r) || echo "no linux-modules-extra-$(uname -r); using the kernel's own modules"
       - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # linux-azure 6.17.0-1015 has a backport-order regression:
         # ublk_ctrl_add_dev() calls ublk_init_queues() *before*
@@ -172,9 +174,11 @@ jobs:
           uname -r
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
           if [ ! -f "$KO_SRC" ]; then
-            echo "module not at $KO_SRC — modules-extra not installed?"
-            ls /lib/modules/$(uname -r)/kernel/drivers/block/
-            exit 1
+            # The patch is for 6.17.0-1015's ublk_drv only; a kernel with ublk elsewhere
+            # (built in, another path or compression) is not affected.
+            echo "module not at $KO_SRC — kernel not affected, skipping"
+            modinfo ublk_drv || true
+            exit 0
           fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
@@ -227,7 +231,8 @@ jobs:
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available"
-          sudo modprobe ublk_drv || echo "ublk_drv not available"
+          sudo modprobe ublk_drv
+          [ -e /dev/ublk-control ] || { echo "::error::/dev/ublk-control missing after modprobe ublk_drv"; exit 1; }
       - name: Install ublk udev rule
         run: |
           sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
@@ -268,16 +273,20 @@ jobs:
       - name: Install kernel modules + fio
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+          sudo apt-get install -y fio
+          # A runner kernel newer than the archive has no modules-extra package yet; its own modules are used.
+          sudo apt-get install -y linux-modules-extra-$(uname -r) || echo "no linux-modules-extra-$(uname -r); using the kernel's own modules"
       - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           uname -r
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
           if [ ! -f "$KO_SRC" ]; then
-            echo "module not at $KO_SRC — modules-extra not installed?"
-            ls /lib/modules/$(uname -r)/kernel/drivers/block/
-            exit 1
+            # The patch is for 6.17.0-1015's ublk_drv only; a kernel with ublk elsewhere
+            # (built in, another path or compression) is not affected.
+            echo "module not at $KO_SRC — kernel not affected, skipping"
+            modinfo ublk_drv || true
+            exit 0
           fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
@@ -326,7 +335,10 @@ jobs:
           sudo depmod -a
       - name: Load kernel modules
         run: |
-          sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+          # The transport under test: its tests skip silently without the device, so a missing
+          # module fails the job instead.
+          sudo modprobe ublk_drv
+          [ -e /dev/ublk-control ] || { echo "::error::/dev/ublk-control missing after modprobe ublk_drv"; exit 1; }
       - name: Install ublk udev rule
         run: |
           sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
@@ -373,16 +385,20 @@ jobs:
       - name: Install kernel modules + fio
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+          sudo apt-get install -y fio
+          # A runner kernel newer than the archive has no modules-extra package yet; its own modules are used.
+          sudo apt-get install -y linux-modules-extra-$(uname -r) || echo "no linux-modules-extra-$(uname -r); using the kernel's own modules"
       - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           uname -r
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
           if [ ! -f "$KO_SRC" ]; then
-            echo "module not at $KO_SRC — modules-extra not installed?"
-            ls /lib/modules/$(uname -r)/kernel/drivers/block/
-            exit 1
+            # The patch is for 6.17.0-1015's ublk_drv only; a kernel with ublk elsewhere
+            # (built in, another path or compression) is not affected.
+            echo "module not at $KO_SRC — kernel not affected, skipping"
+            modinfo ublk_drv || true
+            exit 0
           fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
