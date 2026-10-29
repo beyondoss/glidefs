@@ -172,10 +172,6 @@ jobs:
         # Drop when Ubuntu ships 6.17.0-1016+ with the call-order fix.
         run: |
           uname -r
-          case "$(uname -r)" in
-            6.17.0-1015-*) ;;
-            *) echo "not 6.17.0-1015 (the regression); ublk_drv is left as shipped"; exit 0 ;;
-          esac
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
           if [ ! -f "$KO_SRC" ]; then
             # The patch is for 6.17.0-1015's ublk_drv only; a kernel with ublk elsewhere
@@ -284,10 +280,6 @@ jobs:
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           uname -r
-          case "$(uname -r)" in
-            6.17.0-1015-*) ;;
-            *) echo "not 6.17.0-1015 (the regression); ublk_drv is left as shipped"; exit 0 ;;
-          esac
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
           if [ ! -f "$KO_SRC" ]; then
             # The patch is for 6.17.0-1015's ublk_drv only; a kernel with ublk elsewhere
@@ -400,10 +392,6 @@ jobs:
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           uname -r
-          case "$(uname -r)" in
-            6.17.0-1015-*) ;;
-            *) echo "not 6.17.0-1015 (the regression); ublk_drv is left as shipped"; exit 0 ;;
-          esac
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
           if [ ! -f "$KO_SRC" ]; then
             # The patch is for 6.17.0-1015's ublk_drv only; a kernel with ublk elsewhere
