@@ -2753,7 +2753,16 @@ impl ExportRouter {
         };
         cs.delete_snapshot(name, sequence)
             .await
-            .map_err(RouterError::ContentStore)
+            .map_err(RouterError::ContentStore)?;
+        // The logical index entry written at snapshot time goes with the snapshot; nothing else
+        // ever removes it, and it would otherwise outlive the snapshot and its volume forever.
+        // Idempotent: a missing entry is success, any other failure is returned so the caller
+        // retries the whole (idempotent) delete.
+        let path = self.index_snapshot_path(&crate::block::registry::snapshot_id(name, sequence));
+        match self.object_store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get info for a single export.
@@ -4748,6 +4757,32 @@ mod tests {
 
         let snap = result.unwrap();
         assert!(snap.sequence > 0, "Snapshot sequence should be > 0");
+    }
+
+    #[tokio::test]
+    async fn test_delete_snapshot_removes_its_index_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        router
+            .create_export(test_export_config("snap-idx"), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("snap-idx").await.unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
+        let snap = router.snapshot_export("snap-idx", None).await.unwrap();
+        let id = crate::block::registry::snapshot_id("snap-idx", snap.sequence);
+        assert!(
+            router.load_snapshot_entry(&id).await.unwrap().is_some(),
+            "the snapshot's index entry exists"
+        );
+
+        router.delete_export_snapshot("snap-idx", snap.sequence).await.unwrap();
+        assert!(
+            router.load_snapshot_entry(&id).await.unwrap().is_none(),
+            "deleting the snapshot deletes its index entry"
+        );
+        // Idempotent.
+        router.delete_export_snapshot("snap-idx", snap.sequence).await.unwrap();
     }
 
     #[tokio::test]
