@@ -149,6 +149,15 @@ pub enum RouterError {
         max: usize,
     },
 
+    /// The ublk server holds as many devices as it can give queues to. The export was not created
+    /// with a device; nothing a retry on this node can fix until a device is deleted.
+    #[error("ublk device capacity reached for '{name}': {devices} of {capacity} devices")]
+    DeviceCapacity {
+        name: String,
+        devices: usize,
+        capacity: usize,
+    },
+
     #[error("Invalid `from` ref: {0}")]
     InvalidFromRef(String),
 
@@ -267,6 +276,10 @@ pub struct AggregateStats {
     pub total_cache_misses: u64,
     pub total_dirty_bytes: u64,
     pub exports_count: usize,
+    /// ublk devices registered now, and the most this node can hold (`None`: no device-bearing
+    /// transport, or nothing bounds it). instd refuses to bid at the cap.
+    pub ublk_devices: usize,
+    pub ublk_device_capacity: Option<usize>,
 }
 
 /// Response from a snapshot operation.
@@ -374,6 +387,8 @@ pub struct RouterConfig {
     /// Number of ublk I/O queues per device (Linux + ublk feature only).
     #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
     pub ublk_nr_queues: u16,
+    /// Operator ceiling on ublk devices (`[servers.ublk] max_devices`); lowers the derived capacity.
+    pub ublk_max_devices: Option<usize>,
     /// Dead connection timeout for NBD netlink devices (seconds).
     /// Enables kernel-side I/O queueing during restarts. 0 = disabled.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -765,6 +780,7 @@ impl ExportRouter {
         let ublk_server = tokio::sync::Mutex::new(
             crate::block::ublk::UblkServer::new()
                 .with_nr_queues(config.ublk_nr_queues)
+                .with_max_devices(config.ublk_max_devices)
                 .with_cache_dir(config.cache_dir.clone()),
         );
 
@@ -2912,10 +2928,16 @@ impl ExportRouter {
                     .await
                     .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
                 let mut ublk = self.ublk_server.lock().await;
-                let path = ublk
-                    .add_device(name, handler)
-                    .await
-                    .map_err(|e| RouterError::Io(std::io::Error::other(e)))?;
+                let path = ublk.add_device(name, handler).await.map_err(|e| {
+                    match e.downcast_ref::<crate::block::ublk::DeviceCapacity>() {
+                        Some(c) => RouterError::DeviceCapacity {
+                            name: name.to_string(),
+                            devices: c.devices,
+                            capacity: c.capacity,
+                        },
+                        None => RouterError::Io(std::io::Error::other(e)),
+                    }
+                })?;
                 info!(export = %name, path = %path.display(), "ublk device registered");
                 Ok(())
             }
@@ -3122,6 +3144,17 @@ impl ExportRouter {
             CircuitState::HalfOpen { .. } => 2,
         };
 
+        #[cfg(all(target_os = "linux", feature = "ublk"))]
+        let (ublk_devices, ublk_device_capacity) = {
+            let ublk = self.ublk_server.lock().await;
+            (
+                ublk.device_count(),
+                Some(ublk.device_capacity().map_or(self.max_exports, |c| c.min(self.max_exports))),
+            )
+        };
+        #[cfg(not(all(target_os = "linux", feature = "ublk")))]
+        let (ublk_devices, ublk_device_capacity) = (0, None);
+
         AggregateStats {
             ssd_utilization: self.ssd_utilization(),
             s3_circuit_state,
@@ -3129,6 +3162,8 @@ impl ExportRouter {
             total_cache_misses,
             total_dirty_bytes,
             exports_count: self.exports.len(),
+            ublk_devices,
+            ublk_device_capacity,
         }
     }
 
@@ -3792,6 +3827,7 @@ impl ExportRouter {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -3965,6 +4001,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 2,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -4052,6 +4089,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -5844,6 +5882,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -5884,6 +5923,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -5935,6 +5975,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -5968,6 +6009,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
@@ -6081,6 +6123,7 @@ mod tests {
             max_s3_downloads: 0,
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,

@@ -43,6 +43,10 @@ impl Settings {
     /// looked at #2, silently ignoring `[servers.ublk]`. The bench at
     /// M4 surfaced this — the daemon registered every ublk export with
     /// `queues=1` despite `glidefs.toml` declaring `nr_queues = 4`.
+    pub fn ublk_max_devices(&self) -> Option<usize> {
+        self.servers.ublk.as_ref().and_then(|u| u.max_devices)
+    }
+
     pub fn ublk_nr_queues(&self) -> u16 {
         if let Some(ublk_cfg) = self.servers.ublk.as_ref()
             && let Some(n) = ublk_cfg.nr_queues {
@@ -268,6 +272,10 @@ pub struct UblkConfig {
     /// Higher values improve parallelism on multi-core hosts.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub nr_queues: Option<u16>,
+    /// Ceiling on ublk devices this daemon will create. The daemon derives what its zero-copy workers
+    /// can hold (`workers * 256 / nr_queues`); this can only lower that. Absent: the derived number.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_devices: Option<usize>,
 }
 
 impl UblkConfig {

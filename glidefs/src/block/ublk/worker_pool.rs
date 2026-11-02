@@ -361,6 +361,11 @@ impl WorkerPool {
         Ok(Self { nodes, topology, zc })
     }
 
+    /// Zero-copy queues the host can hold (`K * ZC_MAX_QUEUES`).
+    pub(super) fn zc_queue_capacity(&self) -> usize {
+        self.zc.queue_capacity()
+    }
+
     pub(super) fn num_workers(&self) -> usize {
         self.nodes.iter().map(|n| n.len()).sum()
     }

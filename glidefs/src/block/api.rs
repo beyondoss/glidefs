@@ -295,6 +295,22 @@ fn empty_response(status: StatusCode) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// The response for an export whose device could not be registered: 507 `ublk_capacity` when the
+/// ublk server is full (the caller should place the export elsewhere), 500 for any other failure.
+#[cfg(target_os = "linux")]
+fn device_error_response(name: &str, e: &RouterError) -> Response<BoxBody> {
+    match e {
+        RouterError::DeviceCapacity { .. } => error_response(
+            StatusCode::INSUFFICIENT_STORAGE,
+            &format!("ublk_capacity: {e}"),
+        ),
+        _ => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("device registration failed for '{name}': {e}"),
+        ),
+    }
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     json_response(status, &ApiResponse::error(message))
 }
@@ -413,6 +429,7 @@ async fn create_or_attach_volume(
                     #[cfg(target_os = "linux")]
                     if let Err(e) = router.register_device(name, transport).await {
                         warn!(export = %name, error = %e, "device re-registration after resize failed");
+                        return device_error_response(name, &e);
                     }
                     let _ = transport;
                     match router.get_export_info(name).await {
@@ -553,9 +570,12 @@ async fn create_or_attach_volume(
                     ),
                 );
             }
+            // An export without its device is unusable and a retry would hit the idempotency check
+            // above: tear it down and say why, never answer 201 with no device.
             #[cfg(target_os = "linux")]
             if let Err(e) = register_result {
-                warn!(export = %name, error = %e, "device registration failed");
+                router.cleanup_failed_create(name, &transport).await;
+                return device_error_response(name, &e);
             }
             let _ = transport;
 
@@ -1641,6 +1661,7 @@ mod tests {
                 max_s3_downloads: 0,
                 default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
+                ublk_max_devices: None,
                 nbd_dead_conn_timeout: 0,
                 max_exports: 10_000,
                 manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
@@ -2341,6 +2362,7 @@ mod tests {
                 max_s3_downloads: 0,
                 default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
+                ublk_max_devices: None,
                 nbd_dead_conn_timeout: 0,
                 max_exports: 10_000,
                 manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
@@ -2408,6 +2430,117 @@ mod tests {
         // Confirm the export now exists in-memory.
         let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The mapping a full ublk server takes to the wire: 507 `ublk_capacity`, and any other
+    /// registration failure a 500. Neither is ever a 201.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_registration_failures_are_never_a_created() {
+        let full = RouterError::DeviceCapacity { name: "v".into(), devices: 4, capacity: 4 };
+        assert_eq!(device_error_response("v", &full).status(), StatusCode::INSUFFICIENT_STORAGE);
+        let other = RouterError::Io(std::io::Error::other("boom"));
+        assert_eq!(device_error_response("v", &other).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A full ublk server fails the PUT with 507 and leaves nothing behind: no deviceless export,
+    /// stats at the cap, and a delete frees a slot. Needs root and /dev/ublk-control; fails (never
+    /// skips) without them. Run: `sudo -E cargo test -p glidefs --lib ublk_capacity -- --ignored`.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs root and /dev/ublk-control"]
+    async fn ublk_capacity_is_a_507_not_a_deviceless_201() {
+        assert!(
+            ExportRouter::device_available("ublk") && std::fs::File::open("/dev/ublk-control").is_ok(),
+            "needs root and /dev/ublk-control"
+        );
+        let temp = TempDir::new().unwrap();
+        let s3: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let router = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: s3,
+                db_path: "test".to_string(),
+                cache_dir: temp.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+                pack_index_cache: None,
+                wal_sync: false,
+                max_s3_uploads: 0,
+                max_s3_downloads: 0,
+                default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+                ublk_nr_queues: 1,
+                ublk_max_devices: Some(UBLK_CAP),
+                nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
+                manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+                profile: None,
+            })
+            .await
+            .unwrap(),
+        );
+        // A failed assertion must not strand kernel devices (user-recovery parks them), so the
+        // checks run in a task and every export is deleted whatever they did.
+        let checks = tokio::spawn(ublk_capacity_checks(Arc::clone(&router)));
+        let result = checks.await;
+        for i in 0..=UBLK_CAP {
+            request(&router, Method::DELETE, &format!("/api/exports/cap-{i}"), None).await;
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    const UBLK_CAP: usize = 16;
+
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    async fn ublk_capacity_checks(router: Arc<ExportRouter>) {
+        const CAP: usize = UBLK_CAP;
+        const TRIES: usize = CAP + 4;
+        let put = |i: usize| {
+            let router = Arc::clone(&router);
+            async move {
+                request(
+                    &router,
+                    Method::PUT,
+                    &format!("/api/exports/cap-{i}"),
+                    Some(r#"{"size_gb": 0.01, "transport": "ublk"}"#),
+                )
+                .await
+            }
+        };
+        let mut created = 0;
+        for i in 0..TRIES {
+            let resp = put(i).await;
+            let status = resp.status();
+            let body = body_json(resp).await;
+            if i < CAP {
+                assert_eq!(status, StatusCode::CREATED, "export {i}: {body}");
+                let dev = body["device"].as_str().unwrap_or_default();
+                assert!(dev.starts_with("/dev/ublkb"), "export {i} created without a device: {body}");
+                created += 1;
+            } else {
+                assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "export {i} past the cap: {body}");
+                assert!(body["error"].as_str().unwrap().starts_with("ublk_capacity"), "{body}");
+            }
+        }
+        assert_eq!(created, CAP);
+
+        let listed = body_json(request(&router, Method::GET, "/api/exports", None).await).await;
+        assert_eq!(listed["exports"].as_array().unwrap().len(), CAP, "refused exports must not stay registered");
+        let stats = body_json(request(&router, Method::GET, "/api/stats", None).await).await;
+        assert_eq!(stats["ublk_devices"], CAP);
+        assert_eq!(stats["ublk_device_capacity"], CAP);
+
+        // Free one: the next PUT, which was refused before, now gets a device.
+        let resp = request(&router, Method::DELETE, "/api/exports/cap-0", None).await;
+        assert!(resp.status().is_success(), "{}", resp.status());
+        let resp = put(CAP).await;
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body["device"].as_str().unwrap_or_default().starts_with("/dev/ublkb"), "{body}");
     }
 
     #[tokio::test]

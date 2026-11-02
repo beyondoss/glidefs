@@ -61,6 +61,7 @@ mod fio_bench {
                     // and OOMs the 4 GiB QEMU VM.
                     default_flush_threshold: 0,
                     ublk_nr_queues: 4,
+                    ublk_max_devices: None,
                     nbd_dead_conn_timeout: 0,
                     max_exports: 10_000,
                     manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
