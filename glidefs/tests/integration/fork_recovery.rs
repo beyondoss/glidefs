@@ -42,6 +42,7 @@ async fn router(cache_dir: &Path, s3: Arc<dyn ObjectStore>) -> ExportRouter {
         // "crash" below happens with the fork's writes still only in the WAL.
         default_flush_threshold: 0,
         ublk_nr_queues: 1,
+        ublk_max_devices: None,
         nbd_dead_conn_timeout: 0,
         max_exports: 100,
         manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,

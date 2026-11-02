@@ -236,6 +236,7 @@ async fn create_test_router(
             max_s3_downloads: 0,
             default_flush_threshold: 500,
             ublk_nr_queues: 1,
+            ublk_max_devices: None,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,

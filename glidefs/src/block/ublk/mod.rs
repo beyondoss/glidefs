@@ -68,6 +68,16 @@ struct ProbedDev {
     nr_queues: u16,
 }
 
+/// The server holds as many devices as it can give queues to. Returned (inside the `anyhow::Error`
+/// from [`UblkServer::add_device`]) before any kernel device exists, so a caller can tell "full"
+/// from "failed" with `downcast_ref`.
+#[derive(Debug, thiserror::Error)]
+#[error("ublk device capacity reached: {devices} of {capacity} devices")]
+pub struct DeviceCapacity {
+    pub devices: usize,
+    pub capacity: usize,
+}
+
 /// Manages ublk devices for exports.
 ///
 /// Each export gets its own `/dev/ublkbN` device. The caller provides
@@ -75,6 +85,8 @@ struct ProbedDev {
 /// that dispatch to the handler.
 pub struct UblkServer {
     nr_queues: u16,
+    /// Operator ceiling on devices (`[servers.ublk] max_devices`); can only lower the derived capacity.
+    max_devices: Option<usize>,
     features: KernelFeatures,
     devices: HashMap<String, device::UblkDevice>,
     /// Directory for persisting device ID mapping (enables stable device paths).
@@ -128,6 +140,7 @@ impl UblkServer {
             .expect("failed to spawn ublk worker pool");
         Self {
             nr_queues: DEFAULT_NR_QUEUES,
+            max_devices: None,
             features,
             devices: HashMap::new(),
             cache_dir: None,
@@ -157,6 +170,31 @@ impl UblkServer {
     pub fn with_nr_queues(mut self, nr_queues: u16) -> Self {
         self.nr_queues = nr_queues;
         self
+    }
+
+    /// Lower the device capacity to at most `max_devices` (never raises it).
+    pub fn with_max_devices(mut self, max_devices: Option<usize>) -> Self {
+        self.max_devices = max_devices;
+        self
+    }
+
+    /// Devices this server can hold, or `None` when nothing but the host bounds it. On the zero-copy
+    /// transport every queue takes a slot on a ZC worker's ring (`K * ZC_MAX_QUEUES` in all), so the
+    /// pool holds `queues / nr_queues` devices; `max_devices` can only lower that.
+    pub fn device_capacity(&self) -> Option<usize> {
+        let zc = self
+            .features
+            .zero_copy
+            .then(|| self.pool.zc_queue_capacity() / usize::from(self.nr_queues.max(1)));
+        match (zc, self.max_devices) {
+            (Some(z), Some(m)) => Some(z.min(m)),
+            (z, m) => z.or(m),
+        }
+    }
+
+    /// Devices currently registered.
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
     }
 
     /// Set the cache directory for persisting device ID mappings.
@@ -266,6 +304,11 @@ impl UblkServer {
                 "ublk device for export '{}' already registered",
                 export_name
             );
+        }
+        if let Some(capacity) = self.device_capacity()
+            && self.devices.len() >= capacity
+        {
+            return Err(DeviceCapacity { devices: self.devices.len(), capacity }.into());
         }
 
         let preferred_id = self.load_persisted_indices()

@@ -156,6 +156,7 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             max_s3_downloads: nbd_config.max_s3_downloads(),
             default_flush_threshold: nbd_config.flush_threshold(),
             ublk_nr_queues: settings.ublk_nr_queues(),
+            ublk_max_devices: settings.ublk_max_devices(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
             max_exports: nbd_config.max_exports(),
             manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,

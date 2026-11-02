@@ -92,6 +92,11 @@ impl ZcPool {
         self
     }
 
+    /// Queues the whole pool can host: every worker's ring table full.
+    pub(super) fn queue_capacity(&self) -> usize {
+        self.slots.len() * self.max_queues
+    }
+
     /// Workers that have been started (threads that exist).
     #[cfg(test)]
     pub(super) fn started_workers(&self) -> usize {

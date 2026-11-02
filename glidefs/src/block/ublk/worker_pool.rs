@@ -361,6 +361,11 @@ impl WorkerPool {
         Ok(Self { nodes, topology, zc })
     }
 
+    /// Zero-copy queues the host can hold (`K * ZC_MAX_QUEUES`).
+    pub(super) fn zc_queue_capacity(&self) -> usize {
+        self.zc.queue_capacity()
+    }
+
     pub(super) fn num_workers(&self) -> usize {
         self.nodes.iter().map(|n| n.len()).sum()
     }
@@ -1453,8 +1458,9 @@ mod tests {
             return;
         }
         const WORKERS: usize = 4;
-        // The kernel's `ublks_max` defaults to 64 devices host-wide; leave
-        // room for whatever else is running.
+        // Keep the test well under the pool's capacity and leave room for
+        // whatever else is running (the kernel's `ublks_max` bounds only
+        // unprivileged devices; glidefs runs as root).
         const LARGE: usize = 40;
         let (small, small_iowq) = zc_thread_cost(8, WORKERS).await;
         let (large, large_iowq) = zc_thread_cost(LARGE, WORKERS).await;

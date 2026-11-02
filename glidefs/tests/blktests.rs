@@ -221,6 +221,7 @@ mod blktests {
                     max_s3_downloads: 512,
                     default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                     ublk_nr_queues: 4,
+                    ublk_max_devices: None,
                     nbd_dead_conn_timeout: 0,
                     max_exports: 10_000,
                     manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
