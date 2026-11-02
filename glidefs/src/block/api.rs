@@ -429,7 +429,9 @@ async fn create_or_attach_volume(
                     #[cfg(target_os = "linux")]
                     if let Err(e) = router.register_device(name, transport).await {
                         warn!(export = %name, error = %e, "device re-registration after resize failed");
-                        return device_error_response(name, &e);
+                        if transport == "ublk" {
+                            return device_error_response(name, &e);
+                        }
                     }
                     let _ = transport;
                     match router.get_export_info(name).await {
@@ -570,12 +572,17 @@ async fn create_or_attach_volume(
                     ),
                 );
             }
-            // An export without its device is unusable and a retry would hit the idempotency check
+            // A ublk export without its device is unusable and a retry would hit the idempotency check
             // above: tear it down and say why, never answer 201 with no device.
             #[cfg(target_os = "linux")]
             if let Err(e) = register_result {
-                router.cleanup_failed_create(name, &transport).await;
-                return device_error_response(name, &e);
+                // NBD exports are also served over TCP, so a missing /dev/nbdN is not a failure;
+                // a ublk export exists only as its device.
+                if transport == "ublk" {
+                    router.cleanup_failed_create(name, &transport).await;
+                    return device_error_response(name, &e);
+                }
+                warn!(export = %name, error = %e, "device registration failed");
             }
             let _ = transport;
 
