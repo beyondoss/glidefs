@@ -1684,7 +1684,26 @@ impl ExportRouter {
             info!("Export '{}' created from manifest (fork)", name);
             (Arc::new(cache), volume_manifest)
         } else {
-            // Normal path: open cache, recover from WAL
+            // Normal path: open cache, recover from WAL.
+            //
+            // The persisted manifest, not `export.json`, knows the device's size: a fork is at least as
+            // large as its base whatever size was requested, and `export.json` written before the
+            // effective size was recorded still says the request. Opening the cache at the smaller
+            // size is refused ("Cannot shrink device"), which failed the export's recovery and so
+            // every restart and handoff. Take the larger.
+            let persisted = content_store.get_manifest(&name).await;
+            if let Ok(Some((data, _))) = &persisted
+                && let Ok(vm) = VolumeManifest::deserialize(data)
+                && vm.size > device_size
+            {
+                warn!(
+                    "Export '{}': export.json says {:.1} GB but its manifest is {:.1} GB; recovering at the manifest's size",
+                    name,
+                    device_size as f64 / 1e9,
+                    vm.size as f64 / 1e9,
+                );
+                device_size = vm.size;
+            }
             let cache_config = WriteCacheConfig {
                 cache_dir: self.cache_dir.clone(),
                 device_name: name.clone(),
@@ -1705,7 +1724,7 @@ impl ExportRouter {
             // cause the first sync_manifest to unconditionally overwrite the
             // real manifest (manifest_etag would be None), permanently losing
             // all previously-flushed block references.
-            let volume_manifest = match content_store.get_manifest(&name).await {
+            let volume_manifest = match persisted {
                 Ok(Some((data, etag))) => {
                     let vm = VolumeManifest::deserialize(&data).map_err(|e| {
                         RouterError::Manifest(format!(
