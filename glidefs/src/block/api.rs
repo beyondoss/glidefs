@@ -548,16 +548,23 @@ async fn create_or_attach_volume(
                 }
             }
 
+            // export.json records the size the export really has: a fork is at least as large as its
+            // base whatever size_gb asked for, and recovery reopens the cache at the recorded size.
+            let mut effective = config.clone();
+            if let Some(h) = router.get_handler(name).await {
+                effective.size_gb = h.device_size() as f64 / 1_073_741_824.0;
+            }
+
             // Persist the index entry and register the device concurrently.
             // save_export MUST succeed; register_device is best-effort.
             let t_io = Instant::now();
             #[cfg(target_os = "linux")]
             let (save_result, register_result) = tokio::join!(
-                router.save_export(&config),
+                router.save_export(&effective),
                 router.register_device(name, &transport),
             );
             #[cfg(not(target_os = "linux"))]
-            let save_result = router.save_export(&config).await;
+            let save_result = router.save_export(&effective).await;
 
             if let Err(e) = save_result {
                 // Without teardown, the in-memory entry silently shadows the
@@ -3031,6 +3038,90 @@ mod tests {
         // vm1 was placed in the image's pool (CoW sharing) and records lineage.
         let resp = request(&router, Method::GET, "/api/resolve/vm1", None).await;
         assert_eq!(body_json(resp).await["s3_prefix"], "golden");
+    }
+
+    /// A fork is at least as large as its base whatever size_gb asked for. export.json must record the
+    /// size the export really has, and recovery of an export.json that still says the request (written
+    /// before this) must open the cache at the manifest's size, not refuse with "Cannot shrink device":
+    /// that refusal failed the export's recovery on every restart and handoff.
+    #[tokio::test]
+    async fn test_fork_smaller_than_base_records_effective_size_and_recovers() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let mk = || {
+            let store = Arc::clone(&store);
+            let dir = temp.path().to_path_buf();
+            async move {
+                Arc::new(
+                    ExportRouter::new(RouterConfig {
+                        object_store: store,
+                        db_path: "test".to_string(),
+                        cache_dir: dir,
+                        block_size: 128 * 1024,
+                        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+                        pack_index_cache: None,
+                        wal_sync: false,
+                        max_s3_uploads: 0,
+                        max_s3_downloads: 0,
+                        default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+                        ublk_nr_queues: 1,
+                        ublk_max_devices: None,
+                        nbd_dead_conn_timeout: 0,
+                        max_exports: 10_000,
+                        manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+                        profile: None,
+                    })
+                    .await
+                    .unwrap(),
+                )
+            }
+        };
+        let r1 = mk().await;
+        request(&r1, Method::PUT, "/api/exports/golden", Some(r#"{"size_gb": 0.1}"#)).await;
+        let resp = request(&r1, Method::POST, "/api/exports/golden/snapshot", None).await;
+        let seq = body_json(resp).await["sequence"].as_u64().unwrap();
+        let resp = request(
+            &r1,
+            Method::POST,
+            "/api/exports/golden/promote-base",
+            Some(&format!(r#"{{"sequence": {seq}, "base_name": "ubuntu"}}"#)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = request(
+            &r1,
+            Method::PUT,
+            "/api/exports/vm1",
+            Some(r#"{"size_gb": 0.01, "from": "image:ubuntu"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let recorded = r1
+            .discover_exports()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "vm1")
+            .expect("vm1's export.json");
+        assert!(
+            recorded.size_gb >= 0.0999,
+            "export.json must record the 0.1 GB the fork really has, not the 0.01 requested: {}",
+            recorded.size_gb
+        );
+
+        // An export.json from before the fix: the request, not the size.
+        let mut legacy = recorded.clone();
+        legacy.size_gb = 0.01;
+        r1.save_export(&legacy).await.unwrap();
+        r1.shutdown().await.unwrap();
+        drop(r1);
+
+        let r2 = mk().await;
+        r2.create_export(legacy, false, None, None)
+            .await
+            .expect("recovery must open the cache at the manifest's size");
     }
 
     #[tokio::test]
