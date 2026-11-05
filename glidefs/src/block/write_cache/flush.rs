@@ -740,28 +740,64 @@ impl WriteCache<Active> {
     pub async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
-            // Always save the block-state metadata file — it's the
-            // canonical record of what's PRESENT/DIRTY/SYNCING.
-            inner.save_block_states()?;
-
-            // Skip WAL truncate during the handoff freeze window —
+            // One checkpoint at a time, snapshot through truncate (see `ckpt_lock`).
+            let _ck = inner.ckpt_lock.lock();
+            let handoff_active = || {
+                super::inner::HandoffPhase::from_u8(
+                    inner.handoff_phase.load(std::sync::atomic::Ordering::Acquire),
+                )
+                .is_active()
+            };
+            // Skip the WAL truncate during the handoff freeze window —
             // the successor's `replay_wal_tail` reads the same WAL
             // the predecessor was appending into. If we truncate
             // here while the successor is in WARMING/CUTOVER, any
             // entry the predecessor has acked since the successor's
             // WARMING-time open vanishes from the WAL.
-            if super::inner::HandoffPhase::from_u8(
-                inner
-                    .handoff_phase
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
-            .is_active()
-            {
+            if handoff_active() {
+                // Always save the block-state metadata file — it's the
+                // canonical record of what's PRESENT/DIRTY/SYNCING.
+                inner.save_block_states()?;
                 debug!("checkpoint: skipping WAL truncate (handoff in progress)");
                 return Ok(());
             }
-            inner.wal.truncate()?;
-            debug!("checkpoint complete");
+
+            // The snapshot covers WAL entries with seq <= the sequence it
+            // persisted (a writer marks DIRTY before taking its sequence).
+            // The WAL may be truncated only if nothing was appended after
+            // that sequence, else the truncate would erase the dirty mark of
+            // a block the snapshot saw as clean. After CKPT_MAX_SKIPS skipped
+            // checkpoints, hold the WAL guard across the snapshot instead:
+            // appends wait one metadata fsync, and the WAL stays bounded.
+            if inner.ckpt_skips.load(std::sync::atomic::Ordering::Relaxed)
+                >= super::inner::CKPT_MAX_SKIPS
+            {
+                inner
+                    .wal
+                    .exclusive_then_truncate(
+                        || inner.save_block_states().map_err(std::io::Error::other),
+                        || !handoff_active(),
+                    )?;
+                inner.ckpt_skips.store(0, std::sync::atomic::Ordering::Relaxed);
+                debug!("checkpoint complete (exclusive)");
+                return Ok(());
+            }
+
+            let covered_seq = inner.save_block_states()?;
+
+            #[cfg(feature = "test-utils")]
+            inner.sync_gate(super::inner::FlushStep::CheckpointAfterSnapshot);
+
+            let truncated = inner
+                .wal
+                .truncate_if(|| inner.sequence.current() == covered_seq && !handoff_active())?;
+            if truncated {
+                inner.ckpt_skips.store(0, std::sync::atomic::Ordering::Relaxed);
+                debug!("checkpoint complete");
+            } else {
+                inner.ckpt_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!(covered_seq, "checkpoint: WAL kept, a block was dirtied during the snapshot");
+            }
             Ok(())
         })
         .await
