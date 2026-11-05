@@ -499,6 +499,32 @@ jobs:
             fi
           done
           echo "=== LOOP RESULT: $fail failed of 100" | tee -a /tmp/crash-loop.log
+      - name: Crash-recovery loop x40 with a 300 ms checkpoint delay (${{ matrix.transport }})
+        if: always() && matrix.transport == 'zero-copy'
+        continue-on-error: true
+        run: |
+          uname -a; head -2 /etc/os-release
+          # One process per iteration: an in-process loop leaks ~65 fds per
+          # iteration and hits EMFILE after 15.
+          export GLIDEFS_TEST_CKPT_DELAY_MS=300
+          EXE=$(sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run --message-format=json 2>/dev/null | python3 -c "import sys,json;[print(m['executable']) for l in sys.stdin for m in [json.loads(l)] if m.get('executable') and m.get('target',{}).get('name')=='docker_integration']" | tail -1)
+          echo "exe=$EXE"; fail=0
+          : > /tmp/crash-loop-delay.log
+          for i in $(seq 1 40); do
+            echo "=== LOOP iteration $i uname=$(uname -r)" >> /tmp/crash-loop-delay.log
+            if sudo -E env "PATH=$PATH" "$EXE" fs_crash_recovery::test_fs_repeated_crash_recovery_nbd_kernel --exact --nocapture >> /tmp/crash-loop-delay.log 2>&1; then
+              echo "=== LOOP iteration $i PASS" >> /tmp/crash-loop-delay.log
+            else
+              echo "=== LOOP iteration $i FAIL" >> /tmp/crash-loop-delay.log; fail=$((fail+1))
+            fi
+          done
+          echo "=== LOOP RESULT: $fail failed of 40" | tee -a /tmp/crash-loop-delay.log
+      - name: Upload crash loop delay log
+        if: always() && matrix.transport == 'zero-copy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-loop-delay-log
+          path: /tmp/crash-loop-delay.log
       - name: Upload crash loop log
         if: always() && matrix.transport == 'zero-copy'
         uses: actions/upload-artifact@v4
