@@ -239,6 +239,41 @@ jobs:
           sudo udevadm control --reload-rules
       - name: Run blktests
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture
+      # EVIDENCE ONLY: loop the tests whose failures read zeros after a drain/handoff.
+      - name: Loop fio_verify_after_cold_wake and handoff durability (${{ matrix.transport }})
+        if: always() && matrix.transport == 'zero-copy'
+        continue-on-error: true
+        run: |
+          set +e
+          uname -a
+          exe() { sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features "$2" --test "$1" --no-run --message-format=json 2>/dev/null | python3 -c "import sys,json;[print(m['executable']) for l in sys.stdin for m in [json.loads(l)] if m.get('executable') and m.get('target',{}).get('name')=='$1']" | tail -1; }
+          FIO=$(exe fio_verify fio-bench); HO=$(exe handoff_durability ublk,fio-bench,test-fault-injection)
+          echo "fio=$FIO ho=$HO"
+          : > /tmp/loops.log
+          loop() { # name delay n cmd...
+            local name=$1 delay=$2 n=$3; shift 3; local fail=0
+            for i in $(seq 1 $n); do
+              echo "=== $name iteration $i delay=$delay" >> /tmp/loops.log
+              if sudo -E env "PATH=$PATH" GLIDEFS_TEST_CKPT_DELAY_MS=$delay RUST_LOG=${LOOP_RUST_LOG:-warn} "$@" >> /tmp/loops.log 2>&1; then
+                echo "=== $name iteration $i PASS" >> /tmp/loops.log
+              else
+                echo "=== $name iteration $i FAIL" >> /tmp/loops.log; fail=$((fail+1))
+              fi
+            done
+            echo "=== RESULT $name delay=$delay: $fail failed of $n" | tee -a /tmp/loops.log
+          }
+          export LOOP_RUST_LOG="warn,glidefs::block::write_cache=debug"
+          loop fio_cold_wake 0 30 "$FIO" fio_verify::fio_verify_after_cold_wake --exact --nocapture
+          loop handoff 0 30 "$HO" --ignored --exact handoff_durability_crh_per_pr --nocapture
+          loop fio_cold_wake 300 30 "$FIO" fio_verify::fio_verify_after_cold_wake --exact --nocapture
+          loop handoff 300 30 "$HO" --ignored --exact handoff_durability_crh_per_pr --nocapture
+          exit 0
+      - name: Upload loop log
+        if: always() && matrix.transport == 'zero-copy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: loops-log
+          path: /tmp/loops.log
       - name: Kernel logs (on failure)
         if: failure()
         run: sudo dmesg --color=never | tail -200
@@ -360,7 +395,7 @@ jobs:
     # docker_integration, fs_crash, handoff, and the `Test (ublk)`
     # unit tests were ZC-only.
     name: Kernel Devices (${{ matrix.transport }})
-    timeout-minutes: 60
+    timeout-minutes: 170
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -479,58 +514,6 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
-      # EVIDENCE ONLY (lost-fsync investigation); delete once the cause is known.
-      - name: Crash-recovery loop x100 (${{ matrix.transport }})
-        if: always() && matrix.transport == 'zero-copy'
-        continue-on-error: true
-        run: |
-          uname -a; head -2 /etc/os-release
-          # One process per iteration: an in-process loop leaks ~65 fds per
-          # iteration and hits EMFILE after 15.
-          EXE=$(sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run --message-format=json 2>/dev/null | python3 -c "import sys,json;[print(m['executable']) for l in sys.stdin for m in [json.loads(l)] if m.get('executable') and m.get('target',{}).get('name')=='docker_integration']" | tail -1)
-          echo "exe=$EXE"; fail=0
-          : > /tmp/crash-loop.log
-          for i in $(seq 1 100); do
-            echo "=== LOOP iteration $i uname=$(uname -r)" >> /tmp/crash-loop.log
-            if sudo -E env "PATH=$PATH" "$EXE" fs_crash_recovery::test_fs_repeated_crash_recovery_nbd_kernel --exact --nocapture >> /tmp/crash-loop.log 2>&1; then
-              echo "=== LOOP iteration $i PASS" >> /tmp/crash-loop.log
-            else
-              echo "=== LOOP iteration $i FAIL" >> /tmp/crash-loop.log; fail=$((fail+1))
-            fi
-          done
-          echo "=== LOOP RESULT: $fail failed of 100" | tee -a /tmp/crash-loop.log
-      - name: Crash-recovery loop x40 with a 300 ms checkpoint delay (${{ matrix.transport }})
-        if: always() && matrix.transport == 'zero-copy'
-        continue-on-error: true
-        run: |
-          uname -a; head -2 /etc/os-release
-          # One process per iteration: an in-process loop leaks ~65 fds per
-          # iteration and hits EMFILE after 15.
-          export GLIDEFS_TEST_CKPT_DELAY_MS=300
-          EXE=$(sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run --message-format=json 2>/dev/null | python3 -c "import sys,json;[print(m['executable']) for l in sys.stdin for m in [json.loads(l)] if m.get('executable') and m.get('target',{}).get('name')=='docker_integration']" | tail -1)
-          echo "exe=$EXE"; fail=0
-          : > /tmp/crash-loop-delay.log
-          for i in $(seq 1 40); do
-            echo "=== LOOP iteration $i uname=$(uname -r)" >> /tmp/crash-loop-delay.log
-            if sudo -E env "PATH=$PATH" "$EXE" fs_crash_recovery::test_fs_repeated_crash_recovery_nbd_kernel --exact --nocapture >> /tmp/crash-loop-delay.log 2>&1; then
-              echo "=== LOOP iteration $i PASS" >> /tmp/crash-loop-delay.log
-            else
-              echo "=== LOOP iteration $i FAIL" >> /tmp/crash-loop-delay.log; fail=$((fail+1))
-            fi
-          done
-          echo "=== LOOP RESULT: $fail failed of 40" | tee -a /tmp/crash-loop-delay.log
-      - name: Upload crash loop delay log
-        if: always() && matrix.transport == 'zero-copy'
-        uses: actions/upload-artifact@v4
-        with:
-          name: crash-loop-delay-log
-          path: /tmp/crash-loop-delay.log
-      - name: Upload crash loop log
-        if: always() && matrix.transport == 'zero-copy'
-        uses: actions/upload-artifact@v4
-        with:
-          name: crash-loop-log
-          path: /tmp/crash-loop.log
       - name: Kernel logs (on failure)
         if: failure()
         run: sudo dmesg --color=never | tail -200

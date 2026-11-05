@@ -338,6 +338,26 @@ mod fio_verify {
             }
         }
 
+        // EVIDENCE: after the drain, scan every 4K page through the handler and
+        // name each all-zero page with its 128K block. A zero page here means S3
+        // (or the post-drain local state) already lacks acked data before any cold wake.
+        {
+            let handler = server.router.get_handler("verify").await.unwrap();
+            let total = 128u64 * 1024 * 1024;
+            let mut zero_pages: Vec<u64> = Vec::new();
+            let mut off = 0u64;
+            while off < total {
+                let data = handler.read(off, 4096).await.unwrap();
+                if data.iter().all(|&b| b == 0) { zero_pages.push(off); }
+                off += 4096;
+            }
+            let blocks: std::collections::BTreeSet<u64> = zero_pages.iter().map(|o| o / (128 * 1024)).collect();
+            eprintln!(
+                "[diag-scan] after drain: zero_pages={} blocks={:?} first={:?} last={:?}",
+                zero_pages.len(), blocks, zero_pages.first(), zero_pages.last()
+            );
+        }
+
         // Shutdown (drops local SSD cache)
         server.shutdown().await;
 
