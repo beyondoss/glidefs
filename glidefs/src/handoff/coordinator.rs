@@ -123,7 +123,7 @@ impl HandoffCoordinator {
             .map(|e| Arc::clone(&e.value().cache))
             .collect();
         for c in caches {
-            c.set_handoff_phase(phase);
+            c.set_handoff_phase(phase).await;
         }
     }
 
@@ -160,7 +160,7 @@ impl HandoffCoordinator {
             handler.freeze();
             // Pause the per-export checkpoint truncate so the WAL
             // stays intact for the successor's tail-replay window.
-            cache.set_handoff_phase(HandoffPhase::Freezing);
+            cache.set_handoff_phase(HandoffPhase::Freezing).await;
         }
 
         use futures::stream::{self, StreamExt};
@@ -226,7 +226,7 @@ impl HandoffCoordinator {
             .collect();
         for (h, c) in states {
             h.unfreeze();
-            c.set_handoff_phase(HandoffPhase::Idle);
+            c.set_handoff_phase(HandoffPhase::Idle).await;
         }
         info!("handoff: handlers unfrozen (handoff aborted)");
     }
