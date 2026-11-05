@@ -251,6 +251,8 @@ async fn run_protocol(
         .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Warming)
         .await;
 
+    let fenced_at = Instant::now();
+
     // Build snapshot of our exports.
     let exports = coord.snapshot().await;
     tracing::info!(count = exports.len(), "handoff: built export snapshot");
@@ -323,7 +325,10 @@ async fn run_protocol(
             // Send Abort(Other("dry-run-complete")), do NOT initiate
             // cutover — predecessor stays SERVING, successor exits.
             if dry_run {
-                tracing::info!("handoff: dry-run mode — WARMING succeeded, aborting before cutover");
+                tracing::info!(
+                    fence_held_ms = fenced_at.elapsed().as_millis() as u64,
+                    "handoff: dry-run mode — WARMING succeeded, aborting before cutover"
+                );
                 send_one(
                     sock,
                     &HandoffMessage::Abort(AbortReason::Other(
@@ -467,6 +472,10 @@ async fn run_protocol(
     // Never release the fence: this process is exiting, and a create or
     // remove queued behind it must not run here once the successor serves.
     // The client's connection resets and it retries against the successor.
+    tracing::info!(
+        fence_held_ms = fenced_at.elapsed().as_millis() as u64,
+        "handoff: export-set fence held until exit (creates and removes waited this long)"
+    );
     std::mem::forget(set_fence);
     Ok(HandoffOutcome::Succeeded {
         recovered_count,
