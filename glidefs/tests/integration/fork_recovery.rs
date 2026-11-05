@@ -276,3 +276,30 @@ async fn tag_export_with_own_name_does_not_break_the_next_drain() {
     r.get_handler("fork1").await.unwrap().write(BS as u64, &[9u8; 4096], false).await.unwrap();
     r.drain_export("fork1").await.expect("drain after self-tag");
 }
+
+/// The self-tag shares the live manifest's ETag with every flush. Interleaved
+/// with drains and writes it must never leave the cache holding an ETag older
+/// than S3's (which would fail the next sync): every round, and the final
+/// drain, must succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_tag_interleaved_with_drains_keeps_the_etag_in_step() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let r = router(dir.path(), s3).await;
+    fork_of_base(&r).await;
+    let h = r.get_handler("fork1").await.unwrap();
+
+    for i in 0..50u64 {
+        h.write((i % 8) * BS as u64, &[i as u8 + 1; 4096], false).await.unwrap();
+        let (a, b, c) = tokio::join!(
+            r.snapshot_export("fork1", Some("fork1")),
+            r.drain_export("fork1"),
+            r.tag_export("fork1", "fork1"),
+        );
+        a.unwrap_or_else(|e| panic!("round {i}: snapshot: {e}"));
+        b.unwrap_or_else(|e| panic!("round {i}: drain: {e}"));
+        c.unwrap_or_else(|e| panic!("round {i}: tag: {e}"));
+    }
+    h.write(9 * BS as u64, &[0xEE; 4096], false).await.unwrap();
+    r.drain_export("fork1").await.expect("final drain");
+}

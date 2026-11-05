@@ -57,21 +57,21 @@ fn base_manifest_cache_key(s3_prefix: &str, manifest_name: &str) -> String {
     format!("b:{s3_prefix}:{manifest_name}")
 }
 
-/// Encodes a snapshot-manifest key for the foyer manifest cache.
-/// The triple `(s3_prefix, manifest_name, sequence)` is immutable by
-/// construction (sequences are monotonic + never reused for a name),
-/// so the bytes for a given key are byte-identical forever.
-/// Publish `bytes` as the manifest `tag` of export `name`.
+/// Publish the manifest `tag` of export `name`.
 ///
 /// A tag equal to the export's own name IS its live manifest key
 /// (`manifests/{name}`; instd tags a volume under its own id). That object is
-/// guarded by the cache's ETag (every later sync is If-Match), so overwrite it
-/// the same way and adopt the new ETag; an unconditional PUT would move the
-/// ETag under the cache and fail every subsequent sync. Any other tag is a
-/// separate object nobody CASes.
+/// guarded by the cache's ETag (every sync is If-Match), so it is written the
+/// same way: under `flush_lock`, which every other ETag reader/writer holds
+/// (sync, drain, snapshot), so the read-ETag / PUT / store-ETag sequence cannot
+/// interleave with another PUT of this key. It publishes the CURRENT in-memory
+/// manifest rather than `bytes` (captured earlier, possibly before a flush
+/// that moved the manifest forward), so the tag can never roll the live
+/// manifest back. Any other tag is a separate object nobody CASes.
 async fn publish_tag(
     cache: &WriteCache<Active>,
     content_store: &crate::block::content_store::ContentStore,
+    volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     name: &str,
     tag: &str,
     bytes: Vec<u8>,
@@ -80,14 +80,23 @@ async fn publish_tag(
         content_store.put_manifest(tag, bytes, None).await?;
         return Ok(());
     }
+    let _flush_guard = cache.flush_lock().lock().await;
+    let live = volume_manifest
+        .read()
+        .serialize()
+        .map_err(|e| RouterError::Manifest(format!("serialize manifest: {e}")))?;
     let expected = cache.inner.manifest_etag.lock().clone();
     let new_etag = content_store
-        .put_manifest(tag, bytes, expected.as_deref())
+        .put_manifest(tag, live, expected.as_deref())
         .await?;
     *cache.inner.manifest_etag.lock() = new_etag;
     Ok(())
 }
 
+/// Encodes a snapshot-manifest key for the foyer manifest cache.
+/// The triple `(s3_prefix, manifest_name, sequence)` is immutable by
+/// construction (sequences are monotonic + never reused for a name),
+/// so the bytes for a given key are byte-identical forever.
 fn snapshot_manifest_cache_key(s3_prefix: &str, manifest_name: &str, sequence: u64) -> String {
     format!("s:{s3_prefix}:{manifest_name}:{sequence}")
 }
@@ -2121,7 +2130,7 @@ impl ExportRouter {
         // Uses manifest_bytes captured under the flush lock inside snapshot()
         // to ensure the tag is a consistent point-in-time snapshot.
         if let Some(tag) = tag {
-            publish_tag(&cache, &content_store, name, tag, result.manifest_bytes.clone()).await?;
+            publish_tag(&cache, &content_store, &volume_manifest, name, tag, result.manifest_bytes.clone()).await?;
             // Make the tag forkable by `from: "image:<tag>"`.
             self.index_image(tag, &pool, tag).await;
             info!("Tagged snapshot of '{}' as '{}'", name, tag);
@@ -2174,7 +2183,7 @@ impl ExportRouter {
         validate_export_name(tag)?;
         // Clone the Arc'd content_store + serialize manifest under the
         // shard guard; drop the guard before the .await on put_manifest.
-        let (manifest_bytes, content_store, cache, pool) = {
+        let (manifest_bytes, content_store, cache, volume_manifest, pool) = {
             let entry = self
                 .exports
                 .get(name)
@@ -2186,9 +2195,9 @@ impl ExportRouter {
                 .serialize()
                 .map_err(|e| RouterError::Manifest(e.to_string()))?;
             let pool = s.s3_prefix.clone().unwrap_or_else(|| name.to_string());
-            (manifest_bytes, Arc::clone(&s.content_store), Arc::clone(&s.cache), pool)
+            (manifest_bytes, Arc::clone(&s.content_store), Arc::clone(&s.cache), Arc::clone(&s.volume_manifest), pool)
         };
-        publish_tag(&cache, &content_store, name, tag, manifest_bytes).await?;
+        publish_tag(&cache, &content_store, &volume_manifest, name, tag, manifest_bytes).await?;
         // A tag is a named, forkable manifest — register it in the image index
         // so it resolves via `from: "image:<tag>"`.
         self.index_image(tag, &pool, tag).await;
