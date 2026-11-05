@@ -41,7 +41,7 @@ enum W {
     AcquireLock, SetPresent(Ver),
     PromoteCloneArc, PromoteHasArc(bool, Ver), PromotePread(Ver),
     PromotePwrite(Ver), PromoteCas, PromoteSkip,
-    PwriteData(Ver), WalAppend(Ver), TransitionDirty, ReleaseLock,
+    PwriteData(Ver), TakeSeq(bool, Ver), TransitionDirty(u8, Ver), WalAppend(Ver, u8), ReleaseLock,
     Done,
 }
 
@@ -49,7 +49,10 @@ enum W {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum F {
     CrcPrepass, AcquireWriteLock, Snapshot, Rotate, ReleaseWriteLock,
-    Compute, Upload, ManifestSync, Evict, Checkpoint, Cleanup, Done,
+    Compute, Upload, ManifestSync, Evict,
+    // checkpoint() split into its real steps (flush.rs `checkpoint`):
+    CkptSeq, CkptSnap, CkptRename, CkptTrunc,
+    Cleanup, Done,
 }
 
 // --- Read phases ---
@@ -72,6 +75,11 @@ struct S {
     wl: [bool; 2], rl: bool, wrl: bool, // per-op read locks, write lock
     nv: Ver, lwd: Ver,
     wal: [Ver; NBLK], pb: [BS; NBLK],
+    wseq: u8,                    // WriteCache.sequence
+    walseq: [u8; NBLK],          // sequence of each block's WAL entry
+    pseq: u8,                    // max_sequence persisted in the metadata
+    ck_s: u8, ck_pb: [BS; NBLK], // checkpoint-local: covered seq, snapshot
+    ack: [Ver; NBLK],            // content acknowledged by a completed WAL append
     snap: [bool; NBLK],          // blocks claimed by current flush
     ev: [Ver; NBLK],             // expected value: set in PwriteData
     zw_done: bool,                // limits state space to 1 zero write
@@ -89,14 +97,16 @@ impl fmt::Display for A {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(self, f) }
 }
 
-struct M { s3: bool, sub: bool, crash: bool, zero_writes: bool }
+/// `old_ckpt` reproduces the pre-#109 protocol: sequence taken before the block is
+/// marked DIRTY, persisted sequence read at rename time, WAL truncated unconditionally.
+struct M { s3: bool, sub: bool, crash: bool, zero_writes: bool, old_ckpt: bool, readers: bool }
 
 impl M {
     fn wl(w: &W) -> bool {
         matches!(w, W::AcquireLock | W::SetPresent(_) | W::PromoteCloneArc |
             W::PromoteHasArc(_,_) | W::PromotePread(_) | W::PromotePwrite(_) |
-            W::PromoteCas | W::PromoteSkip | W::PwriteData(_) | W::WalAppend(_) |
-            W::TransitionDirty | W::ReleaseLock)
+            W::PromoteCas | W::PromoteSkip | W::PwriteData(_) | W::WalAppend(_, _) |
+            W::TakeSeq(_, _) | W::TransitionDirty(_, _) | W::ReleaseLock)
     }
     fn rl(r: &R) -> bool {
         matches!(r, R::AcquireReadLock | R::FastPathCheck | R::FastPathPread(_) |
@@ -118,6 +128,7 @@ impl Model for M {
             wl: [false; 2], rl: false, wrl: false,
             nv: 2, lwd: 0,
             wal: [0; NBLK], pb: [BS::NP; NBLK],
+            wseq: 0, walseq: [0; NBLK], pseq: 0, ck_s: 0, ck_pb: [BS::NP; NBLK], ack: [0; NBLK],
             snap: [false; NBLK],
             ev: [v; NBLK],
             zw_done: false,
@@ -153,7 +164,7 @@ impl Model for M {
                 if !nw || !ar { a.push(A::TF); }
             }
         }
-        if matches!(s.r, None | Some((_, R::Done(_)))) {
+        if self.readers && matches!(s.r, None | Some((_, R::Done(_)))) {
             for b in 0..NBLK { a.push(A::SR(b)); }
         }
         if let Some((_, ref r)) = s.r {
@@ -176,6 +187,8 @@ impl Model for M {
                 s.w = [None, None]; s.wz = [false; 2]; s.f = None; s.r = None;
                 s.wl = [false; 2]; s.rl = false; s.wrl = false;
                 s.blk = s.pb; s.lwd = 0; s.crashed = true;
+                // Unacknowledged in-flight writes are not promised to survive.
+                s.ev = s.ack;
                 s.snap = [false; NBLK]; s.zw_done = false;
             }
             A::Recover => {
@@ -183,7 +196,8 @@ impl Model for M {
                     if s.flu_present && s.flu[b] > 0 && s.ssd[b] == 0 { s.ssd[b] = s.flu[b]; }
                     if s.blk[b] == BS::Syncing { s.blk[b] = BS::Dirty; }
                     if s.blk[b] == BS::Clean { s.blk[b] = BS::NP; }
-                    if s.wal[b] > 0 && s.blk[b] == BS::NP { s.blk[b] = BS::Dirty; }
+                    // Wal::replay(min_sequence = persisted max_sequence)
+                    if s.wal[b] > 0 && s.walseq[b] > s.pseq && s.blk[b] == BS::NP { s.blk[b] = BS::Dirty; }
                     s.pb[b] = s.blk[b];
                 }
                 if s.flu_present { s.flu_present = false; s.flu = [0; NBLK]; }
@@ -243,17 +257,22 @@ impl Model for M {
                         W::CasResult(p, w)
                     }
                     W::CasResult(_, w) => { if w { W::AcquireLock } else { W::CheckState } }
-                    W::PwriteData(v) => { s.ssd[b] = v; s.ev[b] = v; W::TransitionDirty }
-                    // Dirty before WAL: checkpoint persists state then
-                    // truncates WAL. Old order (append→dirty) let checkpoint
-                    // persist Clean and discard the entry. New order ensures
-                    // checkpoint always sees Dirty.
-                    W::TransitionDirty => {
+                    W::PwriteData(v) => {
+                        s.ssd[b] = v; s.ev[b] = v;
+                        if self.old_ckpt { W::TakeSeq(false, v) } else { W::TransitionDirty(0, v) }
+                    }
+                    // New order: mark DIRTY, then take the sequence number. Old: reverse.
+                    W::TakeSeq(marked, v) => {
+                        s.wseq += 1;
+                        let q = s.wseq;
+                        if marked { W::WalAppend(v, q) } else { W::TransitionDirty(q, v) }
+                    }
+                    W::TransitionDirty(q, v) => {
                         s.blk[b] = BS::Dirty;
                         if is_zero { s.zw_done = true; } else { s.nv += 1; }
-                        W::WalAppend(write_ver)
+                        if q == 0 { W::TakeSeq(true, v) } else { W::WalAppend(v, q) }
                     }
-                    W::WalAppend(v) => { s.wal[b] = v; W::ReleaseLock }
+                    W::WalAppend(v, q) => { s.wal[b] = v; s.walseq[b] = q; if v > s.ack[b] { s.ack[b] = v; } W::ReleaseLock }
                     W::ReleaseLock => {
                         s.wl[i] = false;
                         if !is_zero {
@@ -312,9 +331,22 @@ impl Model for M {
                         for b in 0..NBLK {
                             if s.blk[b] == BS::Syncing { s.blk[b] = BS::NP; }
                         }
-                        F::Checkpoint
+                        F::CkptSeq
                     }
-                    F::Checkpoint => { s.pb = s.blk; s.wal = [0; NBLK]; F::Cleanup }
+                    // new: read the sequence BEFORE snapshotting; old: not at all
+                    F::CkptSeq => { s.ck_s = s.wseq; F::CkptSnap }
+                    F::CkptSnap => { s.ck_pb = s.blk; F::CkptRename }
+                    // new: persist the sequence read before the snapshot; old: read it now
+                    F::CkptRename => {
+                        s.pb = s.ck_pb;
+                        s.pseq = if self.old_ckpt { s.wseq } else { s.ck_s };
+                        F::CkptTrunc
+                    }
+                    // new: truncate only if no sequence was taken since; old: always
+                    F::CkptTrunc => {
+                        if self.old_ckpt || s.wseq == s.ck_s { s.wal = [0; NBLK]; s.walseq = [0; NBLK]; }
+                        F::Cleanup
+                    }
                     F::Cleanup => {
                         s.flu_present = false; s.flu = [0; NBLK];
                         s.snap = [false; NBLK];
@@ -445,6 +477,21 @@ impl Model for M {
                 }
                 true
             }),
+            // An acknowledged write must stay reachable by STATE alone: a block the
+            // cache calls NOT_PRESENT is read from S3, so S3 must hold the acked
+            // content. Checked across crash and recovery (the checkpoint race lost
+            // the dirty mark and left NOT_PRESENT with a stale S3 copy).
+            Property::always("acked write survives crash recovery", |m: &M, s: &S| {
+                if !m.crash || s.crashed { return true; }
+                let flush_active = s.f.as_ref().is_some_and(|f| !matches!(f, F::Done));
+                let any_writer_active = s.w.iter().any(|w|
+                    w.as_ref().is_some_and(|(_, ph)| !matches!(ph, W::Done)));
+                if flush_active || any_writer_active { return true; }
+                for b in 0..NBLK {
+                    if s.ack[b] > 0 && s.blk[b] == BS::NP && s.s3[b] < s.ack[b] { return false; }
+                }
+                true
+            }),
             Property::sometimes("write done", |_: &M, s: &S| {
                 s.w.iter().any(|w| matches!(w, Some((_, W::Done))))
             }),
@@ -463,7 +510,7 @@ impl Model for M {
 mod tests {
     use super::*;
     fn run(s3: bool, sub: bool, crash: bool, zw: bool) -> impl Checker<M> {
-        M { s3, sub, crash, zero_writes: zw }.checker().threads(4).spawn_dfs().join()
+        M { s3, sub, crash, zero_writes: zw, old_ckpt: false, readers: true }.checker().threads(4).spawn_dfs().join()
     }
 
     // Zero-write interleavings (no crash — exhaustive dedup verification).
@@ -480,9 +527,29 @@ mod tests {
 
     // Crash recovery (no zero writes — keeps state space tractable).
     #[test] fn crash() {
-        let m = M { s3: true, sub: true, crash: true, zero_writes: false };
+        let m = M { s3: true, sub: true, crash: true, zero_writes: false, old_ckpt: false, readers: true };
         let r = m.checker().threads(4).spawn_dfs().join();
         eprintln!("{} states", r.unique_state_count());
         r.assert_properties();
+    }
+
+    // The pre-#109 checkpoint protocol must be caught: a write acknowledged while a
+    // checkpoint is between its snapshot and its truncate recovers as NOT_PRESENT.
+    #[test] fn crash_old_checkpoint_loses_an_acked_write() {
+        let m = M { s3: true, sub: true, crash: true, zero_writes: false, old_ckpt: true, readers: false };
+        let r = m.checker().threads(4).spawn_dfs().join();
+        eprintln!("{} states", r.unique_state_count());
+        r.assert_any_discovery("acked write survives crash recovery");
+    }
+
+    // The fixed checkpoint protocol, same configuration: no acked write is lost.
+    // (Readers are off, so the "read done" reachability property does not apply.)
+    #[test] fn crash_new_checkpoint_keeps_every_acked_write() {
+        let m = M { s3: true, sub: true, crash: true, zero_writes: false, old_ckpt: false, readers: false };
+        let r = m.checker().threads(4).spawn_dfs().join();
+        eprintln!("{} states", r.unique_state_count());
+        r.assert_no_discovery("acked write survives crash recovery");
+        r.assert_no_discovery("no data loss");
+        r.assert_any_discovery("flush done");
     }
 }
