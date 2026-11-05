@@ -80,8 +80,12 @@ fn is_zero(p: &Page) -> bool { p.iter().all(|&v| v == 0) }
 // Writer phases — backfill_and_write + write_inner + promote (correct order).
 //
 // Promote is three phases mirroring `promote_syncing_blocks`'s per-block body:
-//   Promote      — re-read state; nothing-to-do → SetPresent; else try_claim:
-//                  free → PromoteDo (holder), held → PromoteWait (waiter).
+//   Promote      — read state; nothing-to-do → SetPresent; else →
+//   PromoteClaim — try_claim as a SEPARATE step (the real code reads `state`
+//                  at inner.rs `let state = ...` and claims later; a holder
+//                  can finish in between). free → re-read the state and, if
+//                  it moved (`claim_recheck`), drop the claim and go back to
+//                  Promote; else PromoteDo (holder). held → PromoteWait.
 //   PromoteWait  — parked on the claim condvar (still holding the rotation
 //                  read gate `rl`). When the claim frees: waiter_fix → back
 //                  to Promote (RE-CHECK); buggy → SetPresent (skip — assumes
@@ -96,7 +100,7 @@ enum W {
     // Backfill = the async S3 fetch (claim_first=false snapshots `prior`
     // here), BackfillWrite = claim + pwrite of the fetched block.
     Backfill, BackfillWrite,
-    Lock, Promote, PromoteWait, PromoteDo,
+    Lock, Promote, PromoteClaim(BS), PromoteWait, PromoteDo,
     SetPresent, Pwrite, Dirty, Unlock, Done,
 }
 
@@ -135,6 +139,11 @@ pub struct M {
     pub promote_fix: bool,
     /// Claim waiters re-check state after release instead of skipping.
     pub waiter_fix: bool,
+    /// A claimer re-reads the state after winning the claim and re-evaluates
+    /// if it moved. Without it, a promoter that read SYNCING, then lost the
+    /// race to a sibling that promoted AND wrote, wins the free claim and
+    /// copies the flushing pre-image over the sibling's acked write.
+    pub claim_recheck: bool,
     /// Backfills claim (CAS NP→CLEAN) BEFORE the async S3 fetch, pinning the
     /// block so the fetched prior cannot go stale. Without it, a sibling's
     /// newer write can be committed + uploaded + evicted back to NP during
@@ -341,11 +350,21 @@ impl M {
                     // Present (CLEAN/DIRTY) — promoted by a prior holder or
                     // never needed promotion. Nothing to do.
                     W::SetPresent
-                } else if s.claim[b].is_none() {
+                } else {
+                    W::PromoteClaim(s.bs[b])
+                }
+            }
+            W::PromoteClaim(seen) => {
+                if s.claim[b].is_some() {
+                    W::PromoteWait
+                } else if self.claim_recheck && s.bs[b] != seen {
+                    // Won the claim, state moved since the read: release and
+                    // re-evaluate (a no-op claim/release pair, so it is
+                    // folded into this step).
+                    W::Promote
+                } else {
                     s.claim[b] = Some(wi);
                     W::PromoteDo
-                } else {
-                    W::PromoteWait
                 }
             }
             // Parked on the claim condvar (rotation gate still held).
@@ -462,7 +481,7 @@ impl Model for M {
                     // an interleaving the real read/write lock forbids).
                     let needs_file = matches!(
                         ph,
-                        W::BackfillWrite | W::Lock | W::Promote | W::PromoteWait | W::PromoteDo
+                        W::BackfillWrite | W::Lock | W::Promote | W::PromoteClaim(_) | W::PromoteWait | W::PromoteDo
                             | W::SetPresent | W::Pwrite | W::Dirty | W::Unlock
                     );
                     // A parked waiter only does something when the claim
@@ -610,7 +629,12 @@ impl Model for M {
 mod tests {
     use super::*;
     fn run(promote_fix: bool, waiter_fix: bool, claim_first: bool, zc: bool) -> impl Checker<M> {
-        M { promote_fix, waiter_fix, claim_first, zc }
+        run_cfg(promote_fix, waiter_fix, true, claim_first, zc)
+    }
+    fn run_cfg(
+        promote_fix: bool, waiter_fix: bool, claim_recheck: bool, claim_first: bool, zc: bool,
+    ) -> impl Checker<M> {
+        M { promote_fix, waiter_fix, claim_recheck, claim_first, zc }
             .checker().threads(4).spawn_dfs().join()
     }
 
@@ -681,5 +705,21 @@ mod tests {
         eprintln!("[zc all-fixes] {} states", r.unique_state_count());
         r.assert_properties();
     }
-}
 
+    /// BUG #4 (the `fio_verify_after_cold_wake` zero pages): every other fix
+    /// in place, but a promoter claims on the state it read BEFORE the claim.
+    /// A sibling that promoted and landed its write in between leaves the
+    /// claim free; the late claimer copies the flushing pre-image over it.
+    #[test]
+    fn uc_stale_state_claim_still_corrupts() {
+        let r = run_cfg(true, true, false, true, false);
+        eprintln!("[uc stale-claim] {} states", r.unique_state_count());
+        r.assert_any_discovery("read returns last write");
+    }
+    #[test]
+    fn zc_stale_state_claim_still_corrupts() {
+        let r = run_cfg(true, true, false, true, true);
+        eprintln!("[zc stale-claim] {} states", r.unique_state_count());
+        r.assert_any_discovery("read returns last write");
+    }
+}
