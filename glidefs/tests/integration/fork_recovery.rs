@@ -27,6 +27,15 @@ use glidefs::config::ExportConfig;
 const BS: usize = 128 * 1024;
 
 async fn router(cache_dir: &Path, s3: Arc<dyn ObjectStore>) -> ExportRouter {
+    // Tests that capture logs with a scoped subscriber lose events (about one run in four) when a sibling test
+    // hits the same callsite on another thread with no subscriber at all: the callsite caches `never`. A global
+    // subscriber that discards everything keeps every callsite enabled.
+    static GLOBAL: std::sync::Once = std::sync::Once::new();
+    GLOBAL.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt().with_writer(std::io::sink).with_max_level(tracing::Level::INFO).finish(),
+        );
+    });
     let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
     ExportRouter::new(RouterConfig {
         object_store: s3,
@@ -302,4 +311,46 @@ async fn self_tag_interleaved_with_drains_keeps_the_etag_in_step() {
     }
     h.write(9 * BS as u64, &[0xEE; 4096], false).await.unwrap();
     r.drain_export("fork1").await.expect("final drain");
+}
+
+/// `wal.rs` creates `{name}.wal.lock` beside every WAL and nothing else removes it, so a purge that skipped it
+/// left one file per export forever (14,818 of them on the homelab against ~900 caches).
+fn files_of(dir: &Path, name: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|f| f.strip_prefix(name).is_some_and(|rest| rest.starts_with('.')))
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn purge_leaves_no_local_file_for_the_export() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let r = router(dir.path(), s3).await;
+    r.create_export(cfg("gone", None, None), false, None, None).await.unwrap();
+    r.get_handler("gone").await.unwrap().write(0, &[1u8; 4096], false).await.unwrap();
+    assert!(files_of(dir.path(), "gone").iter().any(|f| f == "gone.wal.lock"), "the WAL lockfile exists while the export lives");
+
+    // A retaining remove keeps the local files (a detach re-attaches from them).
+    r.create_export(cfg("kept", None, None), false, None, None).await.unwrap();
+    r.remove_export("kept", false).await.unwrap();
+    assert!(!files_of(dir.path(), "kept").is_empty(), "a non-purge remove keeps its local files");
+
+    r.remove_export("gone", true).await.unwrap();
+    assert_eq!(files_of(dir.path(), "gone"), Vec::<String>::new(), "purge left files behind");
+}
+
+#[tokio::test]
+async fn purge_of_an_export_that_is_already_gone_removes_its_files_too() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let r = router(dir.path(), s3).await;
+    for ext in ["cache", "wal", "wal.lock", "meta"] {
+        std::fs::write(dir.path().join(format!("ghost.{ext}")), b"x").unwrap();
+    }
+    r.remove_export("ghost", true).await.unwrap();
+    assert_eq!(files_of(dir.path(), "ghost"), Vec::<String>::new());
 }
