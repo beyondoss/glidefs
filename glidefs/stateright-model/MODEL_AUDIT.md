@@ -110,3 +110,27 @@ Toggling each fix independently:
   Real-code translation: (1) promote-fix already in inner.rs; (2) serialize the
   write handler per block (sharded async lock keyed by block index across the
   backfill+write critical section).
+
+## D7 — promote read-state and claim were one atomic step  [FIXED, was CRITICAL]
+`faithful.rs` `W::Promote` read `s.bs[b]` and took `s.claim[b]` in a single
+step. The real `promote_syncing_blocks` reads `state` (inner.rs, `let state =
+self.state_map.get(idx)`) and only later calls `promote_claim.try_claim`, then
+copies the flushing file and CASes on that stale `state`. A sibling that
+promoted, landed its bytes and released the claim in between left the claim
+free: the late claimer copied the flushing pre-image over the sibling's acked
+write (zeros, or the page's OLD value if it was rewritten after rotation).
+Seen as zero pages after a drain in `fio_verify_after_cold_wake` (always the
+last blocks: fio's final queued writes land right after the threshold flush
+rotates). Bounds were never the limit: the same 2 writers x 2 blocks x 2 pages
+reach it once the step is split. The properties are checked only when idle,
+which is enough: the lost page persists to the idle state.
+
+Fix in the model: `Promote` reads, `PromoteClaim(seen)` claims; with
+`claim_recheck` (the code fix) a claimer re-reads after winning and goes back
+to `Promote` if the state moved. `uc_/zc_stale_state_claim_still_corrupts`
+are red without it; `with_all_fixes_is_clean` / `zc_with_all_fixes_is_clean`
+are green with it.
+
+Not a gap: repeated flush generations (`A::SF` re-arms while any block is
+DIRTY) and the `blocks_cas_failed` outcome (`F::Evict` evicts only SYNCING
+blocks of the snapshot, so a re-dirtied block stays DIRTY) were already modeled.
