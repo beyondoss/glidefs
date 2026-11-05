@@ -484,9 +484,21 @@ jobs:
         if: always() && matrix.transport == 'zero-copy'
         continue-on-error: true
         run: |
-          uname -a; cat /etc/os-release | head -2
-          set -o pipefail
-          sudo -E env "PATH=$PATH" FS_CRASH_LOOP=100 cargo test -p glidefs --features ublk,docker-tests --test docker_integration fs_crash_recovery::test_fs_repeated_crash_recovery_loop_nbd_kernel -- --ignored --nocapture 2>&1 | grep -vE '^\s*(Compiling|Fresh|Running|warning|-->|\|)' > /tmp/crash-loop.log
+          uname -a; head -2 /etc/os-release
+          # One process per iteration: an in-process loop leaks ~65 fds per
+          # iteration and hits EMFILE after 15.
+          EXE=$(sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run --message-format=json 2>/dev/null | python3 -c "import sys,json;[print(m['executable']) for l in sys.stdin for m in [json.loads(l)] if m.get('executable') and m.get('target',{}).get('name')=='docker_integration']" | tail -1)
+          echo "exe=$EXE"; fail=0
+          : > /tmp/crash-loop.log
+          for i in $(seq 1 100); do
+            echo "=== LOOP iteration $i uname=$(uname -r)" >> /tmp/crash-loop.log
+            if sudo -E env "PATH=$PATH" "$EXE" fs_crash_recovery::test_fs_repeated_crash_recovery_nbd_kernel --exact --nocapture >> /tmp/crash-loop.log 2>&1; then
+              echo "=== LOOP iteration $i PASS" >> /tmp/crash-loop.log
+            else
+              echo "=== LOOP iteration $i FAIL" >> /tmp/crash-loop.log; fail=$((fail+1))
+            fi
+          done
+          echo "=== LOOP RESULT: $fail failed of 100" | tee -a /tmp/crash-loop.log
       - name: Upload crash loop log
         if: always() && matrix.transport == 'zero-copy'
         uses: actions/upload-artifact@v4

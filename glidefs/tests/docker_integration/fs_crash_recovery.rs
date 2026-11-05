@@ -579,33 +579,6 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
     repeated_crash_recovery_once().await;
 }
 
-/// Evidence-only: run the repeated-crash test `FS_CRASH_LOOP` times in one
-/// process (default 100) and report the failure rate. Each iteration gets a
-/// fresh S3 namespace and cache dir. Remove once the lost-fsync cause is known.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "evidence loop; run explicitly"]
-async fn test_fs_repeated_crash_recovery_loop_nbd_kernel() {
-    init_crash_tracing();
-    assert!(crate::nbd_kernel_available() && is_root(), "needs nbd + root");
-    let _lock = NBD_CRASH_LOCK.lock().await;
-    let n: usize = std::env::var("FS_CRASH_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-    let mut failed = Vec::new();
-    for i in 0..n {
-        eprintln!("=== LOOP iteration {i} start");
-        let r = tokio::spawn(repeated_crash_recovery_once()).await;
-        match r {
-            Ok(()) => eprintln!("=== LOOP iteration {i} PASS"),
-            Err(e) => {
-                eprintln!("=== LOOP iteration {i} FAIL: {e}");
-                failed.push(i);
-            }
-        }
-    }
-    eprintln!("=== LOOP RESULT: {} failed of {n}: {failed:?}", failed.len());
-    assert!(failed.is_empty(), "{} of {n} iterations failed: {failed:?}", failed.len());
-}
-
 #[cfg(target_os = "linux")]
 fn init_crash_tracing() {
     use tracing_subscriber::EnvFilter;
