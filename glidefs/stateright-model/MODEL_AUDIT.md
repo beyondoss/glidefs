@@ -110,3 +110,23 @@ Toggling each fix independently:
   Real-code translation: (1) promote-fix already in inner.rs; (2) serialize the
   write handler per block (sharded async lock keyed by block index across the
   backfill+write critical section).
+
+## Checkpoint (lib.rs) — split into its real steps  [fixes a blind spot]
+
+`F::Checkpoint` used to be ONE atomic step (`pb = blk; wal = 0`). The real
+`checkpoint()` is: read sequence, snapshot the state map, rename it, truncate the
+WAL (flush.rs `checkpoint`, inner.rs `save_block_states`). An atomic step cannot
+interleave a writer between the snapshot and the truncate, so the model could not
+see the loss of a write acknowledged in that window (fixed in #109).
+
+Now modeled: `CkptSeq → CkptSnap → CkptRename → CkptTrunc`, a sequence number per
+WAL entry, the persisted `max_sequence` (`pseq`), the `Wal::replay(min_sequence)`
+filter in `Recover`, and the writer's mark/sequence order. `old_ckpt: true`
+reproduces the pre-#109 protocol (sequence before mark, `pseq` read at rename,
+unconditional truncate). Property "acked write survives crash recovery": a block
+the cache calls NOT_PRESENT is read from S3, so S3 must hold every acknowledged
+version. Tests: `crash_old_checkpoint_loses_an_acked_write` (finds it),
+`crash_new_checkpoint_keeps_every_acked_write` (clean).
+
+Not modeled: two checkpoints overlapping (the model has one flush at a time; the
+real code serializes them with `ckpt_lock`), and the exclusive-guard fallback.
