@@ -748,6 +748,11 @@ impl FlushSyncPoints {
 pub struct PromoteSyncPoints {
     pub tx: tokio::sync::mpsc::UnboundedSender<PromoteGateEvent>,
     rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    /// Opt-in: parks exactly one promoter at [`PromoteStep::BeforeClaim`] and
+    /// lets every other promoter, at every step, run free. Off by default so
+    /// tests that gate the other steps never see this one.
+    before_claim_armed: std::sync::atomic::AtomicBool,
+    before_claim_only: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "test-utils")]
@@ -756,6 +761,9 @@ pub enum PromoteStep {
     AfterCloneArc,  // P1
     AfterRead,      // P3→P4 (between pread and pwrite)
     BeforeCas,      // P4→P5 (between pwrite and CAS)
+    /// Between a promoter's state read and its `try_claim`. Opt-in, one-shot:
+    /// see [`PromoteSyncPoints::arm_before_claim`].
+    BeforeClaim,
 }
 
 #[cfg(feature = "test-utils")]
@@ -807,10 +815,36 @@ impl PromoteSyncPoints {
     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<PromoteGateEvent>, std::sync::mpsc::SyncSender<()>) {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
-        (Self { tx: event_tx, rx: std::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+        (Self {
+            tx: event_tx,
+            rx: std::sync::Mutex::new(proceed_rx),
+            before_claim_armed: std::sync::atomic::AtomicBool::new(false),
+            before_claim_only: std::sync::atomic::AtomicBool::new(false),
+        }, event_rx, proceed_tx)
+    }
+
+    /// Park the next promoter between its state read and its claim attempt.
+    pub fn arm_before_claim(&self) {
+        self.before_claim_only
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.before_claim_armed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn gate_sync(&self, step: PromoteStep, block_idx: usize) {
+        let only = self
+            .before_claim_only
+            .load(std::sync::atomic::Ordering::Acquire);
+        if step == PromoteStep::BeforeClaim {
+            if !self
+                .before_claim_armed
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+        } else if only {
+            return;
+        }
         let _ = self.tx.send(PromoteGateEvent { step, block_idx });
         // Blocking recv for sync (non-async) promote path.
         let _ = self.rx.lock().unwrap().recv();
@@ -1246,6 +1280,13 @@ impl CacheInner {
                 // run the same stale-zero check ourselves.
                 loop {
                     let state = self.state_map.get(idx);
+                    #[cfg(feature = "test-utils")]
+                    {
+                        let sp = self.promote_sync.lock().clone();
+                        if let Some(sp) = sp {
+                            sp.gate_sync(PromoteStep::BeforeClaim, idx);
+                        }
+                    }
                     if state == SparseBlockState::CLEAN {
                         // CLEAN = claimed by a writer, data pending. Two
                         // sub-cases, distinguished by the promote claim:
@@ -1321,6 +1362,18 @@ impl CacheInner {
                         }
                     }
                     let _guard = ClaimGuard { claim: &self.promote_claim, idx };
+
+                    // `state` was read before the claim, and a holder releases
+                    // the claim as soon as it has promoted (DIRTY) — before its
+                    // caller's WRITE_FIXED / pwrite lands. Winning the claim
+                    // after such a holder acting on that stale `state` would
+                    // copy the flushing file's pre-image over the holder's
+                    // just-landed bytes. The claim now excludes every other
+                    // promoter, so a re-read is authoritative: if the state
+                    // moved, drop the claim and re-evaluate from the top.
+                    if self.state_map.get(idx) != state {
+                        continue;
+                    }
 
                     // Propagate errors: silent skip on a flushing-read failure
                     // would leave the active file as zeros for un-covered
