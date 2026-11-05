@@ -479,6 +479,20 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
+      # EVIDENCE ONLY (lost-fsync investigation); delete once the cause is known.
+      - name: Crash-recovery loop x100 (${{ matrix.transport }})
+        if: always() && matrix.transport == 'zero-copy'
+        continue-on-error: true
+        run: |
+          uname -a; cat /etc/os-release | head -2
+          set -o pipefail
+          sudo -E env "PATH=$PATH" FS_CRASH_LOOP=100 cargo test -p glidefs --features ublk,docker-tests --test docker_integration fs_crash_recovery::test_fs_repeated_crash_recovery_loop_nbd_kernel -- --ignored --nocapture 2>&1 | grep -vE '^\s*(Compiling|Fresh|Running|warning|-->|\|)' > /tmp/crash-loop.log
+      - name: Upload crash loop log
+        if: always() && matrix.transport == 'zero-copy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-loop-log
+          path: /tmp/crash-loop.log
       - name: Kernel logs (on failure)
         if: failure()
         run: sudo dmesg --color=never | tail -200

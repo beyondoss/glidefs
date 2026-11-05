@@ -570,12 +570,75 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fs_repeated_crash_recovery_nbd_kernel() {
+    init_crash_tracing();
     if !crate::nbd_kernel_available() || !is_root() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
     let _lock = NBD_CRASH_LOCK.lock().await;
+    repeated_crash_recovery_once().await;
+}
 
+/// Evidence-only: run the repeated-crash test `FS_CRASH_LOOP` times in one
+/// process (default 100) and report the failure rate. Each iteration gets a
+/// fresh S3 namespace and cache dir. Remove once the lost-fsync cause is known.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "evidence loop; run explicitly"]
+async fn test_fs_repeated_crash_recovery_loop_nbd_kernel() {
+    init_crash_tracing();
+    assert!(crate::nbd_kernel_available() && is_root(), "needs nbd + root");
+    let _lock = NBD_CRASH_LOCK.lock().await;
+    let n: usize = std::env::var("FS_CRASH_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mut failed = Vec::new();
+    for i in 0..n {
+        eprintln!("=== LOOP iteration {i} start");
+        let r = tokio::spawn(repeated_crash_recovery_once()).await;
+        match r {
+            Ok(()) => eprintln!("=== LOOP iteration {i} PASS"),
+            Err(e) => {
+                eprintln!("=== LOOP iteration {i} FAIL: {e}");
+                failed.push(i);
+            }
+        }
+    }
+    eprintln!("=== LOOP RESULT: {} failed of {n}: {failed:?}", failed.len());
+    assert!(failed.is_empty(), "{} of {n} iterations failed: {failed:?}", failed.len());
+}
+
+#[cfg(target_os = "linux")]
+fn init_crash_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("FS_CRASH_LOG").unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,glidefs::block::write_cache=debug,glidefs::block::wal=debug,\
+             glidefs::block::router=info,glidefs::block::flush_scheduler=debug",
+        )
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .try_init();
+}
+
+/// Print the on-disk WAL/meta/flushing state: whether the WAL holds
+/// entries (and up to which sequence) at this instant.
+#[cfg(target_os = "linux")]
+fn probe_cache_files(cache_dir: &Path, tag: &str) {
+    let wal = cache_dir.join("vol1.wal");
+    let entries = glidefs::block::wal::Wal::replay(&wal, 0)
+        .map(|e| (e.len(), e.iter().map(|x| x.sequence).max().unwrap_or(0)))
+        .ok();
+    let len = |ext: &str| std::fs::metadata(cache_dir.join(format!("vol1.{ext}"))).map(|m| m.len()).ok();
+    eprintln!(
+        "PROBE {tag}: wal_entries/max_seq={entries:?} wal_len={:?} meta_len={:?} flushing_len={:?}",
+        len("wal"), len("meta"), len("flushing")
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn repeated_crash_recovery_once() {
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
     let mountpoint = TempDir::new().unwrap();
@@ -673,10 +736,20 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         fsync_dir(mountpoint.path());
 
         // Crash
+        probe_cache_files(cache_dir.path(), &format!("cycle {cycle} after fsync, before crash"));
+        let weak_router = Arc::downgrade(&server.router);
         let old_dev = dev.crash().await;
         mount.unmount();
         wait_for_device_released(&old_dev).await;
         server.crash_shutdown().await;
+        // A live router here means a straggling instance can still touch the
+        // cache files while the next server recovers them.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        eprintln!(
+            "PROBE cycle {cycle}: old router strong_count after crash = {}",
+            weak_router.strong_count()
+        );
+        probe_cache_files(cache_dir.path(), &format!("cycle {cycle} after crash_shutdown"));
     }
 
     // Final verification: recover and check all 5 files
