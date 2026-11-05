@@ -4018,6 +4018,7 @@ async fn test_set_handoff_phase_waits_for_inflight_checkpoint() {
     cache.write((3 * CK_BS) as u64, &vec![0x33; CK_BS]).unwrap();
     cache.checkpoint().await.unwrap();
     assert!(wal_len() > 0, "checkpoint truncated the WAL during a handoff");
+}
 
 /// A promoter that read a block's state BEFORE a sibling finished promoting
 /// and writing it must not copy the flushing file over the sibling's data.
