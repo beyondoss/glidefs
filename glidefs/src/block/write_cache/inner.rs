@@ -1402,6 +1402,11 @@ impl CacheInner {
         // the header claims, failing CRC on reload.
         let entries: Vec<(usize, u8)> = self.state_map.iter_present().collect();
         let entry_count = entries.len() as u64;
+        // EVIDENCE ONLY: widen the snapshot->truncate window like a slow metadata fsync.
+        #[cfg(feature = "test-utils")]
+        if let Some(ms) = std::env::var("GLIDEFS_TEST_CKPT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         write_hashed!(&entry_count.to_le_bytes());
 
         for (idx, state) in &entries {
