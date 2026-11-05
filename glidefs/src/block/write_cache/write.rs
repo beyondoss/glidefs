@@ -1,7 +1,6 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use tracing::{debug, instrument};
 
-use crate::block::block_map::SparseBlockState;
 use crate::block::state::Active;
 use crate::block::wal::serialize_entry;
 
