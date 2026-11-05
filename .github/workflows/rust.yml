@@ -473,6 +473,8 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_durability_crh_per_pr
       - name: Handoff fault-injection grid (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_fault_injection_grid_crh
+      - name: Handoff under export churn (${{ matrix.transport }})
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture --test-threads=1 handoff_export_churn handoff_dry_run_outcome
       - name: Test (${{ matrix.transport }})
         run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (${{ matrix.transport }})

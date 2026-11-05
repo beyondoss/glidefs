@@ -15,6 +15,13 @@
 //!
 //! Tests assert that every variant ends with zero I/O errors observed by
 //! fio and zero data loss per the side-channel oracle.
+//!
+//! [`pause`] points hold a process at a state-machine point instead of
+//! killing it, so a test can act on the predecessor (create or remove an
+//! export through its API) at an exact moment of the handoff:
+//! - `s_pause_in_warming` — successor built its router; before HELLO
+//! - `s_pause_before_ready` — successor holds the predecessor's export set;
+//!   before READY
 
 #[cfg(feature = "test-fault-injection")]
 pub fn inject(point: &str) {
@@ -37,6 +44,36 @@ pub fn inject(point: &str) {
         }
     }
 }
+
+/// Hold here until the test releases us. Active when `GLIDEFS_PAUSE_AT`
+/// names `point`; `GLIDEFS_PAUSE_DIR` is a directory shared with the test.
+/// Writes `<dir>/<point>.reached`, then waits for `<dir>/<point>.go`.
+/// Gives up after two minutes so a test that dies leaves no orphan.
+#[cfg(feature = "test-fault-injection")]
+pub async fn pause(point: &str) {
+    let (Ok(at), Ok(dir)) = (std::env::var("GLIDEFS_PAUSE_AT"), std::env::var("GLIDEFS_PAUSE_DIR"))
+    else {
+        return;
+    };
+    if at != point {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    tracing::error!(point, "test-fault-injection: pausing");
+    let _ = std::fs::write(dir.join(format!("{point}.reached")), b"");
+    let go = dir.join(format!("{point}.go"));
+    for _ in 0..1200 {
+        if go.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(not(feature = "test-fault-injection"))]
+#[inline(always)]
+#[allow(dead_code)]
+pub async fn pause(_point: &str) {}
 
 // No-op stub for production builds (feature off). Call sites in
 // successor/predecessor invoke it unconditionally, but they are themselves

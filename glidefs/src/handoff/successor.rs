@@ -141,6 +141,8 @@ pub async fn run_successor(
     #[cfg(feature = "test-fault-injection")]
     crate::handoff::fault::inject("s_crash_after_warming");
 
+    crate::handoff::fault::pause("s_pause_before_ready").await;
+
     // Send READY.
     send_one(&sock, &HandoffMessage::Ready).await.context("send READY")?;
     tracing::info!("handoff: READY sent, awaiting CUTOVER");

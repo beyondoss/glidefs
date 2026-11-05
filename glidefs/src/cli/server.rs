@@ -928,6 +928,8 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
         .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Warming)
         .await;
 
+    crate::handoff::fault::pause("s_pause_in_warming").await;
+
     // Drive the handoff protocol. After this returns, our router owns
     // every device the predecessor used to own.
     let timeouts = crate::handoff::HandoffTimeouts::default();
