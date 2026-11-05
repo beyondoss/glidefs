@@ -3981,3 +3981,41 @@ async fn test_overlapping_checkpoints_do_not_publish_a_stale_snapshot() {
     let cache = cd.open().await;
     cd.assert_recovered(&cache, 5, 0x55, 2).await;
 }
+
+/// `set_handoff_phase` must not return while a checkpoint that began under the
+/// old phase is still in flight (it may be about to truncate the WAL the
+/// successor needs), and checkpoints after it must keep the WAL.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_handoff_phase_waits_for_inflight_checkpoint() {
+    use super::inner::{FlushStep, HandoffPhase};
+    let cd = CrashDir::new().await;
+    let cache = Arc::new(cd.open().await);
+    let wal_len = || std::fs::metadata(test_config(cd.dir.path()).wal_path()).unwrap().len();
+    cache.write(0, &vec![0x11; CK_BS]).unwrap();
+    let (mut events, proceed) = gated(&cache, &[FlushStep::CheckpointAfterSnapshot]);
+    let ck = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.checkpoint().await }
+    });
+    assert_eq!(events.recv().await.unwrap().step, FlushStep::CheckpointAfterSnapshot);
+
+    let set = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.set_handoff_phase(HandoffPhase::Freezing).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!set.is_finished(), "set_handoff_phase returned while a checkpoint was in flight");
+    assert_eq!(cache.handoff_phase(), HandoffPhase::Idle);
+
+    proceed.send(()).unwrap();
+    ck.await.unwrap().unwrap();
+    set.await.unwrap();
+    assert_eq!(cache.handoff_phase(), HandoffPhase::Freezing);
+
+    // Under the new phase a checkpoint saves metadata but keeps the WAL.
+    *cache.inner.flush_sync.lock() = None;
+    cache.write((3 * CK_BS) as u64, &vec![0x33; CK_BS]).unwrap();
+    cache.checkpoint().await.unwrap();
+    assert!(wal_len() > 0, "checkpoint truncated the WAL during a handoff");
+}

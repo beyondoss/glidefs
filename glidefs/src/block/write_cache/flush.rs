@@ -336,10 +336,22 @@ impl WriteCache<Active> {
     /// skips the WAL truncate step (the metadata save still runs).
     /// Used by the handoff coordinator to gate predecessor- and
     /// successor-side flushes through the freeze + cutover window.
-    pub fn set_handoff_phase(&self, phase: super::inner::HandoffPhase) {
-        self.inner
-            .handoff_phase
-            .store(phase as u8, std::sync::atomic::Ordering::Release);
+    ///
+    /// Takes `ckpt_lock`, so it waits for a checkpoint already running to finish
+    /// (which may have read the old phase and be about to truncate) and every later
+    /// checkpoint reads the new phase. When this returns, no checkpoint that began
+    /// under the old phase is still in flight. The wait is up to one metadata
+    /// fsync, so it runs on the blocking pool, not a runtime thread.
+    pub async fn set_handoff_phase(&self, phase: super::inner::HandoffPhase) {
+        let inner = Arc::clone(&self.inner);
+        // A join error means the closure panicked; the phase store cannot.
+        let _ = crate::task::spawn_blocking_named("set-handoff-phase", move || {
+            let _ck = inner.ckpt_lock.lock();
+            inner
+                .handoff_phase
+                .store(phase as u8, std::sync::atomic::Ordering::Release);
+        })
+        .await;
     }
 
     /// Read the current handoff phase.
