@@ -481,7 +481,7 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
       # EVIDENCE ONLY: loop the tests whose failures read zeros after a drain/handoff.
       - name: Loop fio_verify_after_cold_wake and handoff durability (${{ matrix.transport }})
-        if: always() && matrix.transport == 'zero-copy'
+        if: always() && matrix.transport == 'user-copy'
         continue-on-error: true
         run: |
           set +e
@@ -503,10 +503,10 @@ jobs:
             echo "=== RESULT $name delay=$delay: $fail failed of $n" | tee -a /tmp/loops.log
           }
           export LOOP_RUST_LOG="warn,glidefs::block::write_cache=debug"
-          loop fio_cold_wake 0 ${LOOP_N:-160} "$FIO" fio_verify::fio_verify_after_cold_wake --exact --nocapture
+          loop fio_cold_wake 0 ${LOOP_N:-80} "$FIO" fio_verify::fio_verify_after_cold_wake --exact --nocapture
           exit 0
       - name: Upload loop log
-        if: always() && matrix.transport == 'zero-copy'
+        if: always() && matrix.transport == 'user-copy'
         uses: actions/upload-artifact@v4
         with:
           name: loops-log
