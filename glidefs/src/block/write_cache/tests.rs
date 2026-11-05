@@ -4076,3 +4076,29 @@ async fn promote_claimed_late_does_not_clobber_sibling_write() {
         );
     }
 }
+
+/// A promoter that times out waiting for another promoter's claim must not
+/// proceed on its own. `zero_range` passes `require_promotion=false`; the old
+/// best-effort `break` let it zero one page of a SYNCING block without the
+/// rest of the block ever being promoted, then mark the block DIRTY — the
+/// other pages read as sparse zeros and the stuck holder's late copy would
+/// roll the zeroed page back. It must fail the I/O instead.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_wait_timeout_fails_closed_for_plain_writers() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    h.cache.write(0, &[0xAA; 4096]).unwrap();
+    h.cache.write(4096, &[0x11; 4096]).unwrap();
+    assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![0]);
+
+    // A holder stuck past the 5 s wait deadline.
+    assert!(h.cache.inner.promote_claim.try_claim(0));
+    let res = h.cache.zero_range(4096, 4096);
+    h.cache.inner.promote_claim.release(0);
+
+    assert!(res.is_err(), "timed-out promoter must fail the I/O, got {res:?}");
+    // Not marked DIRTY over a half-empty active file.
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
+}

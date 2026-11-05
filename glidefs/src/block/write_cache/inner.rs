@@ -1341,9 +1341,15 @@ impl CacheInner {
                                 // recoverable; proceeding can corrupt.
                                 return Err(super::CacheError::BlockEvicted);
                             }
-                            // Plain-write path: best-effort proceed, same as
-                            // the pre-deadline behavior.
-                            break;
+                            // Plain writers (write, zero_range) have no retry
+                            // path, and proceeding without the promote leaves
+                            // the rest of the block as sparse zeros under a
+                            // DIRTY mark, with the stuck holder's late copy
+                            // free to roll the new bytes back. Fail the I/O.
+                            return Err(super::CacheError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "promote: timed out waiting for the block's promote claim",
+                            )));
                         }
                         continue;
                     }
