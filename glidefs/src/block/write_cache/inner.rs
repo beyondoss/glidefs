@@ -648,7 +648,8 @@ pub(crate) struct CacheInner {
     pub(crate) read_sync: parking_lot::Mutex<Option<std::sync::Arc<ReadSyncPoints>>>,
 }
 
-// =====================================================================// Test-only: sync point types for deterministic interleaving tests
+// ============================================================================
+// Test-only: sync point types for deterministic interleaving tests
 // ============================================================================
 
 /// Flush pipeline sync points.
@@ -1490,7 +1491,6 @@ impl CacheInner {
         if let Some(ms) = std::env::var("GLIDEFS_TEST_CKPT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
-=======
         #[cfg(feature = "test-utils")]
         self.sync_gate(FlushStep::MetadataAfterEntries);
         write_hashed!(&entry_count.to_le_bytes());
