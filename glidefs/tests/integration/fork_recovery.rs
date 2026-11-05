@@ -238,3 +238,41 @@ async fn recovered_fork_logs_and_loads_its_persisted_manifest() {
     let got = r.get_handler("fork1").await.unwrap().read(0, BS as u32).await.unwrap();
     assert_eq!(got.as_ref(), &base_data[..]);
 }
+
+/// Incident (homelab, 2026-11-05): instd creates a volume by forking a base and
+/// snapshotting it in place with the tag equal to its own name, so the durable
+/// tag and the live manifest are the same S3 key. The tag PUT overwrote the live
+/// manifest unconditionally, moving its ETag under the cache's feet; the export's
+/// next manifest PUT (If-Match) then failed forever with "ETag mismatch".
+async fn fork_of_base(r: &ExportRouter) {
+    r.create_export(cfg("base", None, None), false, None, None).await.unwrap();
+    r.get_handler("base").await.unwrap().write(0, &[7u8; 4096], false).await.unwrap();
+    r.snapshot_export("base", None).await.unwrap();
+    let fork = cfg("fork1", Some("base"), Some("volume:base"));
+    r.create_export(fork.clone(), false, Some("base"), None).await.unwrap();
+    r.save_export(&fork).await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_tagged_with_own_name_does_not_break_the_next_drain() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let r = router(dir.path(), s3).await;
+    fork_of_base(&r).await;
+
+    r.snapshot_export("fork1", Some("fork1")).await.unwrap();
+    r.get_handler("fork1").await.unwrap().write(BS as u64, &[9u8; 4096], false).await.unwrap();
+    r.drain_export("fork1").await.expect("drain after self-tagged snapshot");
+}
+
+#[tokio::test]
+async fn tag_export_with_own_name_does_not_break_the_next_drain() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let r = router(dir.path(), s3).await;
+    fork_of_base(&r).await;
+
+    r.tag_export("fork1", "fork1").await.unwrap();
+    r.get_handler("fork1").await.unwrap().write(BS as u64, &[9u8; 4096], false).await.unwrap();
+    r.drain_export("fork1").await.expect("drain after self-tag");
+}

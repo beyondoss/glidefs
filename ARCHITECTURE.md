@@ -170,7 +170,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Snapshot | An explicit, versioned copy of an export's VolumeManifest stored at a stable S3 key. Never overwritten by background syncs. Pinned in S3 until explicitly deleted. | Not the same as a background `sync_manifest` — background syncs update `manifests/{name}` and do NOT create versioned snapshot keys |
 | Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local SparseStateMap; unwritten blocks resolve through VolumeManifest → PackIndexCache → S3. | Not a full copy — parent pack files are never duplicated |
 | Snapshot Sequence | A monotonic counter (`u64`) that increments on every flush. | Not a timestamp — purely an ordering counter |
-| Manifest Tag | A named alias for a VolumeManifest, stored at `manifests/{tag}`. Forkable by name. | Not a snapshot sequence — not versioned; overwriting updates the pointer |
+| Manifest Tag | A named alias for a VolumeManifest, stored at `manifests/{tag}`. Forkable by name. | Not a snapshot sequence — not versioned; overwriting updates the pointer. A tag equal to the export's own name is its live manifest: it is overwritten If-Match and the cache adopts the new ETag |
 | File Rotation | After flush, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. Local SSD is a bounded write-back buffer. Reads for evicted blocks go through CleanCache → S3. | Not optional — this is the only storage mode. CLEAN state exists only transiently during migration from older metadata |
 
 ## S3 Object Layout
