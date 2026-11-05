@@ -689,6 +689,20 @@ pub enum FlushStep {
 }
 
 #[cfg(feature = "test-utils")]
+impl FlushStep {
+    /// Steps outside the flush pipeline; gated only when named in `only(..)`.
+    fn is_opt_in(self) -> bool {
+        matches!(
+            self,
+            Self::CheckpointAfterSnapshot
+                | Self::MetadataAfterEntries
+                | Self::MetadataBeforeRename
+                | Self::WriterMarkedBeforeAppend
+        )
+    }
+}
+
+#[cfg(feature = "test-utils")]
 #[derive(Debug)]
 pub struct FlushGateEvent {
     pub step: FlushStep,
@@ -716,7 +730,9 @@ impl FlushSyncPoints {
     }
 
     pub(crate) fn wants(&self, step: FlushStep) -> bool {
-        (self.only.is_empty() || self.only.contains(&step))
+        // The checkpoint and writer steps are opt-in: the flush interleaving tests
+        // build an unfiltered set and never release them.
+        (if self.only.is_empty() { !step.is_opt_in() } else { self.only.contains(&step) })
             && !(self.once && self.fired.load(std::sync::atomic::Ordering::Acquire))
     }
 
