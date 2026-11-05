@@ -443,7 +443,7 @@ WriteCache::snapshot()
     ├── 1. flush_dirty_inner()          flush all dirty blocks → S3 packs
     ├── 2. put_manifest()               overwrite manifests/{name} (current state)
     ├── 3. put_snapshot()               write snapshots/{name}/{seq:020}  ← best-effort
-    └── 4. checkpoint()                 persist block_states + max_seq, truncate WAL
+    └── 4. checkpoint()                 persist block_states + max_seq, truncate WAL if nothing was dirtied meanwhile
 ```
 
 Step 3 is best-effort. If the versioned snapshot upload fails, the base manifest (step 2) is already consistent.
@@ -611,7 +611,13 @@ Append-only on local SSD. Metadata only — block data lives in the cache file.
 [block_index:u64][sequence:u64][crc32:u32]   (20 bytes per entry)
 ```
 
-CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. WAL is truncated after each block map persistence. (`wal.rs`)
+CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. WAL is truncated after block map persistence, under one rule: **a checkpoint may drop only entries its snapshot already contains.**
+
+- A writer marks its block DIRTY *before* it takes a sequence number (`write.rs`), so every entry with `seq <= s` belongs to a block that is DIRTY in any snapshot taken after `s` was read.
+- `save_block_states` reads `s = sequence.current()` *before* serializing the state map and persists that `s` as `max_sequence`. Reading it afterwards persisted a sequence newer than the state, and `Wal::replay(min_sequence)` then dropped the entry of a block dirtied in between.
+- `checkpoint()` truncates with `Wal::truncate_if(sequence.current() == s)` under the WAL's exclusive guard. If a block was dirtied during the snapshot the truncate is skipped and the next checkpoint takes it. After `CKPT_MAX_SKIPS` (2) skips, the next checkpoint holds the guard across the snapshot (`exclusive_then_truncate`), so appends wait one metadata fsync and the WAL stays bounded.
+- Checkpoints are serialized by `CacheInner::ckpt_lock`, held from snapshot through truncate (also by `save_metadata`). Callers overlap (flush scheduler, `flush_to_s3`, `snapshot`); an older snapshot renamed over a newer one after the newer one truncated the WAL would lose the mark. The handoff phase is re-checked under the WAL guard just before the truncate.
+- Without this, a write acknowledged while a checkpoint ran recovered as NOT_PRESENT: reads went to S3 (stale) and the flush never uploaded it. (`wal.rs`, `write_cache/flush.rs:checkpoint`)
 
 ## Garbage Collection (`glidefs gc`)
 

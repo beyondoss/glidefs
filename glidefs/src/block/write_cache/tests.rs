@@ -3705,3 +3705,279 @@ async fn snapshot_survives_write_between_crc_drain_and_rotation() {
     assert_eq!(h.cache.dirty_block_count(), 0);
     assert_eq!(h.read(0, 4096).await, vec![0xCCu8; 4096], "latest write is in the snapshot");
 }
+
+
+// ---------------------------------------------------------------------------
+// Checkpoint vs. acknowledged writes
+//
+// `checkpoint()` snapshots the state map, persists it, then truncates the WAL.
+// An acknowledged write must never be lost to that sequence: after a crash its
+// block must be DIRTY again (else reads go to S3 and the stale pre-image comes
+// back, and the next flush never uploads the block).
+// ---------------------------------------------------------------------------
+
+/// A cache directory that survives simulated crashes, with an S3 stand-in.
+#[cfg(feature = "test-utils")]
+struct CrashDir {
+    dir: TempDir,
+    content_store: crate::block::content_store::ContentStore,
+    pack_index_cache: Arc<PackIndexCache>,
+    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
+}
+
+#[cfg(feature = "test-utils")]
+const CK_BS: usize = 4096;
+
+#[cfg(feature = "test-utils")]
+impl CrashDir {
+    async fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        Self {
+            content_store: crate::block::content_store::ContentStore::new(object_store, "test-bucket"),
+            pack_index_cache: Arc::new(PackIndexCache::open(dir.path()).await.unwrap()),
+            volume_manifest: Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+                1024 * 1024,
+                CK_BS as u32,
+            ))),
+            dir,
+        }
+    }
+
+    async fn open(&self) -> WriteCache<Active> {
+        let cache = WriteCache::<Initializing>::open(test_config(self.dir.path())).unwrap();
+        cache.finish_recovery().await.unwrap()
+    }
+
+    /// After a crash: block `idx` holds `byte`, is DIRTY, and a flush uploads it.
+    async fn assert_recovered(&self, cache: &WriteCache<Active>, idx: usize, byte: u8, dirty: u64) {
+        let got = cache.read_local_only((idx * CK_BS) as u64, CK_BS).unwrap();
+        assert!(got.iter().all(|&b| b == byte), "block {idx}: local bytes lost");
+        assert_eq!(
+            cache.inner.state_map.get(idx),
+            SparseBlockState::DIRTY,
+            "acked write to block {idx} lost its dirty mark: after the crash reads of it \
+             go to S3 (stale) and a flush never uploads it"
+        );
+        assert_eq!(cache.dirty_block_count(), dirty);
+        let stats = cache
+            .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
+            .await
+            .unwrap();
+        assert_eq!(stats.blocks_claimed as u64, dirty, "flush must upload every acked block");
+    }
+}
+
+#[cfg(feature = "test-utils")]
+fn gated(
+    cache: &WriteCache<Active>,
+    steps: &[super::inner::FlushStep],
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<super::inner::FlushGateEvent>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let (sp, events, proceed) = super::inner::FlushSyncPoints::new();
+    *cache.inner.flush_sync.lock() = Some(Arc::new(sp.only(steps)));
+    (events, proceed)
+}
+
+/// Block 5 is written and fsync'd (acked) while a checkpoint is between its
+/// snapshot (block 5 NOT_PRESENT) and its WAL truncate.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_acked_during_checkpoint_survives_crash() {
+    use super::inner::FlushStep;
+    let cd = CrashDir::new().await;
+    {
+        let cache = Arc::new(cd.open().await);
+        cache.write(0, &vec![0x11; CK_BS]).unwrap();
+        let (mut events, proceed) = gated(&cache, &[FlushStep::CheckpointAfterSnapshot]);
+        let ck = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        assert_eq!(events.recv().await.unwrap().step, FlushStep::CheckpointAfterSnapshot);
+        cache.write((5 * CK_BS) as u64, &vec![0x55; CK_BS]).unwrap();
+        cache.flush().unwrap(); // the NBD FLUSH / ublk FLUSH: acked and durable
+        proceed.send(()).unwrap();
+        ck.await.unwrap().unwrap();
+    } // crash: no shutdown, no final checkpoint
+    let cache = cd.open().await;
+    cd.assert_recovered(&cache, 5, 0x55, 2).await;
+}
+
+/// The persisted sequence must not be newer than the state it describes. Block
+/// 5 is dirtied after the entries were collected but before the sequence is
+/// read; the process dies before the WAL is truncated. Replay filters on the
+/// persisted sequence, so reading it late made replay drop block 5's entry.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metadata_sequence_not_newer_than_its_state() {
+    use super::inner::FlushStep;
+    let cd = CrashDir::new().await;
+    {
+        let cache = Arc::new(cd.open().await);
+        cache.write(0, &vec![0x11; CK_BS]).unwrap();
+        let (mut events, proceed) = gated(&cache, &[FlushStep::MetadataAfterEntries]);
+        let save = tokio::task::spawn_blocking({
+            let cache = Arc::clone(&cache);
+            move || cache.save_metadata()
+        });
+        assert_eq!(events.recv().await.unwrap().step, FlushStep::MetadataAfterEntries);
+        cache.write((5 * CK_BS) as u64, &vec![0x55; CK_BS]).unwrap();
+        cache.flush().unwrap();
+        proceed.send(()).unwrap();
+        save.await.unwrap().unwrap();
+        // crash before any truncate: the WAL still holds block 5's entry
+    }
+    let cache = cd.open().await;
+    cd.assert_recovered(&cache, 5, 0x55, 2).await;
+}
+
+/// A writer paused after it marked its block DIRTY and took a sequence number
+/// but before it appended, while a whole checkpoint runs. The checkpoint must
+/// neither lose that write nor its sequence.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_writer_paused_before_append_across_checkpoint() {
+    use super::inner::FlushStep;
+    let cd = CrashDir::new().await;
+    {
+        let cache = Arc::new(cd.open().await);
+        cache.write(0, &vec![0x11; CK_BS]).unwrap();
+        let (mut events, proceed) = gated(&cache, &[FlushStep::WriterMarkedBeforeAppend]);
+        let w = tokio::task::spawn_blocking({
+            let cache = Arc::clone(&cache);
+            move || {
+                cache.write((5 * CK_BS) as u64, &vec![0x55; CK_BS]).unwrap();
+                cache.flush().unwrap();
+            }
+        });
+        assert_eq!(events.recv().await.unwrap().step, FlushStep::WriterMarkedBeforeAppend);
+        cache.checkpoint().await.unwrap(); // the whole checkpoint, writer parked
+        proceed.send(()).unwrap();
+        w.await.unwrap(); // acked
+    }
+    let cache = cd.open().await;
+    cd.assert_recovered(&cache, 5, 0x55, 2).await;
+}
+
+/// Under sustained clean-to-dirty writes a checkpoint that keeps seeing new
+/// appends skips its truncate; after CKPT_MAX_SKIPS the next one holds the WAL
+/// guard and truncates. The WAL must not grow without bound.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_checkpoint_truncates_wal_under_sustained_writes() {
+    use super::inner::FlushStep;
+    let cd = CrashDir::new().await;
+    let cache = Arc::new(cd.open().await);
+    let wal_len = || std::fs::metadata(test_config(cd.dir.path()).wal_path()).unwrap().len();
+    for round in 0..5usize {
+        let (mut events, proceed) = gated(&cache, &[FlushStep::CheckpointAfterSnapshot]);
+        cache.write(((round * 2) * CK_BS) as u64, &vec![1; CK_BS]).unwrap();
+        let ck = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        // Every optimistic checkpoint is interrupted by a fresh dirtying write.
+        // Once the exclusive path runs there is no gate (it holds the guard).
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await;
+        if got.is_ok() {
+            cache.write(((round * 2 + 1) * CK_BS) as u64, &vec![2; CK_BS]).unwrap();
+            proceed.send(()).unwrap();
+        }
+        ck.await.unwrap().unwrap();
+    }
+    assert!(wal_len() <= 20 * 4, "WAL grew without bound: {} bytes", wal_len());
+    // the last checkpoint ran exclusive and emptied the WAL
+    *cache.inner.flush_sync.lock() = None;
+    cache.checkpoint().await.unwrap();
+    assert_eq!(wal_len(), 0);
+}
+
+/// The same window across a real process kill: the child writes, completes the
+/// checkpoint around a write acked mid-window, then is SIGKILLed.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_acked_during_checkpoint_survives_sigkill() {
+    use super::inner::FlushStep;
+    if let Ok(dir) = std::env::var("GLIDEFS_CKPT_CHILD") {
+        let cache = Arc::new(
+            WriteCache::<Initializing>::open(test_config(Path::new(&dir))).unwrap()
+                .finish_recovery().await.unwrap(),
+        );
+        cache.write(0, &vec![0x11; CK_BS]).unwrap();
+        let (mut events, proceed) = gated(&cache, &[FlushStep::CheckpointAfterSnapshot]);
+        let ck = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        events.recv().await.unwrap();
+        cache.write((5 * CK_BS) as u64, &vec![0x55; CK_BS]).unwrap();
+        cache.flush().unwrap();
+        proceed.send(()).unwrap();
+        ck.await.unwrap().unwrap();
+        std::fs::write(Path::new(&dir).join("done"), b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60)); // wait for SIGKILL
+        return;
+    }
+    let cd = CrashDir::new().await;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            &format!(
+                "{}::test_write_acked_during_checkpoint_survives_sigkill",
+                module_path!().trim_start_matches("glidefs::")
+            ),
+            "--exact",
+            "--nocapture",
+        ])
+        .env("GLIDEFS_CKPT_CHILD", cd.dir.path())
+        .spawn()
+        .unwrap();
+    let done = cd.dir.path().join("done");
+    let t = std::time::Instant::now();
+    while !done.exists() {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "child never finished");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    child.kill().unwrap(); // SIGKILL
+    child.wait().unwrap();
+    let cache = cd.open().await;
+    cd.assert_recovered(&cache, 5, 0x55, 2).await;
+}
+
+/// Two overlapping checkpoints. A snapshots with block 5 clean and stalls before
+/// its rename; block 5 is written and acked; B snapshots with block 5 dirty,
+/// renames and truncates the WAL; A then renames its OLDER snapshot over B's.
+/// Checkpoints must be serialized, snapshot through truncate.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlapping_checkpoints_do_not_publish_a_stale_snapshot() {
+    use super::inner::FlushStep;
+    let cd = CrashDir::new().await;
+    {
+        let cache = Arc::new(cd.open().await);
+        cache.write(0, &vec![0x11; CK_BS]).unwrap();
+        let (sp, mut events, proceed) = super::inner::FlushSyncPoints::new();
+        *cache.inner.flush_sync.lock() =
+            Some(Arc::new(sp.only(&[FlushStep::MetadataBeforeRename]).once()));
+        let a = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        assert_eq!(events.recv().await.unwrap().step, FlushStep::MetadataBeforeRename);
+        cache.write((5 * CK_BS) as u64, &vec![0x55; CK_BS]).unwrap();
+        cache.flush().unwrap();
+        let b = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        // Un-serialized, B runs to completion now; serialized, it waits for A.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        proceed.send(()).unwrap();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+    }
+    let cache = cd.open().await;
+    cd.assert_recovered(&cache, 5, 0x55, 2).await;
+}
