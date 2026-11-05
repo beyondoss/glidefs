@@ -4023,11 +4023,14 @@ async fn test_set_handoff_phase_waits_for_inflight_checkpoint() {
 /// A promoter that read a block's state BEFORE a sibling finished promoting
 /// and writing it must not copy the flushing file over the sibling's data.
 ///
-/// Block 0 is SYNCING with page 0 in the flushing file. Writer C reads the
-/// state (SYNCING) and parks before its claim. Writer A then promotes the
-/// block, lands page 1, and releases the claim (state DIRTY). C resumes, wins
-/// the now-free claim and, acting on its stale state, copies the flushing file
-/// (page 1 = zeros) over A's acked page. Both write transports run this loop.
+/// Block 0 is SYNCING; the flushing file holds page 0 = 0xAA and page 1 =
+/// 0x11 (an OLD value of a page the sibling will rewrite) and page 3 = zeros.
+/// Writer C reads the state (SYNCING) and parks before its claim. Writer A
+/// then promotes the block and lands pages 1 and 3 (0xBB, 0xDD) and releases
+/// the claim (state DIRTY). C resumes, wins the now-free claim and, acting on
+/// its stale state, copies the flushing file over A's acked pages: page 1
+/// rolls back to 0x11 and page 3 reads zeros. Both write transports run this
+/// loop. Exact bytes are asserted, so a rollback to old data fails too.
 #[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promote_claimed_late_does_not_clobber_sibling_write() {
@@ -4035,6 +4038,7 @@ async fn promote_claimed_late_does_not_clobber_sibling_write() {
     let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
 
     h.cache.write(0, &[0xAA; 4096]).unwrap();
+    h.cache.write(4096, &[0x11; 4096]).unwrap();
     assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![0]);
     assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
 
@@ -4054,14 +4058,16 @@ async fn promote_claimed_late_does_not_clobber_sibling_write() {
         };
         assert_eq!(ev.step, super::inner::PromoteStep::BeforeClaim);
 
-        // A: a sibling sub-block write to page 1 runs to completion meanwhile.
+        // A: a sibling runs to completion meanwhile, rewriting an old page
+        // and filling a zero one.
         cache.write(4096, &[0xBB; 4096]).unwrap();
+        cache.write(3 * 4096, &[0xDD; 4096]).unwrap();
 
         proceed.send(()).unwrap();
         c.join().unwrap();
     });
 
-    for (page, want) in [(0u64, 0xAAu8), (1, 0xBB), (2, 0xCC)] {
+    for (page, want) in [(0u64, 0xAAu8), (1, 0xBB), (2, 0xCC), (3, 0xDD)] {
         let got = h.cache.read_local_only(page * 4096, 4096).unwrap();
         assert!(
             got.iter().all(|&b| b == want),
