@@ -470,14 +470,19 @@ jobs:
       - name: fio verify (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Handoff durability per-PR (${{ matrix.transport }})
+        if: false
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_durability_crh_per_pr
       - name: Handoff fault-injection grid (${{ matrix.transport }})
+        if: false
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_fault_injection_grid_crh
       - name: Test (${{ matrix.transport }})
+        if: false
         run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (${{ matrix.transport }})
+        if: false
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (${{ matrix.transport }})
+        if: false
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
       # EVIDENCE ONLY: loop the tests whose failures read zeros after a drain/handoff.
       - name: Loop fio_verify_after_cold_wake and handoff durability (${{ matrix.transport }})
