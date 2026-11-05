@@ -1429,7 +1429,7 @@ async fn churn_in_warm_window() -> anyhow::Result<()> {
     let keep_name = {
         let (_, body) = p.api("GET", "/api/exports", None).await?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
-        v.as_array().and_then(|a| a.first()).and_then(|e| e["name"].as_str()).map(String::from)
+        v["exports"].as_array().and_then(|a| a.first()).and_then(|e| e["name"].as_str()).map(String::from)
             .ok_or_else(|| anyhow::anyhow!("no export in {body}"))?
     };
     write_acked(&keep, &keep_name).await?;
@@ -1470,7 +1470,7 @@ async fn churn_while_frozen() -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let (mut p, pause) = churn_daemon(scratch.path(), "s_pause_before_ready").await?;
     let (_, body) = p.api("GET", "/api/exports", None).await?;
-    let keep_name = serde_json::from_str::<serde_json::Value>(&body)?[0]["name"].as_str().unwrap().to_string();
+    let keep_name = serde_json::from_str::<serde_json::Value>(&body)?["exports"][0]["name"].as_str().unwrap().to_string();
     let keep = p.discover_device_path().await?;
     write_acked(&keep, &keep_name).await?;
     let doomed_dev = p.create_volume("doomed").await?;
