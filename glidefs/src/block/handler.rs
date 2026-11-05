@@ -883,11 +883,19 @@ impl BlockHandler {
                 // remainder is legitimately zeros" no longer holds (the S3
                 // image moved on), so re-enter the state machine instead.
                 if prior.is_empty() || prior.iter().all(|&b| b == 0) {
-                    if !claim.is_valid() {
+                    // Committed through the claim (write lock + CLEAN + claim
+                    // identity, one critical section), NOT a plain `write`: a
+                    // plain write promotes, and promote would wait on this
+                    // very claim if the block was stolen and rotated to
+                    // SYNCING meanwhile.
+                    if !self.cache.write_materialized(
+                        write_start,
+                        &data[data_offset..data_offset + write_len],
+                        &claim,
+                    )? {
                         drop(claim);
                         continue 'block_retry;
                     }
-                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
                     drop(claim);
                     break 'block_retry;
                 }
