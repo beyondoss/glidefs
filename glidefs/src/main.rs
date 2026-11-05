@@ -104,8 +104,9 @@ async fn async_main() -> Result<()> {
         cli::Commands::Run { config } => {
             cli::server::run_server(config).await?;
         }
-        cli::Commands::Handoff { socket, dry_run } => {
-            cli::handoff_cmd::run(socket, dry_run).await?;
+        cli::Commands::Handoff { socket, dry_run, timeout_secs } => {
+            cli::handoff_cmd::run(socket, dry_run, std::time::Duration::from_secs(timeout_secs))
+                .await?;
         }
         cli::Commands::Bless {
             image,

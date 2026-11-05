@@ -40,11 +40,20 @@ const RECV_BUF_BYTES: usize = 64 * 1024;
 pub enum HandoffOutcome {
     /// Successor took over; predecessor is exiting.
     Succeeded { recovered_count: usize, duration: std::time::Duration },
+    /// Dry run: the successor warmed and matched our export set. Nothing was
+    /// cut over; still SERVING.
+    DryRunPassed { duration: std::time::Duration },
     /// Predecessor aborted before any destructive action; still SERVING.
     Aborted { reason: String, duration: std::time::Duration },
     /// Successor crashed after CUTOVER; predecessor revived. Still SERVING.
     RevivedFromFailedHandoff { duration: std::time::Duration },
 }
+
+/// How long the predecessor waits for in-flight export creates and removes
+/// before declining to start. They take seconds (S3 manifest fetch, device
+/// registration); a minute of nothing finishing means something is stuck, and
+/// a handoff behind it would hold every create for as long.
+const EXPORT_SET_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run the predecessor state machine.
 ///
@@ -219,6 +228,29 @@ async fn run_protocol(
         });
     }
 
+    // Export-set fence: from here until we exit or abort, no export is
+    // created or removed, so this snapshot is the final export set and the
+    // successor's HELLO_ACK reconcile makes it match. Taken before the
+    // snapshot; waits for creates and removes already in flight.
+    let Some(set_fence) = coord.router().fence_export_set(EXPORT_SET_FENCE_WAIT).await else {
+        let reason = AbortReason::Other(format!(
+            "an export create or remove did not finish within {}s; handoff not started",
+            EXPORT_SET_FENCE_WAIT.as_secs()
+        ));
+        send_one(sock, &HandoffMessage::Abort(reason.clone())).await.ok();
+        return Ok(HandoffOutcome::Aborted {
+            reason: format!("{reason:?}"),
+            duration: started.elapsed(),
+        });
+    };
+    // Exports created since the handoff began missed the Warming phase set
+    // in `run_predecessor`; without it their checkpoint could truncate the
+    // WAL the successor is about to open and tail-replay. Idempotent, and
+    // waits for a checkpoint already in flight (#112).
+    coord
+        .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Warming)
+        .await;
+
     // Build snapshot of our exports.
     let exports = coord.snapshot().await;
     tracing::info!(count = exports.len(), "handoff: built export snapshot");
@@ -300,10 +332,7 @@ async fn run_protocol(
                 )
                 .await
                 .ok();
-                return Ok(HandoffOutcome::Aborted {
-                    reason: "dry-run completed successfully".into(),
-                    duration: started.elapsed(),
-                });
+                return Ok(HandoffOutcome::DryRunPassed { duration: started.elapsed() });
             }
         }
         HandoffMessage::Abort(r) => {
@@ -435,6 +464,10 @@ async fn run_protocol(
         crate::handoff::metrics::HandoffOutcomeKind::Succeeded,
     );
     crate::handoff::metrics::record_stall_ms(duration_ms);
+    // Never release the fence: this process is exiting, and a create or
+    // remove queued behind it must not run here once the successor serves.
+    // The client's connection resets and it retries against the successor.
+    std::mem::forget(set_fence);
     Ok(HandoffOutcome::Succeeded {
         recovered_count,
         duration,

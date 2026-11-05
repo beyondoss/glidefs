@@ -24,7 +24,7 @@ Possible reasons (`AbortReason` variants in `handoff::protocol`):
 - `VersionMismatch` — predecessor and successor binaries disagree on protocol version. Indicates mixed-version deploy. Roll back the unmatched binary.
 - `NoCommonStrategy` — neither side advertises a usable cutover strategy. Currently impossible (CRH always available); would indicate a build with PIOD-only and the other side unaware.
 - `WarmingFailed` — successor's WARMING (foyer open, S3 prefetch, router build) errored. Detail string says why. Common cause: bad config file or unreachable S3.
-- `ExportMismatch` — successor's loaded router doesn't include exports the predecessor lists. Config drift between binaries (one was deployed with an old config).
+- `ExportMismatch` — the successor could not warm an export the predecessor lists (its `export.json` is missing or unreadable in S3). Exports created or removed during warming are not a mismatch; the successor reconciles them.
 - `FreezeFailed` — predecessor failed to fsync a WAL during freeze. Usually disk-error territory — check `dmesg` and SSD health.
 
 ## Symptom: `handoff complete outcome=RevivedFromFailedHandoff`

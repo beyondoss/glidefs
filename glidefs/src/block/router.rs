@@ -461,6 +461,14 @@ pub struct ExportRouter {
     /// `.await` on slow S3 ops, freezing every other tenant's I/O.
     exports: DashMap<String, ExportState>,
 
+    /// Gate on changing the export set. `PUT` / `DELETE /api/exports/{name}`
+    /// hold it shared for their whole run (create + persist + device
+    /// register, or remove). A handoff predecessor holds it exclusive from
+    /// the successor's HELLO until it exits or aborts, so the export set it
+    /// snapshots in HELLO_ACK is the set the successor takes over. See
+    /// `handoff/ARCHITECTURE.md`, "Export-set fence".
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+
     /// Cap on `exports.len()`. See `RouterConfig::max_exports`.
     max_exports: usize,
 
@@ -823,6 +831,7 @@ impl ExportRouter {
         Ok(Self {
             listener_registry: crate::handoff::listener_registry::ListenerRegistry::new(),
             exports: DashMap::new(),
+            lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             max_exports: config.max_exports,
             object_store: config.object_store,
             db_path: config.db_path,
@@ -3460,6 +3469,56 @@ impl ExportRouter {
         self.remove_local_files(name);
 
         info!(export = %name, "cleanup_failed_create: in-memory state cleared");
+    }
+
+    /// Hold the export set steady for the life of the returned guard: every
+    /// `PUT` / `DELETE` of an export waits (see [`Self::lifecycle`]). Waits for
+    /// in-flight ones to finish, so the caller learns of a stuck one.
+    pub(crate) async fn fence_export_set(
+        &self,
+        wait: Duration,
+    ) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        tokio::time::timeout(wait, Arc::clone(&self.lifecycle).write_owned())
+            .await
+            .ok()
+    }
+
+    /// Shared hold on the export set, taken by the API's create and remove.
+    pub(crate) async fn export_set_changing(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.lifecycle.read().await
+    }
+
+    /// Drop an export from this process without writing anything: no drain,
+    /// no metadata save, no S3 call. For a handoff successor that warmed an
+    /// export the predecessor has since removed; the predecessor already
+    /// flushed or purged it, and anything written here would resurrect it.
+    ///
+    /// `purged`: the export's definition is gone from S3, so the successor's
+    /// own warm-up may have recreated local files after the predecessor's
+    /// purge removed them. Delete those too.
+    ///
+    /// **Idempotent**: an export that isn't here is a no-op.
+    pub(crate) async fn forget_export(&self, name: &str, purged: bool) {
+        let Some((_k, state)) = self.exports.remove(name) else {
+            return;
+        };
+        let ExportState { flush_handle, prefetch_handle, flush_shutdown_tx, .. } = state;
+        let _ = flush_shutdown_tx.send(true);
+        if let Some(h) = prefetch_handle {
+            h.abort();
+            let _ = h.await;
+        }
+        flush_handle.abort();
+        let _ = flush_handle.await;
+        if purged {
+            self.remove_local_files(name);
+        }
+        info!(export = %name, purged, "export forgotten (handoff successor)");
+    }
+
+    /// Whether the export's definition is still in S3. `Err` is "can't tell".
+    pub(crate) async fn export_defined(&self, name: &str) -> Result<bool, RouterError> {
+        Ok(self.load_export(name).await?.is_some())
     }
 
     /// Delete every local file an export owns: cache, flushing file, metadata,

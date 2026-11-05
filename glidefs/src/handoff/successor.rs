@@ -123,11 +123,12 @@ pub async fn run_successor(
         "handoff: HELLO_ACK received"
     );
 
-    // Verify our (already-warmed) router has every export the predecessor
-    // listed. The caller is responsible for having done all slow startup
-    // work before invoking us; we just verify the result.
+    // Make our (already-warmed) router match the predecessor's export set.
+    // The predecessor fenced that set at HELLO, so this snapshot is final:
+    // exports created or removed since we started warming are reconciled
+    // here. Only an export we cannot warm at all is a mismatch.
     let _ = timeouts.warming; // currently unused — kept for future async warm path
-    let missing = missing_exports(coord.router(), &exports).await;
+    let missing = coord.adopt_snapshot(&exports).await;
     if !missing.is_empty() {
         send_one(
             &sock,
@@ -211,19 +212,6 @@ pub async fn run_successor(
         recovered_count,
         inherited_fds,
     })
-}
-
-async fn missing_exports(
-    router: &crate::block::router::ExportRouter,
-    snapshot: &[crate::handoff::protocol::ExportSnapshot],
-) -> Vec<String> {
-    let mut missing = Vec::new();
-    for snap in snapshot {
-        if router.get_handler(&snap.name).await.is_none() {
-            missing.push(snap.name.clone());
-        }
-    }
-    missing
 }
 
 fn connect_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
