@@ -377,6 +377,17 @@ impl DaemonHandle {
     /// Spawn a glidefs daemon with a temp config matching the profile.
     /// Polls the HTTP API for readiness before returning.
     async fn spawn(profile: &TestProfile, scratch: &Path) -> anyhow::Result<Self> {
+        Self::spawn_with_env(profile, scratch, &[]).await
+    }
+
+    /// [`Self::spawn`] with extra environment for the daemon. The successor
+    /// the daemon forks inherits it, which is how a test reaches into the
+    /// successor (fault-injection and pause points).
+    async fn spawn_with_env(
+        profile: &TestProfile,
+        scratch: &Path,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
         let binary = Self::locate_binary()?;
         let cache_dir = scratch.join("cache");
         let storage_dir = scratch.join("storage");
@@ -398,6 +409,7 @@ impl DaemonHandle {
             .arg("-c")
             .arg(&config_path)
             .env("RUST_LOG", "info")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -1236,3 +1248,317 @@ async fn handoff_durability_crh_pre_release() {
 // async fn handoff_durability_piod_per_pr() {
 //     run_handoff_durability_test(PR_PROFILE, StrategyKind::Piod).await.unwrap();
 // }
+
+// =============================================================================
+// Export churn during a handoff
+// =============================================================================
+//
+// A node under create/delete churn must still hand off. The successor warms
+// for seconds while the predecessor keeps creating and removing exports; each
+// of those used to either abort the handoff (`ExportMismatch`) or, worse,
+// slip past the successor's check and leave a live device with no handler.
+//
+// These tests fail, never skip, when the environment is missing: a skipped
+// proof proves nothing.
+
+const CHURN_DEVICE_BYTES: usize = 1 << 20;
+
+fn require_ublk_env() {
+    assert!(Path::new("/dev/ublk-control").exists(), "/dev/ublk-control missing — modprobe ublk_drv");
+    assert!(nix_root(), "not root — ublk control device needs CAP_SYS_ADMIN");
+    raise_nofile_limit();
+}
+
+/// Deterministic, per-name 1 MiB pattern (never all zeros).
+fn pattern(name: &str) -> Vec<u8> {
+    let mut x: u64 = name.bytes().fold(0x9E37_79B9_7F4A_7C15, |a, b| a.rotate_left(7) ^ u64::from(b));
+    (0..CHURN_DEVICE_BYTES)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8 | 1
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+impl DaemonHandle {
+    /// `(http status, body)` of one API call.
+    async fn api(&self, method: &str, path: &str, body: Option<&str>) -> anyhow::Result<(u16, String)> {
+        let mut cmd = tokio::process::Command::new("curl");
+        cmd.args(["--silent", "--max-time", "60", "-X", method, "-w", "\n%{http_code}"]);
+        if let Some(b) = body {
+            cmd.args(["-H", "Content-Type: application/json", "-d", b]);
+        }
+        cmd.arg(format!("http://{}{path}", self.api_addr));
+        let out = cmd.output().await?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let (body, code) = text.rsplit_once('\n').unwrap_or(("", "0"));
+        Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+    }
+
+    async fn create_volume(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let (code, body) = self
+            .api("PUT", &format!("/api/exports/{name}"), Some(r#"{"size_gb":1,"transport":"ublk"}"#))
+            .await?;
+        anyhow::ensure!(code == 200 || code == 201, "PUT {name}: HTTP {code}: {body}");
+        device_of(&body)
+    }
+
+    /// The export's device, or `None` if the daemon has no such export.
+    async fn volume_device(&self, name: &str) -> anyhow::Result<Option<PathBuf>> {
+        let (code, body) = self.api("GET", &format!("/api/exports/{name}"), None).await?;
+        match code {
+            404 => Ok(None),
+            200 => Ok(Some(device_of(&body)?)),
+            _ => anyhow::bail!("GET {name}: HTTP {code}: {body}"),
+        }
+    }
+
+    async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
+        let (code, body) = self.api("DELETE", &format!("/api/exports/{name}?purge=true"), None).await?;
+        anyhow::ensure!(code == 200 || code == 404, "DELETE {name}: HTTP {code}: {body}");
+        Ok(())
+    }
+
+    /// Wait for the successor to answer on the same API address.
+    async fn wait_api(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if matches!(self.api("GET", "/api/exports", None).await, Ok((200, _))) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::bail!("API not answering after {timeout:?}")
+    }
+}
+
+fn device_of(body: &str) -> anyhow::Result<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(body)?;
+    let dev = v["device"].as_str().ok_or_else(|| anyhow::anyhow!("no device in {body}"))?;
+    Ok(PathBuf::from(dev))
+}
+
+/// Acked write: O_DIRECT + O_DSYNC, so it is durable on glidefs's terms
+/// before dd returns.
+async fn write_acked(dev: &Path, name: &str) -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), pattern(name))?;
+    let out = tokio::process::Command::new("dd")
+        .arg(format!("if={}", file.path().display()))
+        .arg(format!("of={}", dev.display()))
+        .args(["bs=1M", "count=1", "oflag=direct,dsync", "conv=notrunc"])
+        .output()
+        .await?;
+    anyhow::ensure!(out.status.success(), "dd write {}: {}", dev.display(), String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}
+
+async fn assert_holds(dev: &Path, name: &str, why: &str) -> anyhow::Result<()> {
+    let out = tokio::process::Command::new("dd")
+        .arg(format!("if={}", dev.display()))
+        .args(["bs=1M", "count=1", "iflag=direct", "status=none"])
+        .output()
+        .await?;
+    anyhow::ensure!(out.status.success(), "dd read {}: {}", dev.display(), String::from_utf8_lossy(&out.stderr));
+    anyhow::ensure!(out.stdout == pattern(name), "{name} on {}: acked write lost ({why})", dev.display());
+    Ok(())
+}
+
+fn alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+async fn wait_for(path: &Path, timeout: Duration, what: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        anyhow::ensure!(Instant::now() < deadline, "timed out after {timeout:?} waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// `glidefs handoff [--dry-run]` as an operator or the deploy gate runs it.
+fn spawn_handoff_cli(dry_run: bool) -> anyhow::Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new(DaemonHandle::locate_binary()?);
+    cmd.arg("handoff");
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    Ok(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?)
+}
+
+/// Wait for the predecessor to be gone and the successor to answer, then take
+/// over the handle. Fails if the handoff does not complete: a predecessor that
+/// is still alive after `timeout` means it aborted.
+async fn await_cutover(p: &mut DaemonHandle, timeout: Duration) -> anyhow::Result<()> {
+    let old = p.pid;
+    if let Some(mut child) = p.process.take() {
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => anyhow::ensure!(status?.success(), "predecessor exited non-zero"),
+            Err(_) => anyhow::bail!("handoff did not complete: predecessor pid {old} still alive after {timeout:?}"),
+        }
+    }
+    p.wait_api(Duration::from_secs(30)).await?;
+    p.pid = p.discover_pid()?;
+    anyhow::ensure!(p.pid != old, "same pid {old} after handoff");
+    Ok(())
+}
+
+async fn churn_daemon(scratch: &Path, pause_at: &str) -> anyhow::Result<(DaemonHandle, PathBuf)> {
+    let pause_dir = scratch.join("pause");
+    std::fs::create_dir_all(&pause_dir)?;
+    let p = DaemonHandle::spawn_with_env(
+        &PR_PROFILE,
+        scratch,
+        &[("GLIDEFS_PAUSE_AT", pause_at), ("GLIDEFS_PAUSE_DIR", pause_dir.to_str().unwrap())],
+    )
+    .await?;
+    Ok((p, pause_dir))
+}
+
+/// Exports created and removed while the successor warms. The successor must
+/// take over exactly the exports the predecessor ends with, serve each with
+/// every acked write, and serve none of the removed ones.
+async fn churn_in_warm_window() -> anyhow::Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let (mut p, pause) = churn_daemon(scratch.path(), "s_pause_in_warming").await?;
+    let keep = p.discover_device_path().await?;
+    let keep_name = {
+        let (_, body) = p.api("GET", "/api/exports", None).await?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        v["exports"].as_array().and_then(|a| a.first()).and_then(|e| e["name"].as_str()).map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("no export in {body}"))?
+    };
+    write_acked(&keep, &keep_name).await?;
+    let doomed_dev = p.create_volume("doomed").await?;
+    write_acked(&doomed_dev, "doomed").await?;
+
+    let cli = spawn_handoff_cli(false)?;
+    wait_for(&pause.join("s_pause_in_warming.reached"), Duration::from_secs(120), "successor to finish warming").await?;
+
+    // The successor has built its router. From here the predecessor's export
+    // set moves under it.
+    let born_dev = p.create_volume("born").await?;
+    write_acked(&born_dev, "born").await?;
+    p.create_volume("fleeting").await?;
+    p.delete_volume("fleeting").await?;
+    p.delete_volume("doomed").await?;
+    std::fs::write(pause.join("s_pause_in_warming.go"), b"")?;
+
+    await_cutover(&mut p, Duration::from_secs(90)).await?;
+    let verdict = cli.wait_with_output().await?;
+    anyhow::ensure!(verdict.status.success(), "glidefs handoff exited {:?}: {}", verdict.status, String::from_utf8_lossy(&verdict.stderr));
+
+    assert_holds(&keep, &keep_name, "export that existed throughout").await?;
+    let born = p.volume_device("born").await?.ok_or_else(|| anyhow::anyhow!("born (created during warming) is not served by the successor"))?;
+    assert_holds(&born, "born", "export created during warming").await?;
+    anyhow::ensure!(p.volume_device("doomed").await?.is_none(), "doomed (removed during warming) is still served by the successor");
+    anyhow::ensure!(p.volume_device("fleeting").await?.is_none(), "fleeting (created and removed during warming) is served by the successor");
+    // Serves new writes, not just old reads.
+    write_acked(&born, "born-2").await?;
+    assert_holds(&born, "born-2", "write after the handoff").await?;
+    Ok(())
+}
+
+/// Creates and removes requested while the predecessor waits for the
+/// successor's READY (the freeze stage) must not run on the predecessor: they
+/// wait, and the client's retry lands on the successor.
+async fn churn_while_frozen() -> anyhow::Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let (mut p, pause) = churn_daemon(scratch.path(), "s_pause_before_ready").await?;
+    let (_, body) = p.api("GET", "/api/exports", None).await?;
+    let keep_name = serde_json::from_str::<serde_json::Value>(&body)?["exports"][0]["name"].as_str().unwrap().to_string();
+    let keep = p.discover_device_path().await?;
+    write_acked(&keep, &keep_name).await?;
+    let doomed_dev = p.create_volume("doomed").await?;
+    write_acked(&doomed_dev, "doomed").await?;
+
+    let cli = spawn_handoff_cli(false)?;
+    wait_for(&pause.join("s_pause_before_ready.reached"), Duration::from_secs(120), "successor to hold the export set").await?;
+
+    let url = |n: &str| format!("http://{}/api/exports/{n}", p.api_addr);
+    let mut create = tokio::process::Command::new("curl")
+        .args(["--silent", "--max-time", "120", "-X", "PUT", "-H", "Content-Type: application/json"])
+        .args(["-d", r#"{"size_gb":1,"transport":"ublk"}"#, &url("late")])
+        .stdout(Stdio::null())
+        .spawn()?;
+    let mut remove = tokio::process::Command::new("curl")
+        .args(["--silent", "--max-time", "120", "-X", "DELETE", &format!("{}?purge=true", url("doomed"))])
+        .stdout(Stdio::null())
+        .spawn()?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    anyhow::ensure!(create.try_wait()?.is_none(), "create ran on the predecessor while the export set was fenced");
+    anyhow::ensure!(remove.try_wait()?.is_none(), "remove ran on the predecessor while the export set was fenced");
+    anyhow::ensure!(p.volume_device("late").await?.is_none(), "late exists on the predecessor");
+    anyhow::ensure!(p.volume_device("doomed").await?.is_some(), "doomed removed on the predecessor");
+    std::fs::write(pause.join("s_pause_before_ready.go"), b"")?;
+
+    await_cutover(&mut p, Duration::from_secs(90)).await?;
+    let verdict = cli.wait_with_output().await?;
+    anyhow::ensure!(verdict.status.success(), "glidefs handoff exited {:?}: {}", verdict.status, String::from_utf8_lossy(&verdict.stderr));
+    let _ = tokio::time::timeout(Duration::from_secs(30), create.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), remove.wait()).await;
+
+    // The clients retry against the successor.
+    let late = p.create_volume("late").await?;
+    write_acked(&late, "late").await?;
+    assert_holds(&late, "late", "export created on the successor").await?;
+    p.delete_volume("doomed").await?;
+    anyhow::ensure!(p.volume_device("doomed").await?.is_none(), "doomed still served after its DELETE was retried");
+    assert_holds(&keep, &keep_name, "export that existed throughout").await?;
+    Ok(())
+}
+
+/// `glidefs handoff --dry-run` is a gate: exit 0 only when a handoff would
+/// succeed, non-zero with the reason on stderr when it would not, and the
+/// predecessor keeps serving either way.
+async fn dry_run_reports_outcome() -> anyhow::Result<()> {
+    // Would succeed, even with a create landing in the warm window.
+    {
+        let scratch = tempfile::tempdir()?;
+        let (p, pause) = churn_daemon(scratch.path(), "s_pause_in_warming").await?;
+        let cli = spawn_handoff_cli(true)?;
+        wait_for(&pause.join("s_pause_in_warming.reached"), Duration::from_secs(120), "successor to finish warming").await?;
+        let born = p.create_volume("born").await?;
+        write_acked(&born, "born").await?;
+        std::fs::write(pause.join("s_pause_in_warming.go"), b"")?;
+        let verdict = cli.wait_with_output().await?;
+        anyhow::ensure!(verdict.status.success(), "dry run exited {:?}: {}", verdict.status, String::from_utf8_lossy(&verdict.stderr));
+        anyhow::ensure!(alive(p.pid), "dry run killed the predecessor");
+        assert_holds(&born, "born", "dry run must not disturb the predecessor").await?;
+    }
+    // Would abort: the successor dies while warming.
+    {
+        let scratch = tempfile::tempdir()?;
+        let p = DaemonHandle::spawn_with_env(&PR_PROFILE, scratch.path(), &[("GLIDEFS_INJECT_FAILURE", "s_crash_after_warming")]).await?;
+        let verdict = spawn_handoff_cli(true)?.wait_with_output().await?;
+        anyhow::ensure!(!verdict.status.success(), "dry run of a handoff that aborts exited 0");
+        anyhow::ensure!(!verdict.stderr.is_empty(), "dry run aborted but said nothing on stderr");
+        anyhow::ensure!(alive(p.pid), "aborted dry run killed the predecessor");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires sudo + ublk_drv + test-fault-injection; runs in CI's kernel-devices job"]
+async fn handoff_export_churn_warm_window_crh() {
+    require_ublk_env();
+    churn_in_warm_window().await.expect("export churn during warming");
+}
+
+#[tokio::test]
+#[ignore = "requires sudo + ublk_drv + test-fault-injection; runs in CI's kernel-devices job"]
+async fn handoff_export_churn_frozen_crh() {
+    require_ublk_env();
+    churn_while_frozen().await.expect("export churn during the freeze");
+}
+
+#[tokio::test]
+#[ignore = "requires sudo + ublk_drv + test-fault-injection; runs in CI's kernel-devices job"]
+async fn handoff_dry_run_outcome_crh() {
+    require_ublk_env();
+    dry_run_reports_outcome().await.expect("dry-run outcome");
+}

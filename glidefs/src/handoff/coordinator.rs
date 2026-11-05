@@ -113,6 +113,81 @@ impl HandoffCoordinator {
         out
     }
 
+    /// Successor-side: make the warmed router hold exactly the exports the
+    /// predecessor lists, no more and no fewer. Returns the names that could
+    /// not be adopted (empty on success).
+    ///
+    /// The router was built from the node's device maps some seconds before
+    /// HELLO_ACK, while the predecessor kept creating and removing exports.
+    /// The predecessor fences the export set from HELLO, so `snapshot` is
+    /// final and this is the only reconcile there is:
+    ///
+    /// - listed, not warmed (created in the window): warm it now, from the
+    ///   `export.json` the create persisted before releasing the fence.
+    /// - warmed, not listed (removed in the window): forget it, writing
+    ///   nothing. Left in, the serve loop would register a fresh device for it.
+    /// - listed with a different size (resized in the window): forget and
+    ///   warm again at the new size.
+    ///
+    /// Everything here is local to this process, so an abort at any point
+    /// leaves the predecessor serving and nothing durable changed.
+    pub async fn adopt_snapshot(&self, snapshot: &[ExportSnapshot]) -> Vec<String> {
+        use futures::stream::{self, StreamExt};
+        use std::collections::HashMap;
+
+        let listed: HashMap<&str, &ExportSnapshot> =
+            snapshot.iter().map(|e| (e.name.as_str(), e)).collect();
+
+        let warmed: Vec<(String, u64)> = self
+            .router
+            .exports_map()
+            .iter()
+            .map(|e| (e.key().clone(), e.value().handler.device_size()))
+            .collect();
+        let mut stale = Vec::new();
+        for (name, size) in warmed {
+            match listed.get(name.as_str()) {
+                None => {
+                    info!(export = %name, "handoff: export removed on predecessor during warming");
+                    // No export.json means a purge: the local files go too.
+                    // "Can't tell" keeps them.
+                    let purged = matches!(self.router.export_defined(&name).await, Ok(false));
+                    self.router.forget_export(&name, purged).await;
+                }
+                Some(snap) if snap.size_bytes != size => {
+                    info!(export = %name, warmed = size, listed = snap.size_bytes,
+                        "handoff: export resized on predecessor during warming");
+                    self.router.forget_export(&name, false).await;
+                    stale.push(name);
+                }
+                Some(_) => {}
+            }
+        }
+
+        let to_warm: Vec<&ExportSnapshot> = snapshot
+            .iter()
+            .filter(|e| self.router.exports_map().get(&e.name).is_none())
+            .collect();
+        if !to_warm.is_empty() {
+            info!(count = to_warm.len(), resized = stale.len(),
+                "handoff: warming exports the predecessor gained during warming");
+        }
+
+        let router = &self.router;
+        stream::iter(to_warm)
+            .map(|snap| async move {
+                let attach = async {
+                    let config = router.resolve_export(&snap.name).await.ok()??;
+                    router.create_export(config, snap.readonly, None, None).await.ok()
+                };
+                attach.await.is_none().then(|| snap.name.clone())
+            })
+            .buffer_unordered(16)
+            .filter_map(|failed| async move { failed })
+            .collect()
+            .await
+    }
+
     /// Set the per-export handoff phase on every WriteCache.
     /// Replaces the older `set_all_caches_freeze(bool)` setter.
     pub async fn set_all_caches_phase(&self, phase: HandoffPhase) {
@@ -420,5 +495,67 @@ impl HandoffCoordinator {
     #[cfg(not(all(target_os = "linux", feature = "ublk")))]
     pub async fn revive_after_failed_handoff(&self) -> Result<usize, RouterError> {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ExportConfig;
+
+    fn config(name: &str, size_gb: f64) -> ExportConfig {
+        ExportConfig {
+            name: name.to_string(),
+            size_gb,
+            s3_prefix: None,
+            block_size: None,
+            flush_threshold: None,
+            flush_mode: None,
+            transport: None,
+            compaction_cooldown: None,
+            source: None,
+        }
+    }
+
+    fn listed(name: &str, size_gb: f64) -> ExportSnapshot {
+        ExportSnapshot {
+            name: name.to_string(),
+            size_bytes: (size_gb * 1_073_741_824.0) as u64,
+            readonly: false,
+            last_wal_seq: 0,
+            ublk_dev_id: None,
+        }
+    }
+
+    /// The successor warmed {kept, gone, grown@0.01}; the predecessor now lists
+    /// {kept, grown@0.02, born}. Adopting must leave exactly that set, at those
+    /// sizes, and report an export it cannot warm instead of skipping it.
+    #[tokio::test]
+    async fn adopt_snapshot_matches_the_listed_set() {
+        let router = Arc::new(ExportRouter::new_for_test().await);
+        for (n, gb) in [("kept", 0.01), ("gone", 0.01), ("grown", 0.01)] {
+            router.create_export(config(n, gb), false, None, None).await.unwrap();
+            router.save_export(&config(n, gb)).await.unwrap();
+        }
+        // The predecessor created `born` and grew `grown` after we warmed.
+        router.save_export(&config("born", 0.01)).await.unwrap();
+        router.save_export(&config("grown", 0.02)).await.unwrap();
+        let coord = HandoffCoordinator::new(Arc::clone(&router));
+
+        let failed = coord
+            .adopt_snapshot(&[
+                listed("kept", 0.01),
+                listed("grown", 0.02),
+                listed("born", 0.01),
+                listed("undefined", 0.01), // no export.json anywhere
+            ])
+            .await;
+
+        assert_eq!(failed, vec!["undefined".to_string()]);
+        let mut names = router.list_export_names().await;
+        names.sort();
+        assert_eq!(names, ["born", "grown", "kept"]);
+        let grown = router.get_handler("grown").await.unwrap();
+        assert_eq!(grown.device_size(), listed("grown", 0.02).size_bytes);
     }
 }

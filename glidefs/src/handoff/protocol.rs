@@ -36,7 +36,10 @@ pub const DEFAULT_HANDOFF_CTL_SOCKET: &str = "/run/glidefs/handoff.ctl.sock";
 /// Wire protocol bytes for the handoff *control* socket
 /// (`/run/glidefs/handoff.ctl.sock`). One byte each way:
 /// - Request: REQUEST_HANDOFF or REQUEST_HANDOFF_DRY_RUN.
-/// - Response: RESPONSE_ACCEPTED / BUSY / UNSUPPORTED.
+/// - Response: RESPONSE_ACCEPTED / BUSY / UNSUPPORTED. After ACCEPTED the
+///   daemon holds the connection until the handoff has an outcome, then
+///   sends RESPONSE_OK, or RESPONSE_FAILED followed by the reason as UTF-8
+///   up to EOF. (A real handoff that succeeds exits right after RESPONSE_OK.)
 ///
 /// Used by the `glidefs handoff` CLI, the `POST /admin/handoff` HTTP
 /// API endpoint, and any orchestrator that wants to trigger a handoff
@@ -47,6 +50,8 @@ pub mod ctl_wire {
     pub const RESPONSE_ACCEPTED: u8 = b'A';
     pub const RESPONSE_BUSY: u8 = b'B';
     pub const RESPONSE_UNSUPPORTED: u8 = b'U';
+    pub const RESPONSE_OK: u8 = b'K';
+    pub const RESPONSE_FAILED: u8 = b'F';
 }
 
 /// Capability bits negotiated in HELLO. Both sides advertise their
@@ -117,9 +122,10 @@ pub enum AbortReason {
     VersionMismatch { ours: u32, theirs: u32 },
     /// No common cutover strategy in negotiated capabilities.
     NoCommonStrategy,
-    /// Successor's loaded router doesn't include some exports the
-    /// predecessor lists. Indicates config drift between predecessor
-    /// and successor binaries.
+    /// The successor could not warm some export the predecessor lists (its
+    /// `export.json` is missing or unreadable in S3). Exports created or
+    /// removed during the successor's warm-up are not a mismatch: the
+    /// successor reconciles them (see `HandoffCoordinator::adopt_snapshot`).
     ExportMismatch { missing: Vec<String> },
     /// Successor failed to warm up (foyer open, WAL replay, etc.).
     WarmingFailed { detail: String },

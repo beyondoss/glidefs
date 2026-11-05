@@ -59,12 +59,14 @@ DEAD (exit 0)                            set_freeze_in_progress(false)
                     VersionMismatch
                     NoCommonStrategy        P sends Abort, stays SERVING
   HELLO ──► HELLO_ACK ──► READY ──────────►│ S sends Abort on ExportMismatch
-                    ExportMismatch              or WarmingFailed, then exits
+                    ExportMismatch              (an export it cannot warm)
+                                                or WarmingFailed, then exits
                     WarmingFailed
                     FreezeFailed ────────── P sends Abort, calls unfreeze_all,
                                             stays SERVING
                     dry-run-complete ─────── P sends Abort(Other), stays SERVING
-                                            (operator proved WARMING works)
+                                            (operator proved WARMING works;
+                                            outcome DryRunPassed, CLI exits 0)
 ```
 
 ### Revival path (successor crashes after PREDS_DEAD)
@@ -103,6 +105,23 @@ DEAD (exit 0)                            set_freeze_in_progress(false)
 Messages travel over an `AF_UNIX SOCK_SEQPACKET` socket at `/run/glidefs/handoff.sock`. SEQPACKET preserves message boundaries (no framing needed), delivers in-order, and supports ancillary `SCM_RIGHTS` data in the same call. Each message is bincode-serialized and fits in a 64 KiB receive buffer (handles ~1,000 exports at ~60 bytes/export + overhead).
 
 A separate byte-level control socket at `/run/glidefs/handoff.ctl.sock` accepts single-byte commands from `glidefs handoff` CLI and `POST /admin/handoff`: `H` (handoff), `D` (dry-run). Responses: `A` (accepted), `B` (busy), `U` (unsupported). This separates triggering from the handoff protocol itself.
+
+After `A` the daemon keeps the connection open until the handoff has an outcome, then sends `K` (ok: handoff succeeded, or dry run passed) or `F` followed by the reason up to EOF (aborted, revived, or failed). `glidefs handoff` waits for it (`--timeout-secs`, default 300) and exits non-zero on `F`, on a timeout, or on EOF with no verdict (a daemon older than the CLI sends none). `POST /admin/handoff` reads only the `A` and hangs up; the handoff runs regardless. A real handoff that succeeds sends `K` just before the predecessor exits.
+
+### Export-set fence
+
+The successor builds its router from the node's device maps, then sends HELLO, and the predecessor snapshots its exports for HELLO_ACK. Warming takes seconds to tens of seconds; the predecessor keeps serving `PUT` and `DELETE /api/exports/{name}` throughout. Left alone, an export created in that time is missing from the successor (an abort at best; at worst a live ublk device no handler claims), and one removed in it is warmed on the successor and registered again by the serve loop.
+
+So the export set is fenced, once, at the one moment that decides it:
+
+- `ExportRouter::lifecycle` is a `RwLock`. `PUT` (create/attach/resize) and `DELETE` hold it shared for their whole run, so an export is created with its `export.json` persisted and its device registered, or not at all.
+- On HELLO the predecessor takes it exclusive (`fence_export_set`, 30 s; if a create or remove is stuck longer, the handoff aborts and the predecessor serves on). It then re-applies the Warming phase to every cache (exports created since the handoff began missed it, and a checkpoint there would truncate the WAL the successor is about to open), and takes the snapshot. The snapshot is now final.
+- The fence is held until the predecessor aborts or revives (released) or exits (never released, so a request queued behind it cannot run once the successor serves; its client sees a reset and retries against the successor).
+- The successor makes its router equal the snapshot (`HandoffCoordinator::adopt_snapshot`) before it sends READY: a listed export it did not warm is warmed from its `export.json`; a warmed export that is not listed is forgotten without writing anything (its local files are deleted too if `export.json` is gone, which means a purge); an export listed at a different size (resized) is forgotten and warmed again. Only an export it cannot warm at all is an `ExportMismatch`.
+
+Why every crash point is safe. All the successor's work is in its own memory plus WAL/cache files it opens exactly as warming already does; nothing it does before PREDS_DEAD changes durable state, so a successor crash or abort leaves the predecessor serving (the fence is dropped with the abort). A predecessor crash drops the fence with the process and cold-start recovery runs as before. The window between the snapshot and the freeze needs nothing new: no export can appear or go, and writes to the listed exports are covered by the freeze and `replay_wal_tail` as before. Cost: a create or remove that arrives between HELLO and the end of the handoff waits for it (successor reconcile plus freeze plus cutover, normally a second or two), instead of running. The Stateright model does not cover handoff (`stateright-model` models the write/flush/recovery paths), so there is no transition to add; the end-to-end tests below are the proof.
+
+Proofs: `handoff_export_churn_warm_window_crh`, `handoff_export_churn_frozen_crh`, `handoff_dry_run_outcome_crh` in `tests/handoff_durability.rs`, run on both ublk transports in CI's kernel-devices job.
 
 ### Freeze-in-progress timing invariant
 
@@ -177,7 +196,8 @@ DEAD (exit 0)                        Succeeded
 | From | Event | To | Guard | What Actually Happens |
 |---|---|---|---|---|
 | SERVING | SIGHUP / CLI | WAITING_HELLO | — | `set_all_caches_freeze(true)`, socket bound, successor forked |
-| WAITING_HELLO | recv Hello | WAITING_READY | version match, common strategy | HelloAck + SCM_RIGHTS listener fds sent |
+| WAITING_HELLO | recv Hello | WAITING_READY | version match, common strategy, export-set fence taken | Warming phase re-applied; HelloAck (final snapshot) + SCM_RIGHTS listener fds sent |
+| WAITING_HELLO | fence not taken in 30 s | SERVING | — | Abort(Other) sent; a create or remove is stuck |
 | WAITING_HELLO | timeout / bad version | SERVING | — | Abort sent; freeze cleared |
 | WAITING_READY | recv Ready (dry_run=false) | FROZEN | — | `freeze_all()` called (blocks writes, fsyncs WALs) |
 | WAITING_READY | recv Abort / timeout | SERVING | — | freeze cleared; predecessor resumes normally |
@@ -193,20 +213,22 @@ DEAD (exit 0)                        Succeeded
 STARTED (--handoff-from <socket>)
    │
    ├── connect to handoff socket
-   ├── send Hello{version, caps, pid, dry_run}
-   │
-   ├── WARMING (slow startup — all of it before we talk to P again):
+   ├── WARMING (slow startup — all of it before we talk to P):
    │     open foyer cache
    │     replay WAL
-   │     build ExportRouter (handlers for every export)
+   │     build ExportRouter (handlers for every export on this node's device maps)
    │     prefetch S3 chunk metadata
    │
+   ├── send Hello{version, caps, pid, dry_run}
    ├── recv HelloAck + SCM_RIGHTS fds
    │     version mismatch ──────────────► exit with error
    │     recv Abort ────────────────────► exit with error
    │
-   ├── verify router has all listed exports
-   │     missing exports ────────────────► send Abort(ExportMismatch); exit
+   ├── adopt_snapshot(): router := exactly the listed exports
+   │     listed, not warmed ─────────────► warm from export.json
+   │     warmed, not listed ─────────────► forget (write nothing)
+   │     resized ────────────────────────► forget, warm again
+   │     cannot warm one ────────────────► send Abort(ExportMismatch); exit
    │
    ├── send Ready
    │
@@ -227,8 +249,8 @@ SERVING
 
 | From | Event | To | Guard | What Actually Happens |
 |---|---|---|---|---|
-| WARMING | recv HelloAck | POST_WARMING | version matches | Verifies router has all listed exports |
-| POST_WARMING | export mismatch | EXIT | — | Abort(ExportMismatch) sent; successor exits |
+| WARMING | recv HelloAck | POST_WARMING | version matches | `adopt_snapshot()`: router made equal to the listed exports |
+| POST_WARMING | an export cannot be warmed | EXIT | — | Abort(ExportMismatch) sent; successor exits |
 | POST_WARMING | exports OK | READY_SENT | — | Ready sent |
 | READY_SENT (dry_run) | recv Abort(dry-run-complete) | EXIT | — | Successor exits cleanly; P stays SERVING |
 | READY_SENT | recv Cutover then PredsDead | TAKING_OVER | — | `replay_wal_tail()`; then `recover_devices_by_id()` |
@@ -316,7 +338,8 @@ The handoff socket is created at `/run/glidefs/handoff.sock` (mode 0600, owned b
 | Successor binary not found or fails to exec | `spawn_successor` returns Err; predecessor logs and stays SERVING; freeze cleared | No handoff; operator retries after fixing binary path |
 | Successor times out connecting | accept timeout fires; `Aborted{timeout}`; freeze cleared | Predecessor stays SERVING; stale socket removed on next attempt |
 | Version mismatch (old P / new S or vice versa) | P sends Abort(VersionMismatch), returns Aborted; freeze cleared | No handoff; operator must align versions |
-| Export config drift (S missing an export) | S sends Abort(ExportMismatch); P returns Aborted; freeze cleared | No handoff; operator aligns configs |
+| S cannot warm an export P lists (export.json unreadable) | S sends Abort(ExportMismatch); P returns Aborted; freeze cleared | No handoff; fix the export's definition |
+| Export created or removed while S warms | Not a failure: P fences the export set at HELLO and S adopts the snapshot | None |
 | S crashes during WARMING (before READY) | P hits READY timeout; Aborted; freeze cleared | Predecessor stays SERVING uninterrupted |
 | S sends Abort(WarmingFailed) | P receives Abort, returns Aborted; freeze cleared | Predecessor stays SERVING; inspect successor logs |
 | `freeze_all()` fails (WAL fsync error) | P sends Abort(FreezeFailed), calls `unfreeze_all()` | Predecessor stays SERVING; investigate WAL/disk |
@@ -354,4 +377,4 @@ Single ublk device, 4K random write under `fio --verify=crc32c`:
 
 - **`handoff_sequential_50_crh` / `handoff_multi_export_5_crh` stress failures**: 50 sequential handoffs or 5-export parallel handoffs under continuous fio write+verify produce occasional `bad magic header 0` verify failures in the first ~10 s. The handoff protocol completes correctly each time — WAL tail-replay fires and replays thousands of entries per handoff. The race is in in-flight ublk-bio handling during the QUIESCED → reissue kernel transition, not in the userspace state machine.
 - **PIOD strategy**: not implemented. Kernel 6.16+ with `UBLK_F_PER_IO_DAEMON` would eliminate the QUIESCED transition, reducing the stall floor to sub-millisecond. The wire protocol has an extension point (`StrategyMsg`, `Capabilities.piod`). See `strategy/piod.rs` for the implementation guide.
-- **Dry-run mode**: successor performs full WARMING through READY, then P sends Abort(dry-run-complete). Successor exits cleanly. Useful for canary validation (`glidefs handoff --dry-run`).
+- **Dry-run mode**: successor performs full WARMING through READY, then P sends Abort(dry-run-complete). Successor exits cleanly. Useful for canary validation (`glidefs handoff --dry-run`), which waits for the outcome and exits non-zero with the reason on stderr if the handoff would abort.

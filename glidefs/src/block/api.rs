@@ -391,6 +391,12 @@ async fn create_or_attach_volume(
     req: &CreateVolumeRequest,
     from: &FromRef,
 ) -> Response<BoxBody> {
+    // Hold the export set steady against a handoff: the predecessor fences it
+    // from HELLO on, so an export is either in the snapshot the successor
+    // takes over or created after the successor serves. Held across create,
+    // persist and device registration.
+    let _set = router.export_set_changing().await;
+
     // Single-attach fencing token: high half = orchestrator placement
     // generation, low half = node-lease claim revision. 0/0 is Grant only
     // against an unfenced volume; a lease-only token still
@@ -1077,6 +1083,7 @@ where
                 })
                 .unwrap_or(false);
 
+            let _set = router.export_set_changing().await;
             match router.remove_export(name, purge).await {
                 Ok(()) => json_response(
                     StatusCode::OK,

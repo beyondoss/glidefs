@@ -622,9 +622,10 @@ async fn serve_with_router_inner(
     let handoff_in_progress = Arc::new(tokio::sync::Mutex::new(()));
 
     // Spawn the handoff control socket listener for `glidefs handoff`
-    // CLI invocations. mpsc carries (dry_run: bool) — the value tells
-    // the signal loop which mode to launch.
-    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<bool>(1);
+    // CLI invocations. mpsc carries (dry_run, reply): dry_run tells the
+    // signal loop which mode to launch; reply carries the outcome back to the
+    // waiting CLI.
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<CtlRequest>(1);
     let ctrl_socket_path =
         std::path::PathBuf::from(crate::handoff::DEFAULT_HANDOFF_CTL_SOCKET);
     {
@@ -661,22 +662,27 @@ async fn serve_with_router_inner(
                     continue;
                 };
                 info!("Received SIGHUP, initiating graceful handoff...");
-                if dispatch_handoff(&router, &config_path, false, &mut handoff_succeeded).await {
+                if dispatch_handoff(&router, &config_path, false, &mut handoff_succeeded).await.0 {
                     break;
                 }
                 drop(_guard);
             }
             ctrl = ctrl_rx.recv() => {
-                let Some(dry_run) = ctrl else {
+                let Some(CtlRequest { dry_run, reply }) = ctrl else {
                     warn!("handoff control socket channel closed");
                     continue;
                 };
                 let Ok(_guard) = handoff_in_progress.clone().try_lock_owned() else {
                     warn!("control-socket handoff request but one already in flight; ignoring");
+                    let _ = reply.send(Err("a handoff is already in flight".into()));
                     continue;
                 };
                 info!(dry_run, "Received control-socket handoff request");
-                if dispatch_handoff(&router, &config_path, dry_run, &mut handoff_succeeded).await {
+                let (cutover, result) =
+                    dispatch_handoff(&router, &config_path, dry_run, &mut handoff_succeeded).await;
+                // Before breaking: on success this process is about to exit.
+                let _ = reply.send(result);
+                if cutover {
                     break;
                 }
                 drop(_guard);
@@ -760,32 +766,41 @@ async fn run_predecessor_handoff(
 }
 
 /// Run a handoff and update the `handoff_succeeded` flag if it
-/// succeeded. Returns `true` to signal the caller to break the signal
-/// loop (a successful real handoff means we exit; a dry-run completion
-/// returns `false` so we keep serving).
+/// succeeded. Returns `(break_loop, result)`: `break_loop` is `true` when a
+/// real handoff succeeded and we exit (a dry-run completion keeps serving);
+/// `result` is what `glidefs handoff` reports: `Ok` when the handoff (or dry
+/// run) did what was asked, `Err(reason)` when it aborted or failed.
 async fn dispatch_handoff(
     router: &Arc<ExportRouter>,
     config_path: &PathBuf,
     dry_run: bool,
     handoff_succeeded: &mut bool,
-) -> bool {
+) -> (bool, std::result::Result<(), String>) {
+    use crate::handoff::HandoffOutcome;
     let router = Arc::clone(router);
     let cfg = config_path.clone();
-    let cutover = match run_predecessor_handoff_with_opts(router, cfg, dry_run).await {
+    let (cutover, result) = match run_predecessor_handoff_with_opts(router, cfg, dry_run).await {
         Ok(outcome) => {
             tracing::info!(?outcome, dry_run, "handoff complete");
-            let cutover = !dry_run
-                && matches!(outcome, crate::handoff::HandoffOutcome::Succeeded { .. });
+            let cutover = !dry_run && matches!(outcome, HandoffOutcome::Succeeded { .. });
             if cutover {
                 info!("handoff succeeded — predecessor exiting to release listener fds");
                 *handoff_succeeded = true;
             }
-            // Otherwise: Aborted (incl. dry-run-complete) or Revived — keep serving.
-            cutover
+            // Otherwise: DryRunPassed, Aborted or Revived — keep serving.
+            let result = match outcome {
+                HandoffOutcome::Succeeded { .. } | HandoffOutcome::DryRunPassed { .. } => Ok(()),
+                HandoffOutcome::Aborted { reason, .. } => Err(reason),
+                HandoffOutcome::RevivedFromFailedHandoff { .. } => Err(
+                    "successor failed after cutover; predecessor revived its devices and is serving"
+                        .into(),
+                ),
+            };
+            (cutover, result)
         }
         Err(e) => {
             tracing::error!(error = %e, dry_run, "handoff failed; predecessor continues serving");
-            false
+            (false, Err(format!("{e:#}")))
         }
     };
 
@@ -813,7 +828,14 @@ async fn dispatch_handoff(
         crate::sd_notify::notify_ready();
     }
 
-    cutover
+    (cutover, result)
+}
+
+/// One `glidefs handoff` request from the control socket to the signal loop.
+struct CtlRequest {
+    dry_run: bool,
+    /// The outcome, for the CLI that is waiting on it.
+    reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
 async fn run_predecessor_handoff_with_opts(
@@ -928,6 +950,8 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
         .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Warming)
         .await;
 
+    crate::handoff::fault::pause("s_pause_in_warming").await;
+
     // Drive the handoff protocol. After this returns, our router owns
     // every device the predecessor used to own.
     let timeouts = crate::handoff::HandoffTimeouts::default();
@@ -1009,7 +1033,7 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
 /// Wire protocol is one byte each way (see `crate::cli::handoff_cmd::wire`).
 async fn run_handoff_control_socket(
     socket_path: PathBuf,
-    trigger: tokio::sync::mpsc::Sender<bool>,
+    trigger: tokio::sync::mpsc::Sender<CtlRequest>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -1042,9 +1066,10 @@ async fn run_handoff_control_socket(
                 crate::cli::handoff_cmd::wire::REQUEST_HANDOFF_DRY_RUN => Some(true),
                 _ => None,
             };
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let response_byte = match dry_run {
                 None => crate::cli::handoff_cmd::wire::RESPONSE_UNSUPPORTED,
-                Some(d) => match trigger.try_send(d) {
+                Some(dry_run) => match trigger.try_send(CtlRequest { dry_run, reply: reply_tx }) {
                     Ok(()) => crate::cli::handoff_cmd::wire::RESPONSE_ACCEPTED,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         crate::cli::handoff_cmd::wire::RESPONSE_BUSY
@@ -1054,7 +1079,28 @@ async fn run_handoff_control_socket(
                     }
                 },
             };
-            let _ = stream.write_all(&[response_byte]).await;
+            if stream.write_all(&[response_byte]).await.is_err()
+                || response_byte != crate::cli::handoff_cmd::wire::RESPONSE_ACCEPTED
+            {
+                return;
+            }
+            // Hold the connection until the handoff has an outcome. A caller
+            // that doesn't wait (`POST /admin/handoff`) just hangs up; the
+            // handoff runs regardless.
+            let outcome = reply_rx
+                .await
+                .unwrap_or_else(|_| Err("the daemon dropped the request".into()));
+            let _ = match outcome {
+                Ok(()) => {
+                    stream.write_all(&[crate::cli::handoff_cmd::wire::RESPONSE_OK]).await
+                }
+                Err(reason) => {
+                    let mut msg = vec![crate::cli::handoff_cmd::wire::RESPONSE_FAILED];
+                    msg.extend_from_slice(reason.as_bytes());
+                    stream.write_all(&msg).await
+                }
+            };
+            let _ = stream.shutdown().await;
         });
     }
 }

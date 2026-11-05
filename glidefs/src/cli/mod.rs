@@ -90,9 +90,9 @@ pub enum Commands {
     /// Trigger a graceful zero-downtime handoff against a running daemon.
     ///
     /// Connects to the daemon's handoff control socket and signals it to
-    /// spawn a successor. The current process exits immediately after
-    /// sending the signal — the actual handoff runs in the daemon.
-    /// To watch progress, tail the daemon logs.
+    /// spawn a successor, then waits for the outcome. Exits 0 when the
+    /// handoff (or dry run) succeeded; non-zero, with the reason on stderr,
+    /// when it aborted or timed out. The daemon keeps serving after an abort.
     Handoff {
         /// Path to the daemon's handoff *control* socket. Defaults to
         /// `/run/glidefs/handoff.ctl.sock`. Note: this is distinct from
@@ -106,6 +106,10 @@ pub enum Commands {
         /// Use as a canary check before fleet-wide upgrades.
         #[arg(long)]
         dry_run: bool,
+        /// Seconds to wait for the outcome. The default covers the daemon's
+        /// own bound on a handoff (successor warm-up plus READY wait).
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
     },
     /// Run garbage collection to clean up orphaned packs in S3
     Gc {
