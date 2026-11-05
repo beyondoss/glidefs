@@ -350,6 +350,11 @@ struct ClaimSlot {
     /// Cleared when someone else materializes/claims this block underneath
     /// the holder. A stale holder must not commit.
     valid: bool,
+    /// Held by an S3 materialization, which keeps the claim across its fetch
+    /// and then needs the `data_file` WRITE lock before it can release.
+    /// Every other holder (promoters, `try_claim_block`) needs only a disk
+    /// read/write and releases promptly.
+    materializing: bool,
 }
 
 impl PromoteClaimBitmap {
@@ -364,19 +369,23 @@ impl PromoteClaimBitmap {
     /// Insert `idx` into the in-flight set. `true` iff this caller's
     /// insertion was new (i.e., they own the claim).
     pub(super) fn try_claim(&self, idx: usize) -> bool {
-        self.try_claim_token(idx).is_some()
+        self.claim(idx, false).is_some()
     }
 
     /// [`Self::try_claim`], returning the claim's identity. Callers that
     /// hold the claim across an await point (S3 materialization) must use
     /// this and gate their commit on [`Self::is_valid`].
     pub(super) fn try_claim_token(&self, idx: usize) -> Option<ClaimToken> {
+        self.claim(idx, true)
+    }
+
+    fn claim(&self, idx: usize, materializing: bool) -> Option<ClaimToken> {
         let token = ClaimToken(self.next_token.fetch_add(1, Ordering::Relaxed));
         let mut g = self.in_flight.lock();
         if g.contains_key(&idx) {
             return None;
         }
-        g.insert(idx, ClaimSlot { token, valid: true });
+        g.insert(idx, ClaimSlot { token, valid: true, materializing });
         Some(token)
     }
 
@@ -436,6 +445,11 @@ impl PromoteClaimBitmap {
     pub(super) fn release(&self, idx: usize) {
         self.in_flight.lock().remove(&idx);
         self.released.notify_all();
+    }
+
+    /// Whether the current holder of `idx` is an S3 materialization.
+    pub(super) fn is_materializing(&self, idx: usize) -> bool {
+        self.in_flight.lock().get(&idx).is_some_and(|s| s.materializing)
     }
 
     /// Whether any task currently holds the claim for `idx`.
@@ -1180,6 +1194,26 @@ impl CacheInner {
         (0..self.num_blocks).any(|i| self.state_map.get(i) == SparseBlockState::SYNCING)
     }
 
+    /// Park, holding no lock, until no task holds the promote claim of any
+    /// block in `start_block..=end_block`. For callers that were handed back
+    /// `BlockEvicted` by a plain-writer promote and must retry.
+    pub(super) fn wait_promote_claims_free(&self, start_block: u64, end_block: u64) {
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx >= self.num_blocks {
+                continue;
+            }
+            loop {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                if self.promote_claim.wait_for_release(idx, deadline) {
+                    break;
+                }
+                tracing::warn!(block = idx, "still waiting for the block's promote claim");
+            }
+        }
+    }
+
     /// Promote SYNCING blocks from flushing → active file before a guest write.
     ///
     /// When a guest writes to a block being flushed (SYNCING), its pre-rotation
@@ -1244,7 +1278,7 @@ impl CacheInner {
                 // One overall deadline bounds the total time spent waiting
                 // on other promoters of this block, so a panicking holder
                 // can't park us indefinitely across re-check iterations.
-                let deadline =
+                let mut deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(5);
                 // Per-block promote claim + RE-CHECK loop. The state CAS
                 // stays at the end (kept idempotent for the eviction-during-
@@ -1327,13 +1361,23 @@ impl CacheInner {
                         break;
                     }
                     if !self.promote_claim.try_claim(idx) {
+                        // A materialization holds its claim across the S3
+                        // fetch and then takes the data_file WRITE lock, which
+                        // waits for the read gate our caller holds: parking
+                        // here is a lock-order deadlock. A plain writer hands
+                        // the gate back (BlockEvicted → its caller waits for
+                        // the claim gate-free and retries); `require_promotion`
+                        // callers take the same route below.
+                        if !require_promotion && self.promote_claim.is_materializing(idx) {
+                            return Err(super::CacheError::BlockEvicted);
+                        }
                         // Another promoter holds the claim. Park on the
                         // condvar until they release, then RE-CHECK the
                         // state (loop) — never assume the holder succeeded.
                         if !self.promote_claim.wait_for_release(idx, deadline) {
                             tracing::warn!(
                                 block = idx,
-                                "promote: timed out waiting for prior promote claim release"
+                                "promote: still waiting for the block's promote claim"
                             );
                             if require_promotion {
                                 // Refuse to proceed on an unverified block —
@@ -1341,15 +1385,14 @@ impl CacheInner {
                                 // recoverable; proceeding can corrupt.
                                 return Err(super::CacheError::BlockEvicted);
                             }
-                            // Plain writers (write, zero_range) have no retry
-                            // path, and proceeding without the promote leaves
-                            // the rest of the block as sparse zeros under a
-                            // DIRTY mark, with the stuck holder's late copy
-                            // free to roll the new bytes back. Fail the I/O.
-                            return Err(super::CacheError::Io(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "promote: timed out waiting for the block's promote claim",
-                            )));
+                            // Plain writers have no retry path and must not
+                            // proceed unpromoted. The holder is a promoter
+                            // (a materializer returned above), which needs
+                            // only a disk read and write and drops its claim
+                            // through a RAII guard: a slow disk delays this
+                            // write, it does not fail it. Keep waiting.
+                            deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
                         }
                         continue;
                     }

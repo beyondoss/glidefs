@@ -231,14 +231,32 @@ impl WriteCache<Active> {
         // Holding the read lock across all operations prevents rotation from
         // interleaving. The read lock is shared, so concurrent writers are
         // not blocked — only rotation waits until all writers release.
-        let df = self.inner.data_file.read();
-
+        //
         // Promote SYNCING/NOT_PRESENT blocks from flushing → active BEFORE
         // set_present. promote_syncing_blocks needs to see the real block
         // state to recover data from the flushing file. If set_present runs
         // first, it masks NOT_PRESENT as CLEAN, and promote silently skips —
         // leaving zeros on the active file for sub-block writes.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block, require_promotion)?;
+        //
+        // A plain writer (`!require_promotion`) that meets a materialization's
+        // claim is handed back `BlockEvicted` so it never parks inside the
+        // gate; it waits for the claim with no lock held and retries.
+        let df = loop {
+            let df = self.inner.data_file.read();
+            match self
+                .inner
+                .promote_syncing_blocks(&df, start_block, end_block, require_promotion)
+            {
+                Err(CacheError::BlockEvicted) if !require_promotion => {
+                    drop(df);
+                    self.inner.wait_promote_claims_free(start_block, end_block);
+                }
+                r => {
+                    r?;
+                    break df;
+                }
+            }
+        };
 
         // Mark blocks present AFTER promote but BEFORE pwrite.
         // This prevents a race with prefetch where:
@@ -299,11 +317,26 @@ impl WriteCache<Active> {
 
         // Hold the data_file read lock across promote + set_present + zero +
         // dirty marking (same rotation race as write() — see comment there).
-        let df = self.inner.data_file.read();
-
         // Promote SYNCING blocks from flushing → active before zeroing.
         // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
+        // BlockEvicted here means a materialization holds the claim: retry
+        // with the gate released (see write_inner).
+        let df = loop {
+            let df = self.inner.data_file.read();
+            match self
+                .inner
+                .promote_syncing_blocks(&df, start_block, end_block, false)
+            {
+                Err(CacheError::BlockEvicted) => {
+                    drop(df);
+                    self.inner.wait_promote_claims_free(start_block, end_block);
+                }
+                r => {
+                    r?;
+                    break df;
+                }
+            }
+        };
 
         // Mark blocks present AFTER promote but BEFORE zero write.
         // Same invariant as write() — prevents prefetch race where prefetch
@@ -494,6 +527,18 @@ impl WriteCache<Active> {
 
         tracing::debug!(start_block, end_block, "pwrite_and_commit: wrote + marked dirty");
         Ok(())
+    }
+
+    /// Wait, holding no lock, until no promote claim is held on any block of
+    /// `offset..offset+length`. See `CacheInner::wait_promote_claims_free`.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn wait_promote_claims(&self, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let block_size = self.inner.config.block_size as u64;
+        self.inner
+            .wait_promote_claims_free(offset / block_size, (offset + length - 1) / block_size);
     }
 
     /// Step 1 of ublk zero-copy write: promote any SYNCING blocks in the

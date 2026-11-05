@@ -1684,6 +1684,10 @@ impl BlockHandler {
                     // A flush evicted a block in the backfill→gate gap. Drop
                     // the gate (so rotation can proceed) and re-backfill.
                     drop(gate);
+                    // Also covers a plain (full-block) promote handed back
+                    // because a materialization holds the claim: wait for it
+                    // with no lock held instead of spinning the retries.
+                    self.cache.wait_promote_claims(offset, length);
                     tracing::debug!(
                         offset,
                         length,
