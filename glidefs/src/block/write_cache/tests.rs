@@ -3705,3 +3705,82 @@ async fn snapshot_survives_write_between_crc_drain_and_rotation() {
     assert_eq!(h.cache.dirty_block_count(), 0);
     assert_eq!(h.read(0, 4096).await, vec![0xCCu8; 4096], "latest write is in the snapshot");
 }
+
+
+/// A write acknowledged while a checkpoint is between its metadata snapshot and
+/// its WAL truncate must survive a crash. The checkpoint persists the state map
+/// first (block still NOT_PRESENT), then truncates the WAL; a block dirtied in
+/// that window has its WAL entry erased while the saved metadata does not know
+/// the block, so recovery sees NOT_PRESENT and would read stale S3 data (and
+/// never upload the block).
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_acked_during_checkpoint_survives_crash() {
+    use super::inner::FlushSyncPoints;
+    let dir = TempDir::new().unwrap();
+    let bs = 4096usize;
+    let config = test_config(dir.path());
+
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = Arc::new(cache.finish_recovery().await.unwrap());
+        cache.write(0, &vec![0x11; bs]).unwrap(); // block 0: dirty before the checkpoint
+
+        let (sp, mut events, proceed) = FlushSyncPoints::new();
+        *cache.inner.flush_sync.lock() = Some(Arc::new(sp));
+
+        let ck = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.step, super::inner::FlushStep::CheckpointAfterSnapshot);
+
+        // Block 5 is NOT_PRESENT in the saved snapshot. Write it and fsync
+        // (the NBD FLUSH path): this is an acknowledged, durable write.
+        cache.write(5 * bs as u64, &vec![0x55; bs]).unwrap();
+        cache.flush().unwrap();
+
+        proceed.send(()).unwrap();
+        ck.await.unwrap().unwrap();
+        // Crash: drop without shutdown() or a final checkpoint.
+    }
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+
+    // The bytes are still in the local file...
+    assert_eq!(&cache.read_local_only(5 * bs as u64, 4).unwrap()[..], &[0x55; 4]);
+    // ...but the block must also be DIRTY, or reads go to S3 (stale) and the
+    // next flush never uploads it.
+    assert_eq!(
+        cache.inner.state_map.get(5),
+        SparseBlockState::DIRTY,
+        "acked write to block 5 lost its dirty mark: checkpoint truncated the WAL entry \
+         after snapshotting the block as NOT_PRESENT"
+    );
+    assert_eq!(cache.dirty_block_count(), 2, "blocks 0 and 5 must both upload");
+}
+
+/// Control for the test above: the same write acknowledged BEFORE the
+/// checkpoint starts is in the snapshot, so it survives. Fails only if the
+/// harness, not the checkpoint window, is what loses the mark.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_acked_before_checkpoint_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    let bs = 4096usize;
+    let config = test_config(dir.path());
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+        cache.write(0, &vec![0x11; bs]).unwrap();
+        cache.write(5 * bs as u64, &vec![0x55; bs]).unwrap();
+        cache.flush().unwrap();
+        cache.checkpoint().await.unwrap();
+    }
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+    assert_eq!(cache.inner.state_map.get(5), SparseBlockState::DIRTY);
+    assert_eq!(cache.dirty_block_count(), 2);
+}

@@ -655,6 +655,8 @@ pub enum FlushStep {
     AfterCompute,     // F6→F7
     BeforeEvict,      // F7→F8
     AfterEvict,       // F8→F9
+    /// checkpoint(): after save_block_states, before wal.truncate.
+    CheckpointAfterSnapshot,
 }
 
 #[cfg(feature = "test-utils")]

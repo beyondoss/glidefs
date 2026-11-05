@@ -744,6 +744,15 @@ impl WriteCache<Active> {
             // canonical record of what's PRESENT/DIRTY/SYNCING.
             inner.save_block_states()?;
 
+            #[cfg(feature = "test-utils")]
+            {
+                let sp = inner.flush_sync.lock().clone();
+                if let Some(sp) = sp {
+                    tokio::runtime::Handle::current()
+                        .block_on(sp.gate(super::inner::FlushStep::CheckpointAfterSnapshot, 0));
+                }
+            }
+
             // Skip WAL truncate during the handoff freeze window —
             // the successor's `replay_wal_tail` reads the same WAL
             // the predecessor was appending into. If we truncate
