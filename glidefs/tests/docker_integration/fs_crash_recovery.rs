@@ -595,6 +595,29 @@ fn init_crash_tracing() {
         .try_init();
 }
 
+/// Count this process's open fds by kind and by path, to place the per-cycle leak.
+#[cfg(target_os = "linux")]
+fn probe_fds(tag: &str) {
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+        for e in rd.flatten() {
+            let t = std::fs::read_link(e.path()).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            let k = if t.starts_with("socket:") { "socket".into() }
+                else if t.starts_with("pipe:") { "pipe".into() }
+                else if t.starts_with("anon_inode:") { t.clone() }
+                else if let Some(i) = t.rfind('/') {
+                    // strip the temp dir: keep the file name's extension class
+                    let name = &t[i + 1..];
+                    let ext = name.rsplit('.').next().unwrap_or(name);
+                    if t.starts_with("/dev/") { t.clone() } else { format!("file:*.{ext}") }
+                } else { t };
+            *kinds.entry(k).or_default() += 1;
+        }
+    }
+    let total: usize = kinds.values().sum();
+    eprintln!("FDS {tag}: total={total} {kinds:?}");
+}
+
 /// Print the on-disk WAL/meta/flushing state: whether the WAL holds
 /// entries (and up to which sequence) at this instant.
 #[cfg(target_os = "linux")]
@@ -723,6 +746,7 @@ async fn repeated_crash_recovery_once() {
             weak_router.strong_count()
         );
         probe_cache_files(cache_dir.path(), &format!("cycle {cycle} after crash_shutdown"));
+        probe_fds(&format!("cycle {cycle} after crash_shutdown"));
     }
 
     // Final verification: recover and check all 5 files
