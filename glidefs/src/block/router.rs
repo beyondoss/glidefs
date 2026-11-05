@@ -3457,16 +3457,19 @@ impl ExportRouter {
 
         let _ = Self::teardown_export(name, state, true).await;
 
-        let cache_file = self.cache_dir.join(format!("{}.cache", name));
-        let flushing_file = self.cache_dir.join(format!("{}.flushing", name));
-        let meta_file = self.cache_dir.join(format!("{}.meta", name));
-        let wal_file = self.cache_dir.join(format!("{}.wal", name));
-        remove_file_if_exists(&cache_file);
-        remove_file_if_exists(&flushing_file);
-        remove_file_if_exists(&meta_file);
-        remove_file_if_exists(&wal_file);
+        self.remove_local_files(name);
 
         info!(export = %name, "cleanup_failed_create: in-memory state cleared");
+    }
+
+    /// Delete every local file an export owns: cache, flushing file, metadata,
+    /// WAL and the WAL's sibling lockfile (`wal.rs` creates `{name}.wal.lock`
+    /// and never removes it, so a purge that skipped it leaked one file per
+    /// export). Call after the export's WAL is dropped.
+    fn remove_local_files(&self, name: &str) {
+        for ext in ["cache", "flushing", "meta", "wal", "wal.lock"] {
+            remove_file_if_exists(&self.cache_dir.join(format!("{name}.{ext}")));
+        }
     }
 
     /// Remove an export.
@@ -3484,14 +3487,7 @@ impl ExportRouter {
                     info!("Export '{}' doesn't exist, nothing to remove", name);
                     if purge {
                         // Clean local cache files
-                        let cache_file = self.cache_dir.join(format!("{}.cache", name));
-                        let flushing_file = self.cache_dir.join(format!("{}.flushing", name));
-                        let meta_file = self.cache_dir.join(format!("{}.meta", name));
-                        let wal_file = self.cache_dir.join(format!("{}.wal", name));
-                        remove_file_if_exists(&cache_file);
-                        remove_file_if_exists(&flushing_file);
-                        remove_file_if_exists(&meta_file);
-                        remove_file_if_exists(&wal_file);
+                        self.remove_local_files(name);
 
                         // S3 cleanup: load export config to discover s3_prefix,
                         // then delete manifest, snapshots, and export definition.
@@ -3557,14 +3553,7 @@ impl ExportRouter {
         let remaining = Self::teardown_export(name, state, purge).await;
 
         if purge {
-            let cache_file = self.cache_dir.join(format!("{}.cache", name));
-            let flushing_file = self.cache_dir.join(format!("{}.flushing", name));
-            let meta_file = self.cache_dir.join(format!("{}.meta", name));
-            let wal_file = self.cache_dir.join(format!("{}.wal", name));
-            remove_file_if_exists(&cache_file);
-            remove_file_if_exists(&flushing_file);
-            remove_file_if_exists(&meta_file);
-            remove_file_if_exists(&wal_file);
+            self.remove_local_files(name);
             info!("Purged cache files for export '{}'", name);
 
             // Also delete export definition from S3
