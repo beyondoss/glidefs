@@ -628,6 +628,13 @@ pub(crate) struct CacheInner {
     /// guard across its snapshot, so the WAL stays bounded.
     pub(super) ckpt_skips: std::sync::atomic::AtomicU32,
 
+    /// Serializes whole checkpoints (snapshot through truncate) and `save_metadata`.
+    /// Two overlapping checkpoints could otherwise rename an older snapshot over a
+    /// newer one after the newer one truncated the WAL: stale metadata, empty WAL.
+    /// Lock order: `ckpt_lock` then the WAL guard; neither is taken while holding
+    /// `data_file`, and writers never take `ckpt_lock`.
+    pub(super) ckpt_lock: parking_lot::Mutex<()>,
+
     /// Test-only: sync points for flush path interleaving tests.
     #[cfg(feature = "test-utils")]
     pub(crate) flush_sync: parking_lot::Mutex<Option<std::sync::Arc<FlushSyncPoints>>>,
@@ -652,6 +659,9 @@ pub struct FlushSyncPoints {
     rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
     /// Steps that gate. Empty = every step (the flush tests' default).
     only: Vec<FlushStep>,
+    /// Gate only the first hit; later hits pass straight through.
+    once: bool,
+    fired: std::sync::atomic::AtomicBool,
 }
 
 /// Consecutive checkpoints allowed to keep the WAL (see `CacheInner::ckpt_skips`).
@@ -670,6 +680,9 @@ pub enum FlushStep {
     /// save_block_states(): after the entries are collected, before the
     /// metadata is written.
     MetadataAfterEntries,
+    /// save_block_states(): metadata serialized and fsynced, not yet renamed over
+    /// the live file.
+    MetadataBeforeRename,
     /// wal_append_and_mark_dirty(): block marked DIRTY and sequenced, WAL entry
     /// not yet appended.
     WriterMarkedBeforeAppend,
@@ -687,7 +700,7 @@ impl FlushSyncPoints {
     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<FlushGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (proceed_tx, proceed_rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx), only: Vec::new() }, event_rx, proceed_tx)
+        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx), only: Vec::new(), once: false, fired: std::sync::atomic::AtomicBool::new(false) }, event_rx, proceed_tx)
     }
 
     /// Gate only at these steps; every other step passes straight through.
@@ -696,11 +709,19 @@ impl FlushSyncPoints {
         self
     }
 
+    /// Gate only the first hit of the selected steps.
+    pub fn once(mut self) -> Self {
+        self.once = true;
+        self
+    }
+
     pub(crate) fn wants(&self, step: FlushStep) -> bool {
-        self.only.is_empty() || self.only.contains(&step)
+        (self.only.is_empty() || self.only.contains(&step))
+            && !(self.once && self.fired.load(std::sync::atomic::Ordering::Acquire))
     }
 
     pub(crate) async fn gate(&self, step: FlushStep, block_count: usize) {
+        self.fired.store(true, std::sync::atomic::Ordering::Release);
         let _ = self.tx.send(FlushGateEvent { step, block_count });
         let _ = self.rx.lock().await.recv().await;
     }
@@ -1469,6 +1490,9 @@ impl CacheInner {
         file.sync_all()?;
         drop(file);
 
+        #[cfg(feature = "test-utils")]
+        self.sync_gate(FlushStep::MetadataBeforeRename);
+
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&tmp_path, &path)?;
 
@@ -1505,6 +1529,7 @@ impl CacheInner {
 
     /// Persist block states and presence.
     pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
+        let _ck = self.ckpt_lock.lock();
         self.save_block_states().map(|_| ())
     }
 

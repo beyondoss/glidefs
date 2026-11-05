@@ -3945,3 +3945,39 @@ async fn test_write_acked_during_checkpoint_survives_sigkill() {
     let cache = cd.open().await;
     cd.assert_recovered(&cache, 5, 0x55, 2).await;
 }
+
+/// Two overlapping checkpoints. A snapshots with block 5 clean and stalls before
+/// its rename; block 5 is written and acked; B snapshots with block 5 dirty,
+/// renames and truncates the WAL; A then renames its OLDER snapshot over B's.
+/// Checkpoints must be serialized, snapshot through truncate.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlapping_checkpoints_do_not_publish_a_stale_snapshot() {
+    use super::inner::FlushStep;
+    let cd = CrashDir::new().await;
+    {
+        let cache = Arc::new(cd.open().await);
+        cache.write(0, &vec![0x11; CK_BS]).unwrap();
+        let (sp, mut events, proceed) = super::inner::FlushSyncPoints::new();
+        *cache.inner.flush_sync.lock() =
+            Some(Arc::new(sp.only(&[FlushStep::MetadataBeforeRename]).once()));
+        let a = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        assert_eq!(events.recv().await.unwrap().step, FlushStep::MetadataBeforeRename);
+        cache.write((5 * CK_BS) as u64, &vec![0x55; CK_BS]).unwrap();
+        cache.flush().unwrap();
+        let b = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.checkpoint().await }
+        });
+        // Un-serialized, B runs to completion now; serialized, it waits for A.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        proceed.send(()).unwrap();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+    }
+    let cache = cd.open().await;
+    cd.assert_recovered(&cache, 5, 0x55, 2).await;
+}

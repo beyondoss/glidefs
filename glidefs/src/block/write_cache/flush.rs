@@ -740,19 +740,21 @@ impl WriteCache<Active> {
     pub async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
+            // One checkpoint at a time, snapshot through truncate (see `ckpt_lock`).
+            let _ck = inner.ckpt_lock.lock();
+            let handoff_active = || {
+                super::inner::HandoffPhase::from_u8(
+                    inner.handoff_phase.load(std::sync::atomic::Ordering::Acquire),
+                )
+                .is_active()
+            };
             // Skip the WAL truncate during the handoff freeze window —
             // the successor's `replay_wal_tail` reads the same WAL
             // the predecessor was appending into. If we truncate
             // here while the successor is in WARMING/CUTOVER, any
             // entry the predecessor has acked since the successor's
             // WARMING-time open vanishes from the WAL.
-            let handoff_active = super::inner::HandoffPhase::from_u8(
-                inner
-                    .handoff_phase
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
-            .is_active();
-            if handoff_active {
+            if handoff_active() {
                 // Always save the block-state metadata file — it's the
                 // canonical record of what's PRESENT/DIRTY/SYNCING.
                 inner.save_block_states()?;
@@ -772,9 +774,10 @@ impl WriteCache<Active> {
             {
                 inner
                     .wal
-                    .exclusive_then_truncate(|| {
-                        inner.save_block_states().map_err(std::io::Error::other)
-                    })?;
+                    .exclusive_then_truncate(
+                        || inner.save_block_states().map_err(std::io::Error::other),
+                        || !handoff_active(),
+                    )?;
                 inner.ckpt_skips.store(0, std::sync::atomic::Ordering::Relaxed);
                 debug!("checkpoint complete (exclusive)");
                 return Ok(());
@@ -787,7 +790,7 @@ impl WriteCache<Active> {
 
             let truncated = inner
                 .wal
-                .truncate_if(|| inner.sequence.current() == covered_seq)?;
+                .truncate_if(|| inner.sequence.current() == covered_seq && !handoff_active())?;
             if truncated {
                 inner.ckpt_skips.store(0, std::sync::atomic::Ordering::Relaxed);
                 debug!("checkpoint complete");

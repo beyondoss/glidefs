@@ -379,6 +379,7 @@ impl WriteCache<Initializing> {
             flushing_active: AtomicBool::new(false),
             rotation_seq: AtomicU64::new(0),
             ckpt_skips: std::sync::atomic::AtomicU32::new(0),
+            ckpt_lock: parking_lot::Mutex::new(()),
             #[cfg(feature = "test-utils")]
             flush_sync: parking_lot::Mutex::new(None),
             #[cfg(feature = "test-utils")]
@@ -473,6 +474,7 @@ impl WriteCache<Initializing> {
             flushing_active: AtomicBool::new(false),
             rotation_seq: AtomicU64::new(0),
             ckpt_skips: std::sync::atomic::AtomicU32::new(0),
+            ckpt_lock: parking_lot::Mutex::new(()),
             #[cfg(feature = "test-utils")]
             flush_sync: parking_lot::Mutex::new(None),
             #[cfg(feature = "test-utils")]

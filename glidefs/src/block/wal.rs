@@ -344,13 +344,18 @@ impl Wal {
 
     /// Run `f` with appends excluded, then truncate the WAL to zero length.
     /// Every entry written before `f` ran is covered by whatever `f` persisted;
-    /// none can be appended while it runs. The truncate is skipped if `f` fails.
+    /// none can be appended while it runs. The truncate is skipped if `f` fails or
+    /// `still_ok()` (checked last, under the guard) is false.
     pub fn exclusive_then_truncate<R>(
         &self,
         f: impl FnOnce() -> io::Result<R>,
+        still_ok: impl FnOnce() -> bool,
     ) -> io::Result<R> {
         let _guard = self.guard.write();
         let r = f()?;
+        if !still_ok() {
+            return Ok(r);
+        }
         // SAFETY: as in `truncate`: valid fd, appends excluded by the write guard.
         if unsafe { libc::ftruncate(self.fd, 0) } != 0 {
             return Err(io::Error::last_os_error());
