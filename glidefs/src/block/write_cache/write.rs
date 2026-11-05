@@ -8,8 +8,8 @@ use crate::block::wal::serialize_entry;
 use super::{CacheError, WriteCache};
 
 impl WriteCache<Active> {
-    /// Build WAL entries for non-dirty blocks, append to WAL, sync if configured,
-    /// then transition states to DIRTY.
+    /// Mark each non-dirty block DIRTY, give it a sequence number, append the
+    /// WAL entries, and sync if configured.
     ///
     /// Must be called while holding a `data_file` lock guard (read or write).
     /// The `df` reference is needed for `sync_all()` when `wal_sync` is enabled.
@@ -19,32 +19,29 @@ impl WriteCache<Active> {
         start_block: u64,
         end_block: u64,
     ) -> Result<(), CacheError> {
-        use smallvec::SmallVec;
         let mut batch = Vec::new();
-        let mut to_dirty: SmallVec<[usize; 16]> = SmallVec::new();
+        // Order matters for `checkpoint()`: mark the block DIRTY first, THEN take
+        // its sequence number. Checkpoint reads `sequence.current() == s`
+        // before it snapshots the state map, so every entry with seq <= s
+        // belongs to a block that was already DIRTY when the snapshot was taken.
+        // That makes the snapshot a superset of every WAL entry it covers, and
+        // makes `Wal::replay(min_sequence = s)` safe to drop them. The reverse
+        // order (seq, then mark) let a write take seq <= s yet dirty its block
+        // after the snapshot, and the entry was then discarded as "covered".
         for block in start_block..=end_block {
             #[allow(clippy::cast_possible_truncation)]
             let idx = block as usize; // usize >= u64 on 64-bit systems
             if idx >= self.inner.num_blocks {
                 continue;
             }
-            let state = self.inner.state_map.get(idx);
-            if state != SparseBlockState::DIRTY {
+            if self.inner.transition_to_dirty(idx) {
                 let seq = self.inner.sequence.next();
                 serialize_entry(&mut batch, block, seq);
-                to_dirty.push(idx);
             }
         }
 
-        // Transition to Dirty before WAL append. Checkpoint persists the
-        // state map then truncates the WAL — if it ran between append and
-        // dirty, it would persist Clean and discard the WAL entry, losing
-        // the write on crash. Reordering ensures checkpoint always sees
-        // Dirty. The WAL append after is the crash-recovery backstop for
-        // "dirty in memory but not yet persisted to metadata".
-        for idx in &to_dirty {
-            self.inner.transition_to_dirty(*idx);
-        }
+        #[cfg(feature = "test-utils")]
+        self.inner.sync_gate(super::inner::FlushStep::WriterMarkedBeforeAppend);
 
         if !batch.is_empty() {
             self.inner.wal.append_batch(&batch)?;

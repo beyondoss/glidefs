@@ -623,6 +623,11 @@ pub(crate) struct CacheInner {
     /// authoritative (even if all zeros).
     pub(super) rotation_seq: AtomicU64,
 
+    /// Consecutive checkpoints that kept the WAL because a block was dirtied
+    /// while they ran. At `CKPT_MAX_SKIPS` the next checkpoint holds the WAL
+    /// guard across its snapshot, so the WAL stays bounded.
+    pub(super) ckpt_skips: std::sync::atomic::AtomicU32,
+
     /// Test-only: sync points for flush path interleaving tests.
     #[cfg(feature = "test-utils")]
     pub(crate) flush_sync: parking_lot::Mutex<Option<std::sync::Arc<FlushSyncPoints>>>,
@@ -645,7 +650,12 @@ pub(crate) struct CacheInner {
 pub struct FlushSyncPoints {
     pub tx: tokio::sync::mpsc::UnboundedSender<FlushGateEvent>,
     rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    /// Steps that gate. Empty = every step (the flush tests' default).
+    only: Vec<FlushStep>,
 }
+
+/// Consecutive checkpoints allowed to keep the WAL (see `CacheInner::ckpt_skips`).
+pub(super) const CKPT_MAX_SKIPS: u32 = 2;
 
 #[cfg(feature = "test-utils")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,6 +667,12 @@ pub enum FlushStep {
     AfterEvict,       // F8→F9
     /// checkpoint(): after save_block_states, before wal.truncate.
     CheckpointAfterSnapshot,
+    /// save_block_states(): after the entries are collected, before the
+    /// metadata is written.
+    MetadataAfterEntries,
+    /// wal_append_and_mark_dirty(): block marked DIRTY and sequenced, WAL entry
+    /// not yet appended.
+    WriterMarkedBeforeAppend,
 }
 
 #[cfg(feature = "test-utils")]
@@ -671,7 +687,17 @@ impl FlushSyncPoints {
     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<FlushGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (proceed_tx, proceed_rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx), only: Vec::new() }, event_rx, proceed_tx)
+    }
+
+    /// Gate only at these steps; every other step passes straight through.
+    pub fn only(mut self, steps: &[FlushStep]) -> Self {
+        self.only = steps.to_vec();
+        self
+    }
+
+    pub(crate) fn wants(&self, step: FlushStep) -> bool {
+        self.only.is_empty() || self.only.contains(&step)
     }
 
     pub(crate) async fn gate(&self, step: FlushStep, block_count: usize) {
@@ -998,6 +1024,16 @@ impl CacheInner {
             return false;
         }
         self.state_map.try_set_present(block_num)
+    }
+
+    /// Test-only: block the calling (blocking-pool) thread at a sync point.
+    /// No-op when no sync points are attached. Never call from a runtime worker.
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn sync_gate(&self, step: FlushStep) {
+        let sp = self.flush_sync.lock().clone();
+        if let Some(sp) = sp.filter(|sp| sp.wants(step)) {
+            tokio::runtime::Handle::current().block_on(sp.gate(step, 0));
+        }
     }
 
     /// CAS loop to transition a block to Dirty state (lock-free).
@@ -1362,7 +1398,15 @@ impl CacheInner {
     /// v5 sparse format: only writes entries with non-zero state (present blocks),
     /// plus a trailing max_sequence u64. Uses atomic write pattern: temp file ->
     /// fsync -> rename.
-    pub(super) fn save_block_states(&self) -> Result<(), CacheError> {
+    ///
+    /// Returns the sequence number the snapshot covers. It is read BEFORE the
+    /// state map is serialized: a writer marks its block DIRTY before taking a
+    /// sequence number, so every block with `seq <= returned` is DIRTY in the
+    /// snapshot. Reading it after (as this once did) persisted a sequence newer
+    /// than the state it described, and `Wal::replay` then dropped the entry
+    /// of a block dirtied in between.
+    pub(super) fn save_block_states(&self) -> Result<u64, CacheError> {
+        let covered_seq = self.sequence.current();
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = self.config.metadata_path();
         // Use a unique temp file name to prevent a race between concurrent
@@ -1404,6 +1448,8 @@ impl CacheInner {
         // the header claims, failing CRC on reload.
         let entries: Vec<(usize, u8)> = self.state_map.iter_present().collect();
         let entry_count = entries.len() as u64;
+        #[cfg(feature = "test-utils")]
+        self.sync_gate(FlushStep::MetadataAfterEntries);
         write_hashed!(&entry_count.to_le_bytes());
 
         for (idx, state) in &entries {
@@ -1412,7 +1458,7 @@ impl CacheInner {
         }
 
         // Trailing fields: max_sequence + rotation_seq (u64 LE each)
-        write_hashed!(&self.sequence.current().to_le_bytes());
+        write_hashed!(&covered_seq.to_le_bytes());
         write_hashed!(&self.rotation_seq.load(Ordering::Relaxed).to_le_bytes());
 
         // CRC32 trailer over all preceding bytes.
@@ -1454,12 +1500,12 @@ impl CacheInner {
             present = present_count,
             "saved block states (atomic)"
         );
-        Ok(())
+        Ok(covered_seq)
     }
 
     /// Persist block states and presence.
     pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
-        self.save_block_states()
+        self.save_block_states().map(|_| ())
     }
 
     /// Load block states and presence from metadata file.

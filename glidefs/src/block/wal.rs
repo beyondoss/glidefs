@@ -323,6 +323,41 @@ impl Wal {
         Ok(())
     }
 
+    /// Truncate the WAL to zero length only if `still_covered()` holds while
+    /// no append can run. Returns whether it truncated.
+    ///
+    /// The predicate runs under the exclusive guard, so an append that has
+    /// already taken its sequence number but not yet reached `append_batch`
+    /// is ordered after this truncate, and one that already appended makes
+    /// the predicate see a newer sequence.
+    pub fn truncate_if(&self, still_covered: impl FnOnce() -> bool) -> io::Result<bool> {
+        let _guard = self.guard.write();
+        if !still_covered() {
+            return Ok(false);
+        }
+        // SAFETY: as in `truncate`: valid fd, appends excluded by the write guard.
+        if unsafe { libc::ftruncate(self.fd, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
+    }
+
+    /// Run `f` with appends excluded, then truncate the WAL to zero length.
+    /// Every entry written before `f` ran is covered by whatever `f` persisted;
+    /// none can be appended while it runs. The truncate is skipped if `f` fails.
+    pub fn exclusive_then_truncate<R>(
+        &self,
+        f: impl FnOnce() -> io::Result<R>,
+    ) -> io::Result<R> {
+        let _guard = self.guard.write();
+        let r = f()?;
+        // SAFETY: as in `truncate`: valid fd, appends excluded by the write guard.
+        if unsafe { libc::ftruncate(self.fd, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(r)
+    }
+
     /// Replay a WAL file, returning entries with sequence > min_sequence.
     ///
     /// Returns `Ok(vec![])` if the file does not exist. A torn last record
