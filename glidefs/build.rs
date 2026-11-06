@@ -6,6 +6,10 @@
 //! is absent we still emit an EMPTY placeholder so `include_bytes!` resolves; the
 //! runtime then asks for an explicit `[profile] initramfs`. Linux-only (the
 //! profiling sandbox is Linux-only); a no-op elsewhere.
+//!
+//! A release build sets `GLIDEFS_REQUIRE_INITRAMFS=1`: there a missing toolchain
+//! (or a failed init build) fails the build instead of shipping the empty
+//! placeholder, which makes every boot-set profile fail at run time.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,10 +20,16 @@ fn main() {
     let init_c = Path::new("src/oci/sandbox/vm_init/init.c");
     println!("cargo:rerun-if-changed=src/oci/sandbox/vm_init/init.c");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=GLIDEFS_REQUIRE_INITRAMFS");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let built = target_os == "linux" && build_initramfs(init_c, &out_dir, &cpio_out);
     if !built {
+        assert!(
+            std::env::var_os("GLIDEFS_REQUIRE_INITRAMFS").is_none_or(|v| v.is_empty()),
+            "GLIDEFS_REQUIRE_INITRAMFS is set but the VM profiling initramfs was not built \
+             (need musl-gcc + cpio on a linux target)"
+        );
         std::fs::write(&cpio_out, []).unwrap();
         println!(
             "cargo:warning=glidefs: VM profiling initramfs not built (need musl-gcc + cpio); \
