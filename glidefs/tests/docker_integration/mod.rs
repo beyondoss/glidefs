@@ -487,6 +487,23 @@ pub struct TestServer {
     ublk: Option<UblkState>,
 }
 
+
+/// SCRATCH experiment: with GLIDEFS_TEST_LEAK_FOYER=1, hand the router a pack-index cache and
+/// leak one reference so its foyer files are never closed while the process lives.
+async fn scratch_pack_index_cache(dir: &std::path::Path) -> Option<Arc<glidefs::block::pack_index_cache::PackIndexCache>> {
+    if std::env::var("GLIDEFS_TEST_LEAK_FOYER").is_ok_and(|v| !v.is_empty()) {
+        let c = Arc::new(
+            glidefs::block::pack_index_cache::PackIndexCache::open(dir)
+                .await
+                .expect("pack index cache"),
+        );
+        std::mem::forget(Arc::clone(&c));
+        Some(c)
+    } else {
+        None
+    }
+}
+
 impl TestServer {
     /// Start a GlideFS server with the given transport.
     pub async fn start(
@@ -495,6 +512,7 @@ impl TestServer {
         transport: Transport,
     ) -> Self {
         let cache_dir = TempDir::new().unwrap();
+        let cache_dir_path_for_scratch = cache_dir.path().to_path_buf();
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let shutdown = CancellationToken::new();
 
@@ -505,7 +523,7 @@ impl TestServer {
                 cache_dir: cache_dir.path().to_path_buf(),
                 block_size: 128 * 1024,
                 clean_cache,
-                pack_index_cache: None,
+                pack_index_cache: scratch_pack_index_cache(&cache_dir_path_for_scratch).await,
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
@@ -591,6 +609,7 @@ impl TestServer {
         transport: Transport,
         cache_dir: std::path::PathBuf,
     ) -> Self {
+        let cache_dir_path_for_scratch = cache_dir.clone();
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let shutdown = CancellationToken::new();
 
@@ -601,7 +620,7 @@ impl TestServer {
                 cache_dir: cache_dir.clone(),
                 block_size: 128 * 1024,
                 clean_cache,
-                pack_index_cache: None,
+                pack_index_cache: scratch_pack_index_cache(&cache_dir_path_for_scratch).await,
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
