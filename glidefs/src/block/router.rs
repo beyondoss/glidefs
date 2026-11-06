@@ -1396,6 +1396,65 @@ impl ExportRouter {
         }
     }
 
+    /// Delete every `index/snapshots/{name}@*` entry (idempotent). Export names
+    /// cannot contain `@` or `/`, so the prefix names exactly one volume
+    /// (`vm1@` never matches `vm10@`). Lists from the prefix as a start-after
+    /// offset and stops at the first key past it, so cost tracks this volume's
+    /// entries, not the bucket's. Returns how many it deleted; a failure is
+    /// returned and the caller retries the whole (idempotent) purge.
+    async fn delete_snapshot_index_entries(&self, name: &str) -> Result<usize, RouterError> {
+        use futures::StreamExt;
+        let root = Path::from(format!("{}/index/snapshots", self.db_path));
+        let prefix = format!("{root}/{name}@");
+        let offset = Path::from(prefix.as_str());
+        let mut list = self.object_store.list_with_offset(Some(&root), &offset);
+        let mut found = Vec::new();
+        while let Some(meta) = list.next().await {
+            let meta = meta?;
+            if !meta.location.as_ref().starts_with(&prefix) {
+                break; // keys are sorted: past the prefix, nothing more matches
+            }
+            found.push(meta.location);
+        }
+        drop(list);
+        let mut deleted = 0;
+        for path in found {
+            match self.object_store.delete(&path).await {
+                Ok(()) => deleted += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if deleted > 0 {
+            info!(export = %name, deleted, "deleted snapshot index entries");
+        }
+        Ok(deleted)
+    }
+
+    /// Purge an export's durable S3 state: manifest, snapshot manifests, snapshot
+    /// index entries, and last the export definition. The definition is the
+    /// retry handle: a purge that fails part-way leaves it in place, so the
+    /// next purge finds the volume and runs every step again.
+    async fn purge_s3_state(&self, name: &str, cs: &ContentStore) -> Result<(), RouterError> {
+        let mut first_err: Option<RouterError> = None;
+        if let Err(e) = cs.delete_manifest(name).await {
+            warn!("Failed to delete manifest from S3: {}", e);
+            first_err.get_or_insert(RouterError::ContentStore(e));
+        }
+        if let Err(e) = cs.delete_all_snapshots(name).await {
+            warn!("Failed to delete snapshots from S3: {}", e);
+            first_err.get_or_insert(RouterError::ContentStore(e));
+        }
+        if let Err(e) = self.delete_snapshot_index_entries(name).await {
+            warn!("Failed to delete snapshot index entries from S3: {}", e);
+            first_err.get_or_insert(e);
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        self.delete_export_definition(name).await
+    }
+
     /// Discover ALL exports under the global `{db_path}/exports/` prefix.
     ///
     /// Lists the prefix and loads each `export.json` in parallel. Boot no
@@ -3562,28 +3621,20 @@ impl ExportRouter {
                                     &s3_prefix,
                                 )
                                 .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
-
-                                if let Err(e) = cs.delete_manifest(name).await {
-                                    warn!("Failed to delete manifest from S3: {}", e);
-                                }
-                                if let Err(e) = cs.delete_all_snapshots(name).await {
-                                    warn!("Failed to delete snapshots from S3: {}", e);
-                                }
-                                if let Err(e) = self.delete_export_definition(name).await {
-                                    warn!("Failed to delete export definition from S3: {}", e);
-                                }
+                                self.purge_s3_state(name, &cs).await?;
                             }
                             Ok(None) => {
-                                debug!(
-                                    "No export definition in S3 for '{}', skipping S3 cleanup",
-                                    name
-                                );
+                                // No definition (an earlier purge finished it, or it
+                                // never existed): the pool is unknown, but index
+                                // entries are keyed by name alone, so sweep them.
+                                self.delete_snapshot_index_entries(name).await?;
                             }
                             Err(e) => {
                                 warn!(
                                     "Failed to load export definition for S3 cleanup: {}",
                                     e
                                 );
+                                return Err(e);
                             }
                         }
                     }
@@ -3611,23 +3662,13 @@ impl ExportRouter {
 
         let remaining = Self::teardown_export(name, state, purge).await;
 
+        let mut purge_result = Ok(());
         if purge {
             self.remove_local_files(name);
             info!("Purged cache files for export '{}'", name);
 
-            // Also delete export definition from S3
-            if let Err(e) = self.delete_export_definition(name).await {
-                warn!("Failed to delete export definition from S3: {}", e);
-            }
-
-            // Delete the manifest from S3 (best-effort).
-            if let Some(cs) = &snapshot_cs && let Err(e) = cs.delete_manifest(name).await {
-                warn!("Failed to delete manifest from S3: {}", e);
-            }
-
-            // Delete all versioned snapshots from S3 (best-effort).
-            if let Some(cs) = snapshot_cs && let Err(e) = cs.delete_all_snapshots(name).await {
-                warn!("Failed to delete snapshots from S3: {}", e);
+            if let Some(cs) = &snapshot_cs {
+                purge_result = self.purge_s3_state(name, cs).await;
             }
         }
 
@@ -3639,6 +3680,7 @@ impl ExportRouter {
             });
         }
 
+        purge_result?;
         info!("Export '{}' removed", name);
         Ok(())
     }
