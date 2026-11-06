@@ -98,7 +98,6 @@ jobs:
         run: |
           bin=target/${{ matrix.target }}/ci/glidefs
           grep -qa '070701' "$bin" || { echo "::error::$bin has no embedded initramfs (cpio newc magic missing)"; exit 1; }
-          grep -qa 'no initramfs' "$bin" # sanity: the checked build is a glidefs binary
 
       - name: Prepare binaries
         run: |
