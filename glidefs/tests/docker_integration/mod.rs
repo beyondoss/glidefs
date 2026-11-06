@@ -480,6 +480,36 @@ pub struct TestServer {
     ublk: Option<UblkState>,
 }
 
+
+/// Every pack-index cache any `TestServer` has opened, kept for the life of the test process.
+///
+/// A `PackIndexCache` is a foyer `HybridCache`, and foyer 0.22's psync engine does its file I/O
+/// through the raw fd *number* of its device file (`foyer-storage` `io/engine/psync.rs`,
+/// `FileHandle::from(RawFile)`), not an owned handle. Its flusher tasks can still be writing
+/// when the cache is dropped and the fd closed; the kernel then hands that number to the next
+/// file the process opens, and foyer's late writes (a zstd-encoded pack-index entry) land in it.
+/// In this process that file was another test's GlideFS cache file, so a block read back with
+/// one 4 KiB page of foyer bytes in it. Measured on CI: the drain test and the client-storm
+/// test running together corrupted block 0 in about 1 of 300 iterations (5 of 1483); with the
+/// caches kept open, 0 of 2500. Production opens one cache at startup and keeps it until the
+/// process exits, so only a harness that opens and drops one per test is exposed.
+static KEPT_PACK_INDEX_CACHES: std::sync::Mutex<
+    Vec<(Arc<glidefs::block::pack_index_cache::PackIndexCache>, TempDir)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Open a pack-index cache in its own directory (a restarted server must not share foyer's
+/// files with the instance it replaces, which stays open) and keep it for the process.
+async fn kept_pack_index_cache() -> Arc<glidefs::block::pack_index_cache::PackIndexCache> {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        glidefs::block::pack_index_cache::PackIndexCache::open(dir.path())
+            .await
+            .expect("pack index cache"),
+    );
+    KEPT_PACK_INDEX_CACHES.lock().unwrap().push((Arc::clone(&cache), dir));
+    cache
+}
+
 impl TestServer {
     /// Start a GlideFS server with the given transport.
     pub async fn start(
@@ -498,7 +528,7 @@ impl TestServer {
                 cache_dir: cache_dir.path().to_path_buf(),
                 block_size: 128 * 1024,
                 clean_cache,
-                pack_index_cache: None,
+                pack_index_cache: Some(kept_pack_index_cache().await),
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
@@ -594,7 +624,7 @@ impl TestServer {
                 cache_dir: cache_dir.clone(),
                 block_size: 128 * 1024,
                 clean_cache,
-                pack_index_cache: None,
+                pack_index_cache: Some(kept_pack_index_cache().await),
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
