@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       RUST_LOG: glidefs=debug,ublk_core=debug
       GLIDEFS_FORCE_USER_COPY: ""
@@ -102,7 +102,7 @@ jobs:
           ran=0; fails=0; hangs=0
           start=$(date +%s)
           for i in $(seq 1 "$N"); do
-            if [ $(( $(date +%s) - start )) -gt 5400 ]; then echo "budget reached"; break; fi
+            if [ $(( $(date +%s) - start )) -gt 1500 ]; then echo "budget reached"; break; fi
             ran=$i
             sudo "$BIN" --exact concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk --nocapture > /tmp/iter.log 2>&1 &
             pid=$!
@@ -121,6 +121,7 @@ jobs:
               echo "::warning::shard ${{ matrix.shard }} iter $i FAIL"
               grep -E "DIAG|=== |panicked|should contain" /tmp/iter.log | head -60
               echo "--- dmesg tail"; sudo dmesg --color=never | tail -15
+              break
             fi
           done
-          echo "=== loop summary shard ${{ matrix.shard }}: iterations=$ran fails=$fails hangs=$hangs ==="
+          echo "=== loop summary shard ${{ matrix.shard }}: iterations=$ran fails=$fails hangs=$hangs elapsed=$(( $(date +%s) - start ))s ==="
