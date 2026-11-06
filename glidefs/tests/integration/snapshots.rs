@@ -368,6 +368,99 @@ async fn test_purge_export_deletes_snapshots() {
     assert!(cs.list_snapshots("vm1").await.unwrap().is_empty());
 }
 
+/// Purging an export deletes its `index/snapshots/{name}@*` entries (and only
+/// its own: `vm1@` must not match `vm10@`), including for an export that is no
+/// longer attached and for entries already orphaned by an earlier purge. A
+/// second purge succeeds.
+#[tokio::test]
+async fn test_purge_deletes_snapshot_index_entries() {
+    use futures::TryStreamExt;
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        pack_index_cache: None,
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_flush_threshold: 500,
+        ublk_nr_queues: 1,
+        ublk_max_devices: None,
+        nbd_dead_conn_timeout: 0,
+        max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+        profile: None,
+    })
+    .await
+    .unwrap();
+
+    let cfg = |name: &str| ExportConfig {
+        name: name.to_string(),
+        size_gb: 0.01,
+        s3_prefix: None,
+        block_size: None,
+        flush_threshold: None,
+        flush_mode: None,
+        transport: None,
+        compaction_cooldown: None,
+        source: None,
+    };
+    for name in ["vm1", "vm10", "vm2"] {
+        router.create_export(cfg(name), false, None, None).await.unwrap();
+        router.save_export(&cfg(name)).await.unwrap();
+        for seed in [0xA1u8, 0xB2] {
+            // A flush between snapshots gives each its own sequence.
+            let handler = router.get_handler(name).await.unwrap();
+            handler.write(0, &[seed; 4096], false).await.unwrap();
+            router.drain_export(name).await.unwrap();
+            router.snapshot_export(name, None).await.unwrap();
+        }
+    }
+
+    async fn index_keys(s3: &Arc<dyn ObjectStore>) -> Vec<String> {
+        let prefix = object_store::path::Path::from("test/index/snapshots");
+        let mut keys: Vec<String> = s3
+            .list(Some(&prefix))
+            .map_ok(|m| m.location.filename().unwrap().to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        keys.sort();
+        keys
+    }
+    assert_eq!(index_keys(&s3).await.len(), 6, "two entries per export");
+
+    // Attached purge removes exactly vm1's entries; vm10 and vm2 are untouched.
+    router.remove_export("vm1", true).await.unwrap();
+    let keys = index_keys(&s3).await;
+    assert!(keys.iter().all(|k| !k.starts_with("vm1@")), "vm1 entries remain: {keys:?}");
+    assert_eq!(keys.len(), 4, "siblings keep their entries: {keys:?}");
+
+    // Detached (removed without purge, then purged) takes the other path.
+    router.remove_export("vm10", false).await.unwrap();
+    router.remove_export("vm10", true).await.unwrap();
+    let keys = index_keys(&s3).await;
+    assert!(keys.iter().all(|k| !k.starts_with("vm10@")), "vm10 entries remain: {keys:?}");
+    assert_eq!(keys.len(), 2, "vm2 keeps its entries: {keys:?}");
+
+    // An orphaned entry (its volume's definition is already gone) is still swept,
+    // and purging again is a no-op success.
+    let orphan = object_store::path::Path::from("test/index/snapshots/vm1@9.json");
+    s3.put(&orphan, bytes::Bytes::from_static(b"{}").into()).await.unwrap();
+    router.remove_export("vm1", true).await.unwrap();
+    router.remove_export("vm1", true).await.unwrap();
+    let keys = index_keys(&s3).await;
+    assert_eq!(keys.len(), 2, "orphan swept, vm2 untouched: {keys:?}");
+}
+
 /// HTTP API: list snapshots and delete a snapshot.
 #[tokio::test]
 async fn test_api_list_and_delete_snapshots() {

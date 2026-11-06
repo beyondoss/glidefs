@@ -781,6 +781,15 @@ works**. The physical S3 layout is unchanged — only the *addressing* moved fro
 into GlideFS. Lineage (`ExportConfig::source`, and a snapshot entry's `parent`) records the
 `from` ref so GlideFS, not the caller, owns the parent/child graph.
 
+**Snapshot index lifetime.** The entry is read once, by `resolve_source()`, when a fork is
+created; a running child never consults it. It is deleted with its snapshot
+(`delete_export_snapshot`) and, on `remove_export(purge=true)`, by prefix
+`index/snapshots/{name}@` (export names cannot contain `@`, so the prefix names one volume).
+Purge order is manifest, snapshot manifests, index entries, and last the export definition,
+which is the retry handle: a purge that fails part-way leaves it, so the next purge reruns
+every step. Index entries are keyed by name alone, so they are swept even when the
+definition is already gone. `glidefs gc` does not touch `index/`.
+
 Re-attach: a `PUT` for a volume not held locally consults the volume index first; if it
 exists, GlideFS adopts the persisted pool + geometry and attaches the real data instead of
 creating a fresh empty volume at the wrong pool. (`router.rs:resolve_export`,
