@@ -126,6 +126,23 @@ fn compute_flush_batch(
                     }
                     if any_mismatch {
                         let current_state = inner.state_map.get(chunk_index);
+                        let bad_pages: Vec<usize> = page_crcs
+                            .iter()
+                            .enumerate()
+                            .filter(|&(page, &c)| {
+                                let a = page * PAGE_SIZE;
+                                let b = (a + PAGE_SIZE).min(chunk_buf.len());
+                                c != 0 && crc_fast::crc32_iscsi(&chunk_buf[a..b]) != c
+                            })
+                            .map(|(p, _)| p)
+                            .collect();
+                        tracing::warn!(
+                            chunk_index,
+                            ?current_state,
+                            raced = inner.page_crcs.contains_key(&(chunk_index as u32)),
+                            ?bad_pages,
+                            "SCRATCH flush CRC mismatch"
+                        );
                         if current_state != SparseBlockState::SYNCING {
                             return Ok(BlockResult::Skipped {
                                 chunk_index,

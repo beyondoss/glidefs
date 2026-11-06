@@ -1448,6 +1448,18 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
     ) -> ublk_core::zc::ZcDispatch {
         use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp, ZcDispatch};
 
+        // SCRATCH: trace every ZC request.
+        tracing::info!(
+            op,
+            offset,
+            length,
+            tag,
+            t_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0),
+            "ZCIO dispatch"
+        );
         match u32::from(op) {
             op if crate::block::ublk_zc_policy::zc_no_payload(op)
                 == Some(crate::block::ublk_zc_policy::ZcNoPayload::AdvertisedNoop) =>
