@@ -85,6 +85,13 @@ transport_test! {
             r1.as_ref().map(|d| d.len()),
         );
 
+        // Close the device before the daemon goes away. With the fd still open, `shutdown`
+        // quiesces the ublk device (user recovery holds its requests) while the kernel may have a
+        // page-cache read in flight (readahead past the failed block, udev's probes), and the
+        // fd's close at the end of the test then waits forever on that read's locked folio
+        // (`blkdev_release -> truncate_inode_pages -> __folio_lock`). Measured on CI: ~1 in 10
+        // runs of the ublk suite hung here.
+        client2.disconnect().await.unwrap();
         server2.shutdown().await;
     }
 }
