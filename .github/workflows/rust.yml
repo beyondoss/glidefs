@@ -478,6 +478,9 @@ jobs:
       - name: Test (${{ matrix.transport }})
         run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (${{ matrix.transport }})
+        # A kernel-device teardown can block with no deadline of its own. Bound the step so a
+        # hang is a failure (and "Kernel logs (on failure)" runs), not a cancelled job with no log.
+        timeout-minutes: 20
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
