@@ -1088,12 +1088,12 @@ impl Drop for UblkQueue {
         // raw cdev fd (see UblkQueue::new). Closing the fd is the
         // daemon's responsibility (UblkDev owns the `cdev_file`).
 
-        // Unregister sparse buffer table if auto buffer registration was enabled
-        if self.support_auto_buf_zc() {
-            if let Err(r) = self.ring.with_mut(|r| r.submitter().unregister_buffers()) {
-                log::error!("unregister sparse buffers failed {}", r);
-            }
-        }
+        // No buffer table to unregister: `UblkQueue::new` never registers
+        // one on this ring (a ZC device's table lives on its ZC worker's
+        // ring, `zc::build_ring`, and goes with that ring's fd). Calling
+        // `unregister_buffers` here failed ENXIO for every ZC queue, and on a
+        // ring shared by several queues it would pull the table out from
+        // under the others.
 
         let depth = u32::from(dev.dev_info.queue_depth);
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
@@ -1193,15 +1193,16 @@ impl UblkQueue {
         // the slot release in `Drop`). The sparse-table machinery in
         // `WorkerRing` is intentionally left in place for that future.
 
-        // ZC's auto-buf-reg sparse buffer table is per-ring, not
-        // per-queue. With many queues sharing a ring, only the first
-        // queue should register; subsequent queues skip. ublk's
-        // production path has ZC permanently disabled, so this branch
-        // is dead — just log and skip if it ever triggers.
+        // ZC's auto-buf-reg sparse buffer table is per-ring, and a ZC
+        // device's table is registered by its ZC worker (`zc::build_ring`),
+        // which hosts the queue's FETCHes. The queue built here is a shell
+        // on a worker-pool ring (`io_task` hands it off), so it registers
+        // nothing. Expected for every ZC queue: debug, not a warning.
         if (dev.dev_info.flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0 {
-            log::warn!(
-                "UBLK_F_AUTO_BUF_REG set but multi-queue rings don't \
-                 yet share buffer tables; skipping register_buffers_sparse"
+            log::debug!(
+                "dev {} queue {}: AUTO_BUF_REG buffer table is owned by the ZC worker",
+                dev.dev_info.dev_id,
+                q_id
             );
         }
 
