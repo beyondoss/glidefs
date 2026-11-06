@@ -37,6 +37,10 @@ transport_test! {
             handles.push(tokio::spawn(async move {
                 let mut client = info.connect().await.unwrap();
                 let data = client.read(0, BLOCK_SIZE as u32).await.unwrap();
+                #[cfg(all(target_os = "linux", feature = "ublk"))]
+                if !data.iter().all(|&b| b == 0xAA) {
+                    eprintln!("DIAG storm client got: {}", crate::describe_buf(&data, 0xAA));
+                }
                 assert!(
                     data.iter().all(|&b| b == 0xAA),
                     "storm client read unexpected data"

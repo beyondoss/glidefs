@@ -1096,3 +1096,107 @@ mod range_reads;
 mod resize;
 mod transport_stress;
 mod write_read;
+
+// ---------------------------------------------------------------------------
+// Scratch diagnostics: where did a wrong read come from?
+// ---------------------------------------------------------------------------
+
+/// Describe `buf` against an expected fill byte.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+pub fn describe_buf(buf: &[u8], expected: u8) -> String {
+    let n = buf.len();
+    let good = buf.iter().filter(|&&b| b == expected).count();
+    let zeros = buf.iter().filter(|&&b| b == 0).count();
+    let first_bad = buf.iter().position(|&b| b != expected);
+    let last_bad = buf.iter().rposition(|&b| b != expected);
+    let mut hist = std::collections::BTreeMap::new();
+    for &b in buf {
+        *hist.entry(b).or_insert(0usize) += 1;
+    }
+    let top: Vec<String> = hist.iter().take(6).map(|(b, c)| format!("{b:#04x}x{c}")).collect();
+    format!(
+        "len={n} expected_bytes={good} zero_bytes={zeros} first_bad={first_bad:?} last_bad={last_bad:?} values=[{}]",
+        top.join(",")
+    )
+}
+
+/// Read `len` at `offset` from `path` with O_DIRECT (aligned buffer).
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+fn direct_read(path: &std::path::Path, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?;
+    let layout = std::alloc::Layout::from_size_align(len, 4096)?;
+    // SAFETY: layout is non-zero; the buffer is freed below with the same layout.
+    let p = unsafe { std::alloc::alloc_zeroed(layout) };
+    let s = unsafe { std::slice::from_raw_parts_mut(p, len) };
+    let r = f.read_exact_at(s, offset);
+    let out = s.to_vec();
+    unsafe { std::alloc::dealloc(p, layout) };
+    r?;
+    Ok(out)
+}
+
+/// A client read of `[offset, offset+len)` on the ublk device did not match `expected`.
+/// Print, in one block: what the client got, what the server itself returns for the same
+/// range (cache path and ublk fast path), and whether buffered/O_DIRECT re-reads agree.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+pub async fn diagnose_mismatch(
+    server: &TestServer,
+    name: &str,
+    offset: u64,
+    len: usize,
+    expected: u8,
+    got: &[u8],
+    what: &str,
+) {
+    use std::os::unix::fs::FileExt;
+    eprintln!("=== DIAG {what}: block@{offset} len={len} expected {expected:#04x}");
+    eprintln!("DIAG client first read : {}", describe_buf(got, expected));
+    let handler = server.router.get_handler(name).await;
+    if let Some(h) = handler {
+        match h.read(offset, len as u32).await {
+            Ok(d) => eprintln!("DIAG server handler.read : {}", describe_buf(&d, expected)),
+            Err(e) => eprintln!("DIAG server handler.read : error {e:?}"),
+        }
+        let mut b = vec![0u8; len];
+        match h.read_into(offset, len as u32, &mut b).await {
+            Ok(_) => eprintln!("DIAG server read_into     : {}", describe_buf(&b, expected)),
+            Err(e) => eprintln!("DIAG server read_into     : error {e:?}"),
+        }
+    } else {
+        eprintln!("DIAG no handler for {name}");
+    }
+    let info = server.connect_info(name).await;
+    if let ConnectInfo::Ublk { dev_path, .. } = info {
+        for (label, delay_ms) in [("t+0", 0u64), ("t+200ms", 200), ("t+1s", 800)] {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let p = dev_path.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                // Buffered, no cache drop: what the page cache holds now.
+                let f = std::fs::File::open(&p)?;
+                let mut cached = vec![0u8; len];
+                f.read_exact_at(&mut cached, offset)?;
+                // Buffered after DONTNEED: forces a device read.
+                unsafe { libc::posix_fadvise(std::os::unix::io::AsRawFd::as_raw_fd(&f), 0, 0, libc::POSIX_FADV_DONTNEED) };
+                let mut fresh = vec![0u8; len];
+                f.read_exact_at(&mut fresh, offset)?;
+                let direct = direct_read(&p, offset, len)?;
+                anyhow::Ok((cached, fresh, direct))
+            })
+            .await;
+            match r {
+                Ok(Ok((cached, fresh, direct))) => {
+                    eprintln!("DIAG {label} buffered(no drop)  : {}", describe_buf(&cached, expected));
+                    eprintln!("DIAG {label} buffered(after drop): {}", describe_buf(&fresh, expected));
+                    eprintln!("DIAG {label} O_DIRECT           : {}", describe_buf(&direct, expected));
+                }
+                Ok(Err(e)) => eprintln!("DIAG {label} re-read error: {e:#}"),
+                Err(e) => eprintln!("DIAG {label} join error: {e}"),
+            }
+        }
+    }
+    eprintln!("=== END DIAG");
+}
