@@ -399,6 +399,13 @@ impl TestContext {
     /// Each call allocates a unique bucket so concurrent tests don't see
     /// each other's data.
     pub async fn new() -> Self {
+        static TRACING: std::sync::Once = std::sync::Once::new();
+        TRACING.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .try_init();
+        });
         let minio = shared_minio().await;
         let id = BUCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // MinIO bucket names: lowercase, 3-63 chars, alphanumeric + hyphen.
