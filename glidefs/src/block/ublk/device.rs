@@ -1418,6 +1418,15 @@ struct GlidefsZcTarget {
     scratch_fd: std::os::fd::RawFd,
     /// Bytes per tag in the scratch memfd. Equals `max_io_buf_bytes`.
     scratch_slot_bytes: u64,
+    /// Per tag: bytes of its scratch slot a cold read has written and
+    /// `after_read` has not yet released. The memfd is shmem, charged to
+    /// glidefs's cgroup and unreclaimable without swap, so a slot is only
+    /// borrowed for the read: `after_read` punches it back out. Without that
+    /// the pages stayed resident for the life of the device (12 MiB per
+    /// device after a cold boot, measured), and a cold fill of ~1,000 devices
+    /// reached the service's `MemoryMax` (shmem 6.6 GiB of 8 GiB) and was
+    /// OOM-killed.
+    scratch_used: Arc<[std::sync::atomic::AtomicU32]>,
 }
 
 impl Drop for GlidefsZcTarget {
@@ -1638,6 +1647,7 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 let dev_zero_fd = self.dev_zero_fd;
                 let scratch_fd = self.scratch_fd;
                 let scratch_slot_offset = u64::from(tag) * self.scratch_slot_bytes;
+                let scratch_used = Arc::clone(&self.scratch_used);
                 self.runtime.spawn(async move {
                     let mut guard = SubmitGuard::new(tag, handle);
                     // Try the hot path FIRST, under the rotation gate.
@@ -1676,6 +1686,7 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                                 dev_zero_fd,
                                 scratch_fd,
                                 scratch_slot_offset,
+                                &scratch_used[usize::from(tag)],
                             );
                             guard.commit(action, Some(Box::new(gate)));
                         }
@@ -1692,6 +1703,41 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 keepalive: None,
             },
         }
+    }
+
+    fn after_read(
+        &self,
+        _op: u8,
+        _offset: u64,
+        _length: u32,
+        tag: u16,
+        result: i32,
+        _keepalive: Option<&(dyn std::any::Any + Send)>,
+    ) -> i32 {
+        // Every chunk has completed, so the bio no longer needs the slot.
+        // One atomic swap on the hot path; the syscall only after a cold read.
+        let used = self.scratch_used[usize::from(tag)].swap(0, std::sync::atomic::Ordering::AcqRel);
+        if used > 0 {
+            let off = u64::from(tag) * self.scratch_slot_bytes;
+            // SAFETY: scratch_fd is the memfd this target owns; PUNCH_HOLE with
+            // KEEP_SIZE frees the pages and leaves the file size alone.
+            let rc = unsafe {
+                libc::fallocate(
+                    self.scratch_fd,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    off as libc::off_t,
+                    self.scratch_slot_bytes as libc::off_t,
+                )
+            };
+            if rc < 0 {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    tag,
+                    "ZC scratch slot release failed; its pages stay resident"
+                );
+            }
+        }
+        result
     }
 
     fn after_write(
@@ -1884,6 +1930,7 @@ fn build_read_chunks_in_file(
     dev_zero_fd: std::os::fd::RawFd,
     scratch_fd: std::os::fd::RawFd,
     scratch_slot_offset: u64,
+    scratch_used_bytes: &std::sync::atomic::AtomicU32,
 ) -> ublk_core::zc::ZcAction {
     use crate::block::write_cache::ChunkSource;
     use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp};
@@ -1932,6 +1979,10 @@ fn build_read_chunks_in_file(
                     src_offset: scratch_off,
                 };
                 scratch_used += entry.slice_len as u64;
+                // Published after every pwrite, so an error return below still
+                // leaves `after_read` knowing what to release.
+                #[allow(clippy::cast_possible_truncation)]
+                scratch_used_bytes.store(scratch_used as u32, std::sync::atomic::Ordering::Release);
                 op
             }
             ChunkSource::Zero => ZcChunkOp::ReadFixed {
@@ -2069,6 +2120,9 @@ pub(super) fn place_zero_copy(
         dev_zero_fd,
         scratch_fd,
         scratch_slot_bytes,
+        scratch_used: (0..queue_depth)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect(),
     });
 
     zc.pool
