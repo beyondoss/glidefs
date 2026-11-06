@@ -368,8 +368,14 @@ impl PromoteClaimBitmap {
 
     /// Insert `idx` into the in-flight set. `true` iff this caller's
     /// insertion was new (i.e., they own the claim).
+    #[allow(dead_code)] // tests
     pub(super) fn try_claim(&self, idx: usize) -> bool {
         self.claim(idx, false).is_some()
+    }
+
+    /// [`Self::try_claim`], returning the claim's identity.
+    pub(super) fn try_claim_promote(&self, idx: usize) -> Option<ClaimToken> {
+        self.claim(idx, false)
     }
 
     /// [`Self::try_claim`], returning the claim's identity. Callers that
@@ -442,14 +448,38 @@ impl PromoteClaimBitmap {
         true
     }
 
+    #[allow(dead_code)] // tests
     pub(super) fn release(&self, idx: usize) {
         self.in_flight.lock().remove(&idx);
         self.released.notify_all();
     }
 
-    /// Whether the current holder of `idx` is an S3 materialization.
-    pub(super) fn is_materializing(&self, idx: usize) -> bool {
-        self.in_flight.lock().get(&idx).is_some_and(|s| s.materializing)
+    /// Release `idx` only if `token` is still the live claim on it. A claim
+    /// that was taken over (see [`Self::steal_from_materializer`]) is no
+    /// longer its original holder's to release.
+    pub(super) fn release_token(&self, idx: usize, token: ClaimToken) {
+        let mut g = self.in_flight.lock();
+        if g.get(&idx).is_some_and(|s| s.token == token) {
+            g.remove(&idx);
+            self.released.notify_all();
+        }
+    }
+
+    /// Take over `idx` from an S3 materialization whose commit can no longer
+    /// land, returning the new claim. The caller has seen the block SYNCING:
+    /// a materialization commits only a CLEAN block and only under its own
+    /// token (`write_materialized`, inside `if_valid` on this same mutex), so
+    /// replacing its slot makes its eventual commit abort. This keeps a guest
+    /// write from waiting behind an S3 fetch whose result will be discarded.
+    /// `None` if the holder is not a materialization (or the claim is gone).
+    pub(super) fn steal_from_materializer(&self, idx: usize) -> Option<ClaimToken> {
+        let mut g = self.in_flight.lock();
+        if !g.get(&idx).is_some_and(|s| s.materializing) {
+            return None;
+        }
+        let token = ClaimToken(self.next_token.fetch_add(1, Ordering::Relaxed));
+        g.insert(idx, ClaimSlot { token, valid: true, materializing: false });
+        Some(token)
     }
 
     /// Whether any task currently holds the claim for `idx`.
@@ -1194,26 +1224,6 @@ impl CacheInner {
         (0..self.num_blocks).any(|i| self.state_map.get(i) == SparseBlockState::SYNCING)
     }
 
-    /// Park, holding no lock, until no task holds the promote claim of any
-    /// block in `start_block..=end_block`. For callers that were handed back
-    /// `BlockEvicted` by a plain-writer promote and must retry.
-    pub(super) fn wait_promote_claims_free(&self, start_block: u64, end_block: u64) {
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.num_blocks {
-                continue;
-            }
-            loop {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(5);
-                if self.promote_claim.wait_for_release(idx, deadline) {
-                    break;
-                }
-                tracing::warn!(block = idx, "still waiting for the block's promote claim");
-            }
-        }
-    }
-
     /// Promote SYNCING blocks from flushing → active file before a guest write.
     ///
     /// When a guest writes to a block being flushed (SYNCING), its pre-rotation
@@ -1360,42 +1370,55 @@ impl CacheInner {
                         // never needed promotion. Nothing to do.
                         break;
                     }
-                    if !self.promote_claim.try_claim(idx) {
-                        // A materialization holds its claim across the S3
-                        // fetch and then takes the data_file WRITE lock, which
-                        // waits for the read gate our caller holds: parking
-                        // here is a lock-order deadlock. A plain writer hands
-                        // the gate back (BlockEvicted → its caller waits for
-                        // the claim gate-free and retries); `require_promotion`
-                        // callers take the same route below.
-                        if !require_promotion && self.promote_claim.is_materializing(idx) {
-                            return Err(super::CacheError::BlockEvicted);
+                    let token = match self.promote_claim.try_claim_promote(idx) {
+                        Some(t) => t,
+                        None => {
+                            // A materialization holds its claim across the S3
+                            // fetch, then needs the data_file WRITE lock, which
+                            // waits for the read gate our caller holds: parking
+                            // on it here is a lock-order deadlock, and waiting
+                            // is pointless anyway. For a SYNCING block the
+                            // materializer's commit can no longer land (it
+                            // commits only a CLEAN block under its own token),
+                            // so take its claim over: its commit then aborts,
+                            // and no guest write waits behind an S3 fetch.
+                            let stolen = if state == SparseBlockState::SYNCING {
+                                self.promote_claim.steal_from_materializer(idx)
+                            } else {
+                                None
+                            };
+                            let Some(t) = stolen else {
+                                // A promoter holds the claim. Park on the
+                                // condvar until they release, then RE-CHECK
+                                // the state (loop) — never assume the holder
+                                // succeeded.
+                                if !self.promote_claim.wait_for_release(idx, deadline) {
+                                    tracing::warn!(
+                                        block = idx,
+                                        "promote: still waiting for the block's promote claim"
+                                    );
+                                    if require_promotion {
+                                        // Refuse to proceed on an unverified
+                                        // block — the caller re-backfills from
+                                        // S3. Erring is recoverable;
+                                        // proceeding can corrupt.
+                                        return Err(super::CacheError::BlockEvicted);
+                                    }
+                                    // Plain writers have no retry path and must
+                                    // not proceed unpromoted. The holder is a
+                                    // promoter (or a materializer about to
+                                    // claim the block), which needs only a disk
+                                    // read and write and drops its claim
+                                    // through a RAII guard: a slow disk delays
+                                    // this write, it does not fail it.
+                                    deadline = std::time::Instant::now()
+                                        + std::time::Duration::from_secs(5);
+                                }
+                                continue;
+                            };
+                            t
                         }
-                        // Another promoter holds the claim. Park on the
-                        // condvar until they release, then RE-CHECK the
-                        // state (loop) — never assume the holder succeeded.
-                        if !self.promote_claim.wait_for_release(idx, deadline) {
-                            tracing::warn!(
-                                block = idx,
-                                "promote: still waiting for the block's promote claim"
-                            );
-                            if require_promotion {
-                                // Refuse to proceed on an unverified block —
-                                // the caller re-backfills from S3. Erring is
-                                // recoverable; proceeding can corrupt.
-                                return Err(super::CacheError::BlockEvicted);
-                            }
-                            // Plain writers have no retry path and must not
-                            // proceed unpromoted. The holder is a promoter
-                            // (a materializer returned above), which needs
-                            // only a disk read and write and drops its claim
-                            // through a RAII guard: a slow disk delays this
-                            // write, it does not fail it. Keep waiting.
-                            deadline =
-                                std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        }
-                        continue;
-                    }
+                    };
                     // We hold the claim. Wrap the rest in a RAII guard so a
                     // panic or early return — including the `?` propagation on
                     // pwrite errors — releases the claim and wakes waiters.
@@ -1404,13 +1427,14 @@ impl CacheInner {
                     struct ClaimGuard<'a> {
                         claim: &'a PromoteClaimBitmap,
                         idx: usize,
+                        token: ClaimToken,
                     }
                     impl<'a> Drop for ClaimGuard<'a> {
                         fn drop(&mut self) {
-                            self.claim.release(self.idx);
+                            self.claim.release_token(self.idx, self.token);
                         }
                     }
-                    let _guard = ClaimGuard { claim: &self.promote_claim, idx };
+                    let _guard = ClaimGuard { claim: &self.promote_claim, idx, token };
 
                     // `state` was read before the claim, and a holder releases
                     // the claim as soon as it has promoted (DIRTY) — before its
