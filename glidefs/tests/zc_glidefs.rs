@@ -845,6 +845,92 @@ async fn zc_glidefs_concurrent_rw_race_on_evicted_block() {
     eprintln!("[zc-rw-race] OK");
 }
 
+/// Bytes of this process's `glidefs-zc-scratch-*` memfds that are resident.
+/// A memfd is shmem: charged to the service cgroup and, with swap off, never
+/// reclaimable, so what a cold read leaves in one is held until the device goes.
+fn resident_scratch_bytes() -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut total = 0;
+    for ent in std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd").flatten() {
+        let Ok(target) = std::fs::read_link(ent.path()) else { continue };
+        if target.to_string_lossy().starts_with("/memfd:glidefs-zc-scratch") {
+            if let Ok(md) = std::fs::metadata(ent.path()) {
+                total += md.blocks() * 512;
+            }
+        }
+    }
+    total
+}
+
+/// A cold read borrows its tag's scratch slot and must give it back: after
+/// reading evicted blocks back, no scratch page stays resident. Before the
+/// slot was released on completion, every cold read left its bytes in the
+/// memfd for the life of the device, and a cold fill of ~1,000 devices
+/// reached the service's `MemoryMax` (shmem 6.6 GiB of 8 GiB) and was
+/// OOM-killed.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_cold_reads_release_scratch() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skip [zc-scratch]: {why}");
+        return;
+    }
+    let _rss_guard = RSS_EXCLUSIVE.read().await;
+    if std::env::var("GLIDEFS_TEST_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
+        eprintln!("skip [zc-scratch]: USER_COPY has no scratch memfd");
+        return;
+    }
+    let (router, _cache_dir) = setup_router_with_flush_threshold(8).await;
+    let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
+    let mut ublk_server = UblkServer::new();
+    let dev_path = ublk_server
+        .add_device(EXPORT_NAME, handler)
+        .await
+        .expect("ublk register");
+
+    let bdev = dev_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        const BLOCKS: u64 = 256;
+        let mut file = open_direct(&bdev, true)?;
+        for i in 0..BLOCKS {
+            let pat = rw_race_block_pattern(i, 0);
+            file.seek(SeekFrom::Start(i * 4096))?;
+            file.write_all(&aligned_4k(&pat))?;
+        }
+        file.sync_data()?;
+        // Let the flush worker evict, so the reads below come from the store.
+        std::thread::sleep(Duration::from_millis(500));
+        for i in 0..BLOCKS {
+            let mut buf = aligned_4k(&[0u8; 4096]);
+            file.seek(SeekFrom::Start(i * 4096))?;
+            file.read_exact(&mut buf)?;
+            let got = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            if got != i {
+                return Err(std::io::Error::other(format!(
+                    "block {i} reads back as block {got}"
+                )));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    let resident = resident_scratch_bytes();
+    if let Err(e) = ublk_server.shutdown().await {
+        eprintln!("ublk shutdown error: {e}");
+    }
+    if let Err(e) = router.shutdown().await {
+        eprintln!("router shutdown error: {e}");
+    }
+    result.unwrap_or_else(|e| panic!("[zc-scratch] io failed: {e}"));
+    assert_eq!(
+        resident, 0,
+        "[zc-scratch] {resident} bytes of scratch memfd stayed resident after the cold reads completed"
+    );
+    eprintln!("[zc-scratch] OK");
+}
+
 fn rw_race_block_pattern(block_idx: u64, generation: u64) -> [u8; 4096] {
     let mut buf = [0u8; 4096];
     buf[..8].copy_from_slice(&generation.to_le_bytes());
