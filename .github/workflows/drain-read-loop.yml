@@ -12,9 +12,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        include:
+          - {shard: 1, tests: 'concurrent::test_drain_during_active_writes_ublk'}
+          - {shard: 2, tests: 'concurrent::test_drain_during_active_writes_ublk'}
+          - {shard: 3, tests: 'concurrent::test_drain_during_active_writes_ublk'}
+          - {shard: 4, tests: 'transport_stress::test_client_storm_ublk'}
+          - {shard: 5, tests: 'transport_stress::test_client_storm_ublk'}
+          - {shard: 6, tests: 'transport_stress::test_client_storm_ublk'}
+          - {shard: 7, tests: 'concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk'}
+          - {shard: 8, tests: 'concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk'}
+          - {shard: 9, tests: 'concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk'}
     env:
-      RUST_LOG: glidefs=debug,ublk_core=debug
+      RUST_LOG: glidefs=info,ublk_core=info
+      RUST_BACKTRACE: '1'
       GLIDEFS_FORCE_USER_COPY: ""
       GLIDEFS_TEST_FORCE_USER_COPY: ""
     steps:
@@ -96,6 +107,9 @@ jobs:
         run: cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run
       - name: Loop
         run: |
+          sudo apt-get install -y gdb >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%p >/dev/null
+          ulimit -c unlimited
           BIN=$(ls -t target/debug/deps/docker_integration-* | grep -v '\.d$' | head -1)
           echo "bin=$BIN"
           N=${LOOP_N:-250}
@@ -103,8 +117,8 @@ jobs:
           start=$(date +%s)
           for i in $(seq 1 "$N"); do
             if [ $(( $(date +%s) - start )) -gt 1500 ]; then echo "budget reached"; break; fi
-            ran=$i
-            sudo "$BIN" --exact concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk --nocapture > /tmp/iter.log 2>&1 &
+            ran=$i; sudo rm -f /tmp/core.*
+            sudo "$BIN" --exact ${{ matrix.tests }} --nocapture > /tmp/iter.log 2>&1 &
             pid=$!
             waited=0
             while kill -0 $pid 2>/dev/null && [ $waited -lt 90 ]; do sleep 1; waited=$((waited+1)); done
@@ -119,8 +133,9 @@ jobs:
             if ! wait $pid; then
               fails=$((fails+1))
               echo "::warning::shard ${{ matrix.shard }} iter $i FAIL"
-              grep -E "DIAG|=== |panicked|should contain" /tmp/iter.log | head -60
+              tail -c 30000 /tmp/iter.log
               echo "--- dmesg tail"; sudo dmesg --color=never | tail -15
+              for c in /tmp/core.*; do [ -f "$c" ] && sudo gdb -batch -ex "thread apply all bt 25" "$BIN" "$c" 2>&1 | tail -250; done
               break
             fi
           done

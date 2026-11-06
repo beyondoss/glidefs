@@ -186,6 +186,10 @@ transport_test! {
                 .read(i * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
                 .await
                 .unwrap();
+            if !data.iter().all(|&b| b == (i + 1) as u8) {
+                #[cfg(all(target_os = "linux", feature = "ublk"))]
+                crate::diagnose_mismatch(&server2, "vol1", i * BLOCK_SIZE as u64, BLOCK_SIZE, (i + 1) as u8, &data, "drain-after-restart").await;
+            }
             assert!(
                 data.iter().all(|&b| b == (i + 1) as u8),
                 "block {} should contain {:#x} after restart",
