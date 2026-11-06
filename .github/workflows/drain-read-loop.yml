@@ -96,11 +96,7 @@ jobs:
         run: cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run
       - name: Loop
         run: |
-          BIN=$(cargo test -p glidefs --features ublk,docker-tests --test docker_integration --no-run --message-format=json 2>/dev/null | python3 -c 'import sys,json
-for l in sys.stdin:
-    try: m=json.loads(l)
-    except Exception: continue
-    if m.get("reason")=="compiler-artifact" and m.get("target",{}).get("name")=="docker_integration" and m.get("executable"): print(m["executable"])' | tail -1)
+          BIN=$(ls -t target/debug/deps/docker_integration-* | grep -v '\.d$' | head -1)
           echo "bin=$BIN"
           N=${LOOP_N:-250}
           ran=0; fails=0; hangs=0
