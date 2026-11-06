@@ -585,11 +585,11 @@ impl WriteCache<Active> {
     /// promotable).
     #[inline]
     pub fn try_claim_block(&self, block_idx: usize) -> bool {
-        if !self.inner.promote_claim.try_claim(block_idx) {
+        let Some(token) = self.inner.promote_claim.try_claim_promote(block_idx) else {
             return false;
-        }
+        };
         let won = self.inner.try_set_present(block_idx);
-        self.inner.promote_claim.release(block_idx);
+        self.inner.promote_claim.release_token(block_idx, token);
         won
     }
 
@@ -636,7 +636,7 @@ impl WriteCache<Active> {
     ) -> Option<MaterializationClaim<'_>> {
         let token = self.inner.promote_claim.try_claim_token(block_idx)?;
         if !self.inner.try_set_present(block_idx) {
-            self.inner.promote_claim.release(block_idx);
+            self.inner.promote_claim.release_token(block_idx, token);
             return None;
         }
         Some(MaterializationClaim { cache_inner: &self.inner, block_idx, token })
@@ -704,7 +704,9 @@ impl MaterializationClaim<'_> {
 
 impl Drop for MaterializationClaim<'_> {
     fn drop(&mut self) {
-        self.cache_inner.promote_claim.release(self.block_idx);
+        self.cache_inner
+            .promote_claim
+            .release_token(self.block_idx, self.token);
     }
 }
 

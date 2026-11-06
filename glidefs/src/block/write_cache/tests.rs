@@ -4077,15 +4077,15 @@ async fn promote_claimed_late_does_not_clobber_sibling_write() {
     }
 }
 
-/// A promoter that times out waiting for another promoter's claim must not
-/// proceed on its own. `zero_range` passes `require_promotion=false`; the old
-/// best-effort `break` let it zero one page of a SYNCING block without the
-/// rest of the block ever being promoted, then mark the block DIRTY — the
-/// other pages read as sparse zeros and the stuck holder's late copy would
-/// roll the zeroed page back. It must fail the I/O instead.
+/// A plain writer (`require_promotion=false`: `write`, `zero_range`) that waits
+/// on a promoter's claim must wait for it, however long the holder's disk
+/// takes: failing the I/O (EIO) can turn the guest filesystem read-only, and
+/// proceeding unpromoted loses the rest of the block. The holder here is a
+/// promoter, which needs only disk I/O and drops its claim through a RAII
+/// guard, so the wait cannot deadlock.
 #[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn promote_wait_timeout_fails_closed_for_plain_writers() {
+async fn promote_waits_past_five_seconds_for_a_slow_holder() {
     let block_size = 128 * 1024usize;
     let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
 
@@ -4093,12 +4093,71 @@ async fn promote_wait_timeout_fails_closed_for_plain_writers() {
     h.cache.write(4096, &[0x11; 4096]).unwrap();
     assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![0]);
 
-    // A holder stuck past the 5 s wait deadline.
     assert!(h.cache.inner.promote_claim.try_claim(0));
-    let res = h.cache.zero_range(4096, 4096);
-    h.cache.inner.promote_claim.release(0);
+    let cache = &h.cache;
+    let res = std::thread::scope(|s| {
+        let w = s.spawn(|| cache.zero_range(4096, 4096));
+        // Past the old 5 s deadline.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        cache.inner.promote_claim.release(0);
+        w.join().unwrap()
+    });
+    res.expect("a slow holder must delay the write, not fail it");
+    let got = h.cache.read_local_only(0, 4096).unwrap();
+    assert!(got.iter().all(|&b| b == 0xAA), "page 0 lost: {:#04x}", got[0]);
+    let got = h.cache.read_local_only(4096, 4096).unwrap();
+    assert!(got.iter().all(|&b| b == 0), "page 1 not zeroed");
+}
 
-    assert!(res.is_err(), "timed-out promoter must fail the I/O, got {res:?}");
-    // Not marked DIRTY over a half-empty active file.
+/// A materialization holds the block's promote claim across its S3 fetch and
+/// then takes the data_file WRITE lock. A plain writer that parks on that
+/// claim INSIDE its gate deadlocks with it, and one that waits for it is held
+/// hostage by the S3 fetch. The stale claim is reachable: a straggler write
+/// commits the CLEAN block, a flush rotates it to SYNCING, the claim is still
+/// held. The materializer's commit can no longer land on a SYNCING block, so
+/// the writer takes the claim over and proceeds while the fetch is still
+/// "running"; the materializer's commit then aborts and its release is a no-op.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_writer_takes_over_a_stale_materialization_claim() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    let claim = h
+        .cache
+        .claim_block_for_materialization(0)
+        .expect("block 0 is not present");
+    // Straggler guest write commits the CLEAN block; a flush rotates it.
+    h.cache.write(0, &[0x22; 4096]).unwrap();
+    assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![0]);
     assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
+
+    // The materializer's S3 fetch is still in flight (it never calls
+    // write_materialized here). The writer must not wait for it.
+    let cache = &h.cache;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            tx.send(cache.write(4096, &[0x33; 4096]).is_ok()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .expect("a guest write waited behind a materializer's in-flight fetch"),
+            "write failed"
+        );
+    });
+
+    // The fetch finishes: its commit aborts (taken over) and dropping the
+    // claim must not release anyone else's claim.
+    let landed = h
+        .cache
+        .write_materialized(0, &vec![0u8; block_size], &claim)
+        .unwrap();
+    assert!(!landed, "a taken-over materialization must not commit");
+    drop(claim);
+    assert!(!h.cache.inner.promote_claim.is_claimed(0));
+
+    let got = h.cache.read_local_only(0, 8192).unwrap();
+    assert!(got[..4096].iter().all(|&b| b == 0x22), "page 0 lost");
+    assert!(got[4096..].iter().all(|&b| b == 0x33), "page 1 lost");
 }
