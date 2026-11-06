@@ -1824,6 +1824,13 @@ impl BlockHandler {
 
         self.metrics.record_guest_read(u64::from(length));
 
+        // Boot-fault profiler hook (None in production). The zero-copy ublk
+        // transport reads through this plan, not `read`/`read_into`, so without
+        // it a profile on a kernel with AUTO_BUF_REG captures no blocks.
+        if let Some(t) = &self.read_tracer {
+            t.record(offset, u64::from(length), crate::block::write_trace::TraceOp::Read);
+        }
+
         let plan = self
             .cache
             .resolve_read_plan(
@@ -2678,4 +2685,20 @@ pub(crate) mod tests {
         );
     }
 
+    /// The zero-copy ublk transport reads via `resolve_read`; the boot-set
+    /// profiler's read tracer must see those reads or a profile on a kernel with
+    /// AUTO_BUF_REG captures nothing.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[tokio::test]
+    async fn resolve_read_feeds_the_read_tracer() {
+        use crate::block::write_trace::{boot_set_from_trace, WriteTracer};
+        let (handler, dir) = test_handler().await;
+        let path = dir.path().join("t.rtrace");
+        let tracer = Arc::new(WriteTracer::new(&path, 4096, 256, "t").unwrap());
+        let handler = handler.with_read_tracer(Some(Arc::clone(&tracer)));
+        handler.resolve_read(8192, 4096).await.unwrap();
+        tracer.finish();
+        let blocks = boot_set_from_trace(&std::fs::read(&path).unwrap(), 1000);
+        assert_eq!(blocks, vec![2]);
+    }
 }
