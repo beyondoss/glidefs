@@ -1121,6 +1121,17 @@ pub fn describe_buf(buf: &[u8], expected: u8) -> String {
         *hist.entry(b).or_insert(0usize) += 1;
     }
     let top: Vec<String> = hist.iter().take(6).map(|(b, c)| format!("{b:#04x}x{c}")).collect();
+    let bad: Vec<String> = buf
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b != expected && b != 0)
+        .take(80)
+        .map(|(i, b)| format!("{i}:{b:#04x}"))
+        .collect();
+    let bad_pages: Vec<usize> = (0..n.div_ceil(4096))
+        .filter(|p| buf[p * 4096..((p + 1) * 4096).min(n)].iter().any(|&b| b != expected))
+        .collect();
+    eprintln!("DIAG   bad pages (4K) {bad_pages:?}; first nonzero-nonexpected bytes {bad:?}");
     format!(
         "len={n} expected_bytes={good} zero_bytes={zeros} first_bad={first_bad:?} last_bad={last_bad:?} values=[{}]",
         top.join(",")
