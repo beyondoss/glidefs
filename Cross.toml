@@ -1,0 +1,10 @@
+# Release builds run in cross's container, where build.rs needs musl-gcc + cpio
+# to bake the boot-set profiling initramfs (glidefs/build.rs). Only x86_64 gets
+# them: build.rs compiles init.c with the container's native musl-gcc, so on any
+# other target it would bake an x86_64 init into a foreign-arch guest. Those
+# targets keep the empty placeholder, as before.
+[target.x86_64-unknown-linux-gnu]
+pre-build = ["apt-get update && apt-get install -y musl-tools cpio"]
+
+[target.x86_64-unknown-linux-gnu.env]
+passthrough = ["GLIDEFS_REQUIRE_INITRAMFS"]

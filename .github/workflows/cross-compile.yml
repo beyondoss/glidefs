@@ -22,12 +22,14 @@ jobs:
             arch: amd64
             os: ubuntu-latest
             platform: linux
+            initramfs: true
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             os: ubuntu-latest
             platform: linux
             features: glidefs/ublk
             variant: ublk-
+            initramfs: true
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             os: ubuntu-latest
@@ -83,8 +85,19 @@ jobs:
           # x86_64/aarch64. This flag tells it to use those bindings on other
           # architectures where the io_uring ABI is identical.
           RUSTFLAGS: '--cfg=io_uring_skip_arch_check --cfg tokio_unstable'
+          # x86_64 releases run VMs: fail the build rather than ship the empty
+          # boot-profiling initramfs (see Cross.toml, glidefs/build.rs).
+          GLIDEFS_REQUIRE_INITRAMFS: ${{ matrix.initramfs && '1' || '' }}
         run: |
           cross build -p glidefs -p oci-distribution --profile ci --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+
+      # build.rs embeds the cpio with include_bytes!; an empty one has no newc
+      # magic. Assert on the binary itself, not on the build's say-so.
+      - name: Assert boot-profiling initramfs is embedded
+        if: matrix.initramfs
+        run: |
+          bin=target/${{ matrix.target }}/ci/glidefs
+          grep -qa '070701' "$bin" || { echo "::error::$bin has no embedded initramfs (cpio newc magic missing)"; exit 1; }
 
       - name: Prepare binaries
         run: |
