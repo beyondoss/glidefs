@@ -173,7 +173,7 @@ UblkQueue (hosted by user-copy worker i, as always)
 
 A ZC queue is placed on its worker inside `AddQueue`, before `ready` fires (`place_zero_copy`); a full pool (`K * 256` queues) or a failed arm answers the `AddQueue` with an error and the device add fails cleanly. Registrations run at most 16 at a time (`REGISTER_PERMITS`), bounding the blocking threads (and their control-ring io-wq workers) a burst of creates can hold.
 
-Host-level budget (`K` ZC workers, default `min(cpus, 32)`): `K` threads + the shared dispatch runtime (`cpus` threads), `K` rings (~1 MB each: SQ 4096, CQ 32768, 16384-entry buffer table), at most `K * (16 + 4)` io-wq workers. Per device: 4 scratch memfds (sparse; 64 x 128 KiB virtual each, resident only for cold-read slices) and nothing else that scales with the thread or ring count.
+Host-level budget (`K` ZC workers, default `min(cpus, 32)`): `K` threads + the shared dispatch runtime (`cpus` threads), `K` rings (~1 MB each: SQ 4096, CQ 32768, 16384-entry buffer table), at most `K * (16 + 4)` io-wq workers. Per device: 4 scratch memfds (sparse; 64 x 128 KiB virtual each; a cold read lands its bytes in its tag's slot and `after_read` punches the slot out when the read completes, so resident scratch is bounded by in-flight cold reads, not by devices or by their age. The memfds are shmem: unreclaimable without swap and charged to glidefs's cgroup, which is why they are never left holding data) and nothing else that scales with the thread or ring count.
 
 ### Sparse fixed-file table
 
