@@ -136,7 +136,7 @@ jobs:
             if ! wait $pid; then
               fails=$((fails+1))
               echo "::warning::shard ${{ matrix.shard }} iter $i FAIL"
-              tail -c 30000 /tmp/iter.log
+              grep -E 'ZCIO|SCRATCH|rotated|starting flush|flush|DIAG|panicked|WARN|test ' /tmp/iter.log | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-260 | tail -700
               echo "--- dmesg tail"; sudo dmesg --color=never | tail -15
               for c in /tmp/core.*; do [ -f "$c" ] && sudo gdb -batch -ex "thread apply all bt 25" "$BIN" "$c" 2>&1 | tail -250; done
               break
