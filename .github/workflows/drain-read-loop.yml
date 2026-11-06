@@ -35,7 +35,7 @@ jobs:
           - {shard: 19, leak: '1', tests: 'concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk'}
           - {shard: 20, leak: '1', tests: 'concurrent::test_drain_during_active_writes_ublk transport_stress::test_client_storm_ublk'}
     env:
-      RUST_LOG: warn,glidefs=info,ublk_core=info
+      RUST_LOG: error
       RUST_BACKTRACE: '1'
       GLIDEFS_TEST_LEAK_FOYER: ${{ matrix.leak }}
       GLIDEFS_FORCE_USER_COPY: ""
