@@ -4,6 +4,11 @@
 //! - **Pack-size flush** (event-driven): when dirty blocks reach the per-export
 //!   `flush_threshold` threshold, the write path notifies the scheduler to flush
 //!   packs + sync manifest to S3. Disabled in manual mode (flush_threshold = 0).
+//! - **Dirty-age flush** (event-armed, one-shot): an export with unflushed data
+//!   uploads it within `MAX_DIRTY_AGE` of the write that made it dirty, even
+//!   below `flush_threshold`. This bounds what a hard node death can lose. The
+//!   timer is armed on the clean -> dirty edge, so clean exports and exports
+//!   deleted before the age elapses cost nothing. Disabled in manual mode.
 //! - **Local checkpoint** (demand-driven, 5s interval when active): persists block
 //!   states and truncates the WAL. Only runs when dirty blocks or a pending manifest
 //!   sync exist. Idle exports consume zero timer resources.
@@ -29,6 +34,11 @@ use crate::block::write_cache::WriteCache;
 
 /// Maximum backoff between flush retries.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Longest dirty data may stay out of S3 before the scheduler flushes it,
+/// measured from the write that took the export from clean to dirty. The flush
+/// itself is the ordinary `flush_and_sync` path (same atomic cut, same backoff).
+const MAX_DIRTY_AGE: Duration = Duration::from_secs(30);
 
 /// Duration used to "park" the checkpoint timer when idle. Must be large
 /// enough to never fire during normal operation, but small enough that
@@ -186,6 +196,12 @@ pub async fn flush_scheduler(
     tokio::pin!(checkpoint_timer);
     let mut checkpoint_active = false;
 
+    // Dirty-age timer: armed when the export goes clean -> dirty, parked when a
+    // flush leaves it clean. `dirty_age_armed` is false while parked.
+    let dirty_age_timer = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(dirty_age_timer);
+    let mut dirty_age_armed = false;
+
     // Activate the checkpoint timer (idempotent). First activation includes
     // jitter to spread checkpoint storms across exports.
     macro_rules! activate_checkpoint {
@@ -266,6 +282,8 @@ pub async fn flush_scheduler(
                 }
 
                 let start = std::time::Instant::now();
+                let cut_start = tokio::time::Instant::now();
+                let mut flush_ok = false;
                 let mut packs_uploaded = 0usize;
                 let mut touched_chunks: HashSet<u32> = HashSet::new();
 
@@ -302,6 +320,7 @@ pub async fn flush_scheduler(
                         &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
                     ).await {
                         metrics.record_s3_put_latency(start.elapsed());
+                        flush_ok = true;
                         packs_uploaded = result.packs_uploaded;
                         touched_chunks = result.touched_chunks;
                         if result.manifest_conflict {
@@ -322,6 +341,21 @@ pub async fn flush_scheduler(
                         }
                     }
                 } // compaction runs without holding the flush lock.
+
+                // Re-arm the dirty-age clock. After a successful flush, whatever
+                // is dirty was written after the cut began, so it is no older
+                // than `cut_start`. After a failure the blocks went back to
+                // DIRTY and `first_dirty` re-arms us; the checkpoint timer
+                // retries the upload after the backoff.
+                if flush_ok && cache.dirty_block_count() > 0 {
+                    dirty_age_timer.as_mut().reset(cut_start + MAX_DIRTY_AGE);
+                    dirty_age_armed = true;
+                } else {
+                    dirty_age_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + FAR_FUTURE);
+                    dirty_age_armed = false;
+                }
 
                 // Advance per-chunk idle ages for cooldown compaction: every
                 // tracked chunk ages one cycle, chunks written this cycle reset
@@ -419,6 +453,31 @@ pub async fn flush_scheduler(
                             warn!(error = %e, "compaction failed, will retry next cycle");
                         }
                     }
+                }
+            }
+
+            // Clean -> dirty edge: start the dirty-age clock. No-op if already
+            // running, or if a drain/snapshot cleaned the export meanwhile.
+            () = cache.first_dirty().notified(), if flush_threshold > 0 => {
+                if !dirty_age_armed && cache.dirty_block_count() > 0 {
+                    dirty_age_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + MAX_DIRTY_AGE);
+                    dirty_age_armed = true;
+                }
+            }
+
+            // Dirty data reached MAX_DIRTY_AGE: run the ordinary flush branch
+            // (backoff, semaphore, flush lock, compaction). Nothing to do when
+            // the export was cleaned by someone else in the meantime.
+            () = &mut dirty_age_timer, if dirty_age_armed => {
+                dirty_age_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + FAR_FUTURE);
+                if cache.dirty_block_count() > 0 {
+                    flush_notify.notify_one();
+                } else {
+                    dirty_age_armed = false;
                 }
             }
 
@@ -1385,5 +1444,142 @@ mod tests {
             result.is_ok(),
             "BUG: scheduler should exit within 5s but is stuck on semaphore"
         );
+    }
+
+    // ---- dirty-age flush -------------------------------------------------
+
+    /// Spawn a scheduler with the production default threshold (auto mode)
+    /// against `s3`, returning the pieces a dirty-age test drives.
+    #[allow(clippy::type_complexity)]
+    async fn spawn_auto_scheduler(
+        threshold: usize,
+    ) -> (
+        Arc<FailingObjectStore>,
+        Arc<WriteCache<Active>>,
+        Arc<parking_lot::RwLock<VolumeManifest>>,
+        Arc<ExportMetrics>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+        TempDir,
+    ) {
+        let s3 = Arc::new(FailingObjectStore::new());
+        let (cache, content_store, pack_index_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, clean_cache, temp) =
+            test_scheduler_components_with_store(s3.clone() as _).await;
+        let (c, vm, m) = (Arc::clone(&cache), Arc::clone(&volume_manifest), Arc::clone(&metrics));
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache, content_store, pack_index_cache, volume_manifest, clean_cache,
+                flush_notify, shutdown_rx, metrics, None, threshold, 0,
+            )
+            .await;
+        });
+        // Let the scheduler reach its select loop before any write.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        (s3, c, vm, m, shutdown_tx, handle, temp)
+    }
+
+    async fn s3_object_count(s3: &FailingObjectStore) -> usize {
+        use futures::TryStreamExt;
+        s3.list(None).try_collect::<Vec<_>>().await.unwrap().len()
+    }
+
+    /// One small write, far below `flush_threshold`, reaches S3 within the
+    /// dirty-age bound with no threshold event and no shutdown. Fails without
+    /// the dirty-age timer: nothing else uploads a sub-threshold export.
+    #[tokio::test(start_paused = true)]
+    async fn test_dirty_age_flushes_below_threshold() {
+        let (s3, cache, vm, _m, shutdown_tx, handle, _temp) =
+            spawn_auto_scheduler(DEFAULT_FLUSH_THRESHOLD).await;
+
+        cache.write(0, &[0xAB; 128 * 1024]).unwrap();
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        tokio::time::sleep(MAX_DIRTY_AGE - Duration::from_secs(1)).await;
+        assert_eq!(s3_object_count(&s3).await, 0, "nothing uploads before the bound");
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(cache.dirty_block_count(), 0, "flushed within the bound");
+        assert!(s3_object_count(&s3).await > 0, "pack + manifest on S3");
+        assert!(!vm.read().chunks.is_empty(), "manifest references the pack");
+
+        // Clean again: no further uploads while idle.
+        let after = s3_object_count(&s3).await;
+        tokio::time::sleep(MAX_DIRTY_AGE * 3).await;
+        assert_eq!(s3_object_count(&s3).await, after, "idle export uploads nothing");
+
+        // A later write starts a fresh clock.
+        cache.write(128 * 1024, &[0xCD; 128 * 1024]).unwrap();
+        tokio::time::sleep(MAX_DIRTY_AGE + Duration::from_secs(2)).await;
+        assert_eq!(cache.dirty_block_count(), 0);
+        assert!(s3_object_count(&s3).await > after);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// An export torn down before the bound (VM deleted) uploads nothing: the
+    /// clock dies with the scheduler. Also covers purge, which aborts it.
+    #[tokio::test(start_paused = true)]
+    async fn test_export_deleted_before_dirty_age_uploads_nothing() {
+        let (s3, cache, _vm, _m, shutdown_tx, handle, _temp) =
+            spawn_auto_scheduler(DEFAULT_FLUSH_THRESHOLD).await;
+
+        cache.write(0, &[0xEF; 128 * 1024]).unwrap();
+        tokio::time::sleep(MAX_DIRTY_AGE / 2).await;
+
+        // Graceful teardown path.
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("scheduler exits on shutdown")
+            .unwrap();
+        tokio::time::sleep(MAX_DIRTY_AGE * 3).await;
+        assert_eq!(s3_object_count(&s3).await, 0, "no PUT for an export gone before the bound");
+
+        // Purge path: the router aborts the scheduler task.
+        let (s3, cache, _vm, _m, _tx, handle, _temp2) =
+            spawn_auto_scheduler(DEFAULT_FLUSH_THRESHOLD).await;
+        cache.write(0, &[0xEF; 128 * 1024]).unwrap();
+        tokio::time::sleep(MAX_DIRTY_AGE / 2).await;
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::sleep(MAX_DIRTY_AGE * 3).await;
+        assert_eq!(s3_object_count(&s3).await, 0);
+    }
+
+    /// Manual mode (threshold 0) stays operator-driven: no dirty-age flush.
+    #[tokio::test(start_paused = true)]
+    async fn test_manual_mode_has_no_dirty_age_flush() {
+        let (s3, cache, _vm, _m, shutdown_tx, handle, _temp) = spawn_auto_scheduler(0).await;
+        cache.write(0, &[0x11; 128 * 1024]).unwrap();
+        tokio::time::sleep(MAX_DIRTY_AGE * 4).await;
+        assert_eq!(s3_object_count(&s3).await, 0);
+        assert_eq!(cache.dirty_block_count(), 1);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// An S3 failure at the bound goes through the ordinary backoff: errors
+    /// do not run away, and the data lands once S3 recovers.
+    #[tokio::test(start_paused = true)]
+    async fn test_dirty_age_flush_respects_backoff() {
+        let (s3, cache, _vm, metrics, shutdown_tx, handle, _temp) =
+            spawn_auto_scheduler(DEFAULT_FLUSH_THRESHOLD).await;
+        s3.set_fail_puts(true);
+        cache.write(0, &[0x22; 128 * 1024]).unwrap();
+
+        tokio::time::sleep(MAX_DIRTY_AGE + Duration::from_millis(500)).await;
+        let errs = metrics.snapshot().flush_errors;
+        assert!(errs >= 1, "the bound attempted a flush");
+        assert!(errs <= 2, "backoff holds retries back, got {errs}");
+        assert_eq!(cache.dirty_block_count(), 1, "data stays dirty, not lost");
+
+        s3.set_fail_puts(false);
+        tokio::time::sleep(MAX_DIRTY_AGE + MAX_BACKOFF).await;
+        assert_eq!(cache.dirty_block_count(), 0, "uploaded after S3 recovered");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 }
