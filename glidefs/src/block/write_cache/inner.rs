@@ -567,11 +567,6 @@ pub(crate) struct CacheInner {
     pub(super) dirty_block_count: AtomicU64,
     pub(super) syncing_block_count: AtomicU64,
 
-    /// Wakes the flush scheduler when `dirty_block_count` goes 0 -> 1, so it
-    /// can bound how long the data stays out of S3 (`MAX_DIRTY_AGE`). Fired
-    /// once per clean->dirty edge, never per write.
-    pub(super) first_dirty: tokio::sync::Notify,
-
     /// Monotonic sequence counter for WAL replay ordering and snapshot versioning.
     /// Lock-free AtomicU64.
     pub(super) sequence: SequenceNumber,
@@ -1156,14 +1151,6 @@ impl CacheInner {
         }
     }
 
-    /// Count one more dirty block; wake the flush scheduler on the 0 -> 1 edge.
-    #[inline]
-    pub(super) fn add_dirty_block(&self) {
-        if self.dirty_block_count.fetch_add(1, Ordering::Release) == 0 {
-            self.first_dirty.notify_one();
-        }
-    }
-
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
     /// Delegates the CAS logic to `SparseStateMap::transition_to_dirty()` and
@@ -1177,12 +1164,12 @@ impl CacheInner {
         match self.state_map.transition_to_dirty(idx) {
             DirtyTransition::AlreadyDirty => false,
             DirtyTransition::FromCleanOrNotPresent => {
-                self.add_dirty_block();
+                self.dirty_block_count.fetch_add(1, Ordering::Release);
                 true
             }
             DirtyTransition::FromSyncing => {
                 self.syncing_block_count.fetch_sub(1, Ordering::Release);
-                self.add_dirty_block();
+                self.dirty_block_count.fetch_add(1, Ordering::Release);
                 true
             }
         }
@@ -1525,14 +1512,14 @@ impl CacheInner {
                             .is_ok()
                         {
                             self.syncing_block_count.fetch_sub(1, Ordering::Release);
-                            self.add_dirty_block();
+                            self.dirty_block_count.fetch_add(1, Ordering::Release);
                         }
                     } else if self
                         .state_map
                         .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
                         .is_ok()
                     {
-                        self.add_dirty_block();
+                        self.dirty_block_count.fetch_add(1, Ordering::Release);
                     }
                     // _guard drops here, releasing the claim + waking waiters.
                     break;
