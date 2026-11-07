@@ -244,6 +244,22 @@ fn is_zero_block_u64(data: &[u8]) -> bool {
     suffix.iter().all(|&b| b == 0)
 }
 
+/// True from the moment a handoff successor starts until its takeover completes.
+/// Caches built while it is set are born `Warming`; caches built after it is
+/// cleared are born `Idle`, so they flush. Process-global because the successor
+/// builds its router before any cache exists to carry the state.
+static SUCCESSOR_PASSIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by `run_server_as_successor` before any cache is built; cleared when
+/// takeover completes (and the existing caches are set `Idle`).
+pub fn set_successor_passive(on: bool) {
+    SUCCESSOR_PASSIVE.store(on, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn successor_passive() -> bool {
+    SUCCESSOR_PASSIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Per-export handoff phase. Reflects which window of the graceful
 /// daemon-handoff state machine the cache is currently inside.
 ///

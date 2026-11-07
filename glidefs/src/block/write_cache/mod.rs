@@ -42,6 +42,7 @@ pub use read::{ChunkPlanEntry, ChunkSource, ReadPlan};
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub use inner::SyncFile;
 pub use inner::HandoffPhase;
+pub use inner::set_successor_passive;
 use inner::CacheInner;
 
 #[cfg(feature = "test-utils")]
