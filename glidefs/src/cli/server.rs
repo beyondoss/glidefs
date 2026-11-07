@@ -900,13 +900,7 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // construction. CacheInner reads this and starts in passive mode
     // (handoff_phase=Warming, flush_scheduler can't truncate WAL or
     // rotate the data file until we clear the flag after takeover).
-    // SAFETY: set_var is unsafe in Rust 2024; called before any
-    // worker threads or background tasks have been spawned, so no
-    // concurrent reader exists.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE", "1");
-    }
+    crate::block::write_cache::set_successor_passive(true);
 
     info!(socket = %socket_path.display(), "starting in successor mode");
 
@@ -974,6 +968,8 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     coord
         .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Idle)
         .await;
+    // Caches created from now on (new exports) must be born Idle, or they never flush.
+    crate::block::write_cache::set_successor_passive(false);
 
     // If the predecessor passed its listener fds via SCM_RIGHTS in
     // the HelloAck, we adopt them directly — no bind, no port
