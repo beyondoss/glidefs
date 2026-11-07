@@ -307,6 +307,12 @@ impl WriteCache<Active> {
         self.inner.dirty_block_count.load(Ordering::Acquire)
     }
 
+    /// Fires on each clean -> dirty edge (dirty count 0 -> 1). The flush
+    /// scheduler arms its dirty-age timer from it.
+    pub(crate) fn first_dirty(&self) -> &tokio::sync::Notify {
+        &self.inner.first_dirty
+    }
+
     /// Get the number of blocks currently being synced.
     pub fn syncing_block_count(&self) -> u64 {
         self.inner.syncing_block_count.load(Ordering::Acquire)
@@ -429,9 +435,7 @@ impl WriteCache<Active> {
                         .cas(idx, current, SparseBlockState::DIRTY)
                         .is_ok()
                     {
-                        self.inner
-                            .dirty_block_count
-                            .fetch_add(1, Ordering::Release);
+                        self.inner.add_dirty_block();
                     }
             }
         }
@@ -535,9 +539,7 @@ impl WriteCache<Active> {
                 SparseBlockState::SYNCING,
                 SparseBlockState::DIRTY,
             );
-            self.inner
-                .dirty_block_count
-                .fetch_add(1, Ordering::Release);
+            self.inner.add_dirty_block();
             recovered += 1;
         }
         drop(df_guard);
