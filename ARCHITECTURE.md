@@ -937,7 +937,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map) |
 | `block/write_cache/recovery.rs` | Crash recovery: Syncing→Dirty on startup |
 | `block/state.rs` | Typestate marker structs: `Initializing`, `Recovering`, `Active`, `Draining` (compile-time I/O gating) |
-| `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), dirty-age flush (one-shot 30 s timer armed on the clean-to-dirty edge), demand-driven checkpoint (5s interval, only active when dirty/manifest pending — idle exports consume zero timer resources) |
+| `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), demand-driven checkpoint (5s interval, only active when dirty/manifest pending — idle exports consume zero timer resources) |
 | `block/wal.rs` | Append-only WAL with CRC32 per entry; O_APPEND for lock-free concurrent appends; RwLock for truncation |
 
 ### Storage Formats
@@ -1025,18 +1025,10 @@ S3 PUT latency is 50-200ms. Write-through would make snapshots take 5-15 seconds
 
 Write-behind trades durability for latency: data between the last FLUSH and the next S3 sync is at risk if the host dies. This is acceptable because:
 
-1. Two flush triggers keep the dirty window small: pack size (1024 dirty blocks = 128 MiB per export) and **dirty age** (data uploads within 30 s of the write that made the export dirty, `MAX_DIRTY_AGE` in `flush_scheduler.rs`). On a hard node death an auto-flush export loses at most about the last 30 s of writes plus one flush (tens of ms to ~1 s). Guest `fsync` is durable on the local SSD (WAL), not on S3.
+1. Pack-size flush keeps the dirty window small (flush triggers at 500 dirty blocks = ~64 MB per export)
 2. SIGTERM triggers a drain before exit
 3. The workload (microVMs) is ephemeral — VMs can be recreated from base images
-4. Max dirty data node-wide is bounded: 1023 blocks × 128KB × 2000 exports ≈ 250 GB (by size) and 30 s per export (by age)
-
-**Dirty-age flush.** The write path signals the scheduler on each clean-to-dirty edge (dirty count 0 to 1; once per edge, never per write). The scheduler arms a one-shot 30 s timer. When it fires with dirty blocks it takes the ordinary flush branch: same flush lock, global flush semaphore, S3 backoff, atomic rotation cut and compaction as a threshold flush. After a successful flush that leaves the export clean the timer is parked; if writes landed after the cut it is re-armed from the cut's start. Properties:
-
-- Clean exports and exports torn down before the age elapses upload nothing: a VM that lives under 30 s costs no PUT for existing. Idle exports hold no timer.
-- Crash consistency is unchanged: the cut is taken under the `data_file` write lock, so S3 holds the device exactly as it was at one instant (a power-cut image ext4 recovers from), manifest applied only after every pack of the cut uploaded.
-- Manual-mode exports (`flush_threshold == 0`) get no timer; operators drive drains.
-- On S3 failure the flush goes through the existing exponential backoff (1 s to 30 s); the data stays dirty and the checkpoint timer retries.
-- Cost per continuously-writing export: 2 PUTs (pack + manifest) per 30 s, about 172,800 PUTs per month, $0.86 at $0.005 per 1,000. Compaction adds PUTs and GETs when a chunk piles up more than 16 packs (about every 8 minutes) or its dead ratio passes 0.5; `compaction_cooldown` defers the dead-ratio case.
+4. Max dirty data node-wide is bounded: 499 blocks × 128KB × 2000 exports ≈ 122 GB
 
 ### Why defer hashing to flush time?
 
