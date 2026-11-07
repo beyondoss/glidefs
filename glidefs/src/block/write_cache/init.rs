@@ -124,9 +124,7 @@ impl WriteCache<Initializing> {
         // successor uses the existing inode as-is and lets the
         // predecessor's flush_scheduler / our own post-takeover
         // checkpoint handle WAL hygiene.
-        let in_successor_passive_mode = std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let in_successor_passive_mode = super::inner::successor_passive();
         if !in_successor_passive_mode {
             use crate::block::wal::serialize_entry;
             use std::io::Write as IoWrite;
@@ -350,7 +348,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
-            // Default to `Warming` if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // Default to `Warming` if the process-global successor-passive flag
             // is set in the env. The handoff successor sets it before
             // calling `build_router_only` so every WriteCache is born
             // in passive mode (no flushing, no checkpoint truncate)
@@ -360,9 +358,7 @@ impl WriteCache<Initializing> {
             // — could fire a rotation during the brief window and break
             // cross-process file-handle sharing with the predecessor.
             handoff_phase: std::sync::atomic::AtomicU8::new(
-                if std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
+                if super::inner::successor_passive()
                 {
                     super::inner::HandoffPhase::Warming as u8
                 } else {
@@ -452,13 +448,11 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
-            // Default to `Warming` if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // Default to `Warming` if the process-global successor-passive flag
             // is set in the env. See the matching block in `open` for
             // the full rationale.
             handoff_phase: std::sync::atomic::AtomicU8::new(
-                if std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
+                if super::inner::successor_passive()
                 {
                     super::inner::HandoffPhase::Warming as u8
                 } else {
