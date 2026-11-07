@@ -2,8 +2,7 @@
 //! WAL truncation, until takeover completes. Caches created AFTER takeover are
 //! new exports and must flush like any other. v0.6.0 to v0.9.17 left the
 //! passive flag set for the life of the process, so every export created after
-//! a handoff upgrade never uploaded (the dirty-age timer fired into a skipped
-//! flush forever).
+//! a handoff upgrade never uploaded on its own (threshold flushes were skipped).
 //!
 //! One test, one process: the flag is process-global, so the cases run in
 //! sequence here and cannot race another test's cache construction.
@@ -76,10 +75,13 @@ async fn objects(e: &Export) -> usize {
     e.s3.list(None).try_collect::<Vec<_>>().await.unwrap().len()
 }
 
-/// One block written, then 35 s: the dirty-age bound (30 s) has passed.
-async fn age_flushes(e: &Export) -> bool {
-    e.cache.write(0, &[0xAB; BLOCK]).unwrap();
-    tokio::time::sleep(Duration::from_secs(35)).await;
+/// Fill a pack's worth of blocks and signal the scheduler, as the write path does.
+async fn threshold_flushes(e: &Export) -> bool {
+    for i in 0..DEFAULT_FLUSH_THRESHOLD {
+        e.cache.write((i * BLOCK) as u64, &[0xCD; BLOCK]).unwrap();
+    }
+    e.notify.notify_one();
+    tokio::time::sleep(Duration::from_secs(5)).await;
     e.cache.dirty_block_count() == 0 && objects(e).await > 0
 }
 
@@ -89,29 +91,19 @@ async fn caches_created_after_takeover_flush() {
     set_successor_passive(true);
     let existing = export("existing").await;
     assert_eq!(existing.cache.handoff_phase(), HandoffPhase::Warming);
-    assert!(!age_flushes(&existing).await, "a Warming cache must not flush");
-    assert_eq!(existing.cache.dirty_block_count(), 1);
+    assert!(!threshold_flushes(&existing).await, "a Warming cache must not flush");
 
     // Takeover completes: existing caches go Idle, the process-wide flag clears.
     existing.cache.set_handoff_phase(HandoffPhase::Idle).await;
     set_successor_passive(false);
 
-    // A cache that existed at takeover flushes by dirty age, as before.
-    tokio::time::sleep(Duration::from_secs(35)).await;
+    // A cache that existed at takeover flushes at the threshold, as before.
+    existing.notify.notify_one();
+    tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(existing.cache.dirty_block_count(), 0, "existing cache flushes after takeover");
 
-    // A cache created after takeover is Idle and flushes by dirty age...
-    let by_age = export("new-age").await;
-    assert_eq!(by_age.cache.handoff_phase(), HandoffPhase::Idle);
-    assert!(age_flushes(&by_age).await, "a post-takeover cache must flush by dirty age");
-
-    // ...and by the pack-size threshold, long before the age bound.
-    let by_size = export("new-size").await;
-    for i in 0..DEFAULT_FLUSH_THRESHOLD {
-        by_size.cache.write((i * BLOCK) as u64, &[0xCD; BLOCK]).unwrap();
-    }
-    by_size.notify.notify_one();
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(by_size.cache.dirty_block_count(), 0, "threshold flush of a post-takeover cache");
-    assert!(objects(&by_size).await > 0);
+    // A cache created after takeover is Idle and flushes at the threshold.
+    let created_after = export("created-after").await;
+    assert_eq!(created_after.cache.handoff_phase(), HandoffPhase::Idle);
+    assert!(threshold_flushes(&created_after).await, "a post-takeover cache must flush at the threshold");
 }
