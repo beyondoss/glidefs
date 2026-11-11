@@ -453,6 +453,27 @@ async fn create_or_attach_volume(
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             };
         }
+        // Attached here with no block device: a create that was cut off after `create_export` but
+        // before `register_device` (the process was killed mid-request) left it so. Register the
+        // device now, so the caller's idempotent re-PUT is the heal. `register_device` is a no-op
+        // for a transport with no device, and the export is only device-less on Linux.
+        #[cfg(target_os = "linux")]
+        if export.device.is_none() {
+            let transport = export.transport.as_str();
+            if let Err(e) = router.register_device(name, transport).await {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("export '{name}' is attached with no block device and registering one failed: {e}"),
+                );
+            }
+            return match router.get_export_info(name).await {
+                Some(info) => json_response(StatusCode::OK, &ExportInfoResponse::from(info)),
+                None => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Export device registered but export not found in map",
+                ),
+            };
+        }
         return json_response(StatusCode::OK, &ExportInfoResponse::from(export));
     }
 
@@ -758,7 +779,23 @@ where
                 }
             };
 
-            create_or_attach_volume(&router, name, &put_req, &from).await
+            // Run the create to completion even if the client goes away. hyper drops the handler
+            // future when its connection closes, and a drop between `create_export` and
+            // `register_device` leaves an export in the map with no block device. A spawned task is
+            // not dropped with the request; the client that went away simply never reads the reply.
+            let router = Arc::clone(&router);
+            let name = name.to_string();
+            match tokio::spawn(async move {
+                create_or_attach_volume(&router, &name, &put_req, &from).await
+            })
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("create task failed: {e}"),
+                ),
+            }
         }
 
         // GET /api/exports/{name} - Get export info

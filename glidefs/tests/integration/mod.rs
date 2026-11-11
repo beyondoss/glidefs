@@ -6,6 +6,7 @@
 //! 3. Failure recovery - graceful handling of S3/network failures
 //! 4. Crash recovery - dirty blocks survive process crashes
 
+mod attach_heal;
 mod boot_replay;
 mod chunk_prefetch;
 mod interleaving;
