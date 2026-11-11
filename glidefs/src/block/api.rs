@@ -453,18 +453,15 @@ async fn create_or_attach_volume(
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             };
         }
-        // Attached here with no block device: a create that was cut off after `create_export` but
-        // before `register_device` (the process was killed mid-request) left it so. Register the
-        // device now, so the caller's idempotent re-PUT is the heal. `register_device` is a no-op
-        // for a transport with no device, and the export is only device-less on Linux.
+        // A ublk export attached here with no block device is unusable: a create that was cut off after
+        // `create_export` but before `register_device` (the process was killed mid-request) left it
+        // so. Register the device now, so the caller's idempotent re-PUT is the heal; a failure is the
+        // create path's own answer (507 `ublk_capacity` or a 500 naming the device), never a 200 with
+        // `device` null. An NBD export is also served over TCP, so a missing /dev/nbdN is not a failure.
         #[cfg(target_os = "linux")]
-        if export.device.is_none() {
-            let transport = export.transport.as_str();
-            if let Err(e) = router.register_device(name, transport).await {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("export '{name}' is attached with no block device and registering one failed: {e}"),
-                );
+        if export.device.is_none() && export.transport == "ublk" {
+            if let Err(e) = router.register_device(name, "ublk").await {
+                return device_error_response(name, &e);
             }
             return match router.get_export_info(name).await {
                 Some(info) => json_response(StatusCode::OK, &ExportInfoResponse::from(info)),

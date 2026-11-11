@@ -136,47 +136,71 @@ async fn a_put_whose_client_goes_away_still_completes() {
     assert!(router.get_export_info("ghost").await.is_some(), "the export stays attached");
 }
 
-/// An export attached with no device (a process killed mid-create) is healed by the next PUT: it
-/// answers with a device, or fails naming the missing device. It never answers 200 with
-/// `device: null`, which is the answer that stranded the VMs.
-#[tokio::test]
-async fn a_put_of_an_attached_export_with_no_device_registers_one() {
-    let s3 = Arc::new(InMemory::new());
-    let dir = TempDir::new().unwrap();
-    let router = router(&dir, s3.clone() as _).await;
+/// A ublk export attached with no device (a process killed mid-create) is healed by the next PUT, and
+/// so is one a resize leaves without its device: the answer carries a device, or fails naming the
+/// device (507 / 500). It never answers 200 with `device: null`, the answer that stranded the VMs.
+/// (An NBD export is also served over TCP, so a missing /dev/nbdN is not a failure and is not tested.)
+/// Needs the `ublk` feature; without root it takes the failing branch, with root it checks the device.
+#[cfg(feature = "ublk")]
+mod ublk {
+    use super::*;
 
-    // What a create cut off after `create_export` leaves behind.
-    router
-        .create_export(
-            ExportConfig {
-                name: "half".to_string(),
-                size_gb: 1.0,
-                s3_prefix: None,
-                block_size: None,
-                flush_threshold: None,
-                flush_mode: None,
-                transport: None,
-                compaction_cooldown: None,
-                source: None,
-            },
-            false,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(router.get_export_info("half").await.unwrap().device.is_none(), "set-up: no device yet");
+    async fn put_to_a_half_created_export(name: &str, put_size_gb: f64) {
+        let s3 = Arc::new(InMemory::new());
+        let dir = TempDir::new().unwrap();
+        let router = router(&dir, s3.clone() as _).await;
 
-    let resp = glidefs::block::api::handle_request_for_test(Arc::clone(&router), put("half"))
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    if status == StatusCode::OK {
-        assert!(body["device"].is_string(), "200 without a device is the stranding answer: {body}");
-    } else {
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-        assert!(body.to_string().contains("no block device"), "{body}");
+        // What a create cut off after `create_export` leaves behind.
+        router
+            .create_export(
+                ExportConfig {
+                    name: name.to_string(),
+                    size_gb: 1.0,
+                    s3_prefix: None,
+                    block_size: None,
+                    flush_threshold: None,
+                    flush_mode: None,
+                    transport: Some("ublk".to_string()),
+                    compaction_cooldown: None,
+                    source: None,
+                },
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(router.get_export_info(name).await.unwrap().device.is_none(), "set-up: no device yet");
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/exports/{name}"))
+            .body(Full::new(Bytes::from(format!(r#"{{"size_gb": {put_size_gb}, "transport": "ublk"}}"#))))
+            .unwrap();
+        let resp = glidefs::block::api::handle_request_for_test(Arc::clone(&router), req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if status == StatusCode::OK {
+            let device = body["device"].as_str().unwrap_or_else(|| panic!("200 without a device is the stranding answer: {body}"));
+            assert!(std::path::Path::new(device).exists(), "{device}");
+            router.remove_export(name, true).await.unwrap();
+        } else {
+            assert!(
+                status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::INSUFFICIENT_STORAGE,
+                "{status}: {body}"
+            );
+            assert!(body.to_string().contains("device"), "the failure names the device: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_put_of_an_attached_export_with_no_device_registers_one() {
+        put_to_a_half_created_export("half", 1.0).await;
+    }
+
+    #[tokio::test]
+    async fn a_resize_that_cannot_register_the_device_fails_loudly() {
+        put_to_a_half_created_export("grown", 2.0).await;
     }
 }
