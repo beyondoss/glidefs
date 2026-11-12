@@ -3031,6 +3031,85 @@ mod tests {
         assert_eq!(body_json(resp).await["s3_prefix"], "source");
     }
 
+    /// A fork into a NEW name has no prior owner: it must not inherit its source's fence stamp, or a child whose placement
+    /// generation is below the source's is refused (409) on the attach of a volume nobody else can hold.
+    #[tokio::test]
+    async fn test_fork_into_a_new_name_starts_unfenced() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        // The source is owned at (5, 2).
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/source",
+            Some(r#"{"size_gb": 0.01, "generation": 5, "lease_revision": 2}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = request(&router, Method::POST, "/api/exports/source/snapshot", None).await;
+        let id = body_json(resp).await["snapshot_id"].as_str().unwrap().to_string();
+
+        // A child at generation 1 forks it: granted, and owned at its own token, not the source's.
+        let body = format!(r#"{{"size_gb": 0.01, "from": "snapshot:{id}", "generation": 1, "lease_revision": 1}}"#);
+        let resp = request(&router, Method::PUT, "/api/exports/child", Some(&body)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "a fork into a new name is not fenced by its source's stamp");
+        let info = body_json(request(&router, Method::GET, "/api/exports/child", None).await).await;
+        assert_eq!(info["generation"], 1);
+        assert_eq!(info["lease_revision"], 1);
+
+        // A fork with no token at all starts unstamped (granted against (0,0)).
+        let body = format!(r#"{{"size_gb": 0.01, "from": "snapshot:{id}"}}"#);
+        let resp = request(&router, Method::PUT, "/api/exports/child2", Some(&body)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The source itself is untouched: a lower token is still refused there.
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/source",
+            Some(r#"{"size_gb": 0.01, "generation": 1}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "the source keeps its own fence");
+    }
+
+    /// A reconstitute into the SAME name (instd's purge re-attaches a parked volume from its own manifest) keeps the stamp:
+    /// the volume has an owner, and a lower token must still be refused.
+    #[tokio::test]
+    async fn test_same_name_reconstitute_keeps_the_stamp() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 5}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // Park it: the export goes, the manifest stays, stamped.
+        let resp = request(&router, Method::DELETE, "/api/exports/vol1", None).await;
+        assert!(resp.status().is_success());
+        // Reconstitute it from its own manifest at a lower generation: refused.
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "from": "volume:vol1", "generation": 3}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "a same-name fork keeps the stamp, so the lower token is fenced");
+        // At the owning generation it is granted.
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "from": "volume:vol1", "generation": 5}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
     #[tokio::test]
     async fn test_api_fork_from_image() {
         let temp = TempDir::new().unwrap();
