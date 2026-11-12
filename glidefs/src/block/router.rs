@@ -1750,6 +1750,15 @@ impl ExportRouter {
 
             let mut vm = fork_vm;
             vm.size = device_size;
+            // A fork into a NEW name has no prior owner: the single-attach fence guards a name against two holders, and this
+            // name has none yet. Left on the copy, the SOURCE's stamp would refuse a child placed below the source's
+            // generation or lease (409) on a volume nobody else can hold. The caller's own token stamps it at attach
+            // (`enforce_attach_fence`). A fork into the SAME name (a parked volume reconstituted from its own manifest) keeps
+            // the stamp: that name has an owner, and a lower token must still be refused.
+            if manifest_name != name {
+                vm.generation = 0;
+                vm.lease_revision = 0;
+            }
 
             // Store the volume manifest for this export
             let volume_manifest = Arc::new(parking_lot::RwLock::new(vm));
