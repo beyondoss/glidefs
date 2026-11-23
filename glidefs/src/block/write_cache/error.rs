@@ -16,6 +16,14 @@ pub enum CacheError {
     #[error("Cache is shutting down")]
     ShuttingDown,
 
+    /// The owner tag was closed and the owner cut nothing: the cut is refused (`snapshot_owner::owned_cut_decision`).
+    #[error("owner_closed: owner tag '{0}' is closed")]
+    OwnerClosed(String),
+
+    /// The owned cut's request outlived the bound before it wrote: nothing was written (`snapshot_owner::cut_may_write`).
+    #[error("owned cut expired before it wrote")]
+    OwnedCutExpired,
+
     #[error("Invalid cache metadata")]
     InvalidMetadata,
 

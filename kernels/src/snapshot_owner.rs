@@ -20,9 +20,41 @@
 //! sequence is at least every marker's; a sequence an owner cut is not deleted (the owner deletes it, and the listing drops it with it).
 //!
 //! Mutations (`verify-kernels.sh --features mut_x` must go red, and the named glidefs test fail): `mut_list_ignores_owner`,
-//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`.
+//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`, `mut_expired_cut_writes`, `mut_store_config_unchecked`.
+//!
+//! The tag fence: `close` (under the flush lock) marks a tag closed; a cut under a closed tag that cut nothing is refused (`owned_cut_decision`), so
+//! `a_closed_tags_listing_is_final`: after the close returns, the tag's listing only shrinks. A closed marker is removed when older than the
+//! request bound (`closed_marker_removable`, `a_removed_closed_marker_has_no_late_cut_to_stop`) or with its export.
 
 use vstd::prelude::*;
+
+/// The longest an owned cut may run before it writes: `WriteCache::snapshot_owned` refuses to write its marker or its manifest once the request
+/// is older than this, checked under the flush lock (`cut_may_write`), and the router cancels the request at it. instd's client times out at the
+/// same bound.
+pub const OWNED_CUT_REQUEST_BOUND_SECS: u64 = 900;
+
+/// S3 rejects a SigV4-signed request whose `X-Amz-Date` is more than 15 minutes from S3's clock (`RequestTimeTooSkewed`): axiom AX-s3-sigv4-skew.
+pub const SIGV4_WINDOW_SECS: u64 = 900;
+
+/// The most GlideFS's clock and S3's clock differ by (chrony/NTP): FA-clock-sync.
+pub const CLOCK_SKEW_SECS: u64 = 60;
+
+/// The object-store client's request timeout, and the longest a store write may take to be signed (credential fetch) or to send its body:
+/// the largest `request_timeout` a store config may carry (`store_config_admitted`; GlideFS refuses a larger one at startup).
+pub const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// The longest, after a cut's write passed `cut_may_write`, that the write can still be applied by the store. The client signs a request once
+/// (object_store `aws/client.rs` `with_aws_sigv4` runs before `.retryable()`, and the retry loop re-sends the same signed request), so the date
+/// in its signature is fixed at signing, which is at most one request timeout after the check (credential fetch). S3 applies a request only if
+/// that date is within 15 minutes (+ clock skew) of its arrival (AX-s3-sigv4-skew), and only on receiving the whole body (AX-s3-whole-body); the
+/// body takes at most one request timeout after arrival, because the client abandons the request then and stops sending
+/// (`parse_object_store::an_abandoned_put_stops_sending_its_body`).
+pub const STORE_WRITE_SLACK_SECS: u64 = REQUEST_TIMEOUT_SECS + SIGV4_WINDOW_SECS + CLOCK_SKEW_SECS + REQUEST_TIMEOUT_SECS;
+
+const _: () = assert!(STORE_WRITE_SLACK_SECS == 2 * 300 + 900 + 60, "store_config_admitted's 300 is REQUEST_TIMEOUT_SECS");
+
+/// The age a closed marker must pass before it is removed: the bound plus the slack.
+pub const CLOSED_MARKER_KEEP_SECS: u64 = OWNED_CUT_REQUEST_BOUND_SECS + STORE_WRITE_SLACK_SECS;
 
 verus! {
 
@@ -258,6 +290,8 @@ pub fn retry_answer(owned: &[Owned]) -> (r: Option<u64>)
 pub struct Store {
     pub markers: ISet<(Seq<u8>, u64)>,
     pub manifests: ISet<u64>,
+    /// Owner tags that were closed (`close`): the fence a late cut meets.
+    pub closed: ISet<Seq<u8>>,
 }
 
 /// The sequences listed under `o`.
@@ -288,7 +322,7 @@ pub open spec fn cut(st: Store, o: Seq<u8>, fresh: u64, r: Option<u64>) -> (Stor
     match r {
         Some(s) => (st, s),
         None => (
-            Store { markers: st.markers.insert((o, fresh)), manifests: st.manifests.insert(fresh) },
+            Store { markers: st.markers.insert((o, fresh)), manifests: st.manifests.insert(fresh), closed: st.closed },
             fresh,
         ),
     }
@@ -296,7 +330,7 @@ pub open spec fn cut(st: Store, o: Seq<u8>, fresh: u64, r: Option<u64>) -> (Stor
 
 /// A cut that crashed after its marker, before its manifest (only reached after a `None` decision).
 pub open spec fn crash(st: Store, o: Seq<u8>, fresh: u64) -> Store {
-    Store { markers: st.markers.insert((o, fresh)), manifests: st.manifests }
+    Store { markers: st.markers.insert((o, fresh)), manifests: st.manifests, closed: st.closed }
 }
 
 /// A manifested marker of `o` that is the unique maximum answers `is_answer`.
@@ -523,10 +557,12 @@ pub enum Event {
     Cut { owner: Seq<u8>, fresh: u64 },
     Crash { owner: Seq<u8>, fresh: u64 },
     Delete { sequence: u64 },
+    /// `POST .../snapshot-owners/{owner}/close`: under the flush lock, so after every cut of the tag ahead of it.
+    Close { owner: Seq<u8> },
 }
 
 pub open spec fn empty_store() -> Store {
-    Store { markers: ISet::empty(), manifests: ISet::empty() }
+    Store { markers: ISet::empty(), manifests: ISet::empty(), closed: ISet::empty() }
 }
 
 /// The decision `retry_answer` makes, over the store: the manifested marker of `owner` that is at least every marker of `owner` (unique under
@@ -546,22 +582,31 @@ pub open spec fn delete(st: Store, seq: u64) -> Store {
     Store {
         markers: ISet::new(|m: (Seq<u8>, u64)| st.markers.contains(m) && m.1 != seq),
         manifests: ISet::new(|s: u64| st.manifests.contains(s) && s != seq),
+        closed: st.closed,
     }
 }
 
 pub open spec fn enabled(st: Store, ev: Event) -> bool {
     match ev {
         Event::Cut { owner, fresh } => mono(st, fresh),
-        Event::Crash { owner, fresh } => mono(st, fresh) && decide(st, owner) is None,
+        // A cut that crashed after its marker held the lock until it died, so it ran before any close of its tag.
+        Event::Crash { owner, fresh } => mono(st, fresh) && decide(st, owner) is None && !st.closed.contains(owner),
         Event::Delete { sequence } => true,
+        Event::Close { owner } => true,
     }
 }
 
 pub open spec fn step(st: Store, ev: Event) -> Store {
     match ev {
-        Event::Cut { owner, fresh } => cut(st, owner, fresh, decide(st, owner)).0,
+        // `owned_cut_decision`: an answer is answered; otherwise a closed tag is refused (nothing written) and an open one is cut.
+        Event::Cut { owner, fresh } => if decide(st, owner) is None && st.closed.contains(owner) {
+            st
+        } else {
+            cut(st, owner, fresh, decide(st, owner)).0
+        },
         Event::Crash { owner, fresh } => crash(st, owner, fresh),
         Event::Delete { sequence } => delete(st, sequence),
+        Event::Close { owner } => Store { closed: st.closed.insert(owner), ..st },
     }
 }
 
@@ -655,9 +700,13 @@ pub proof fn inv_survives_every_event(st: Store, ev: Event)
     match ev {
         Event::Cut { owner, fresh } => {
             decide_none_iff_unmanifested(st, owner);
-            if decide(st, owner) is None {
+            if decide(st, owner) is None && !st.closed.contains(owner) {
                 none_preserves_inv(st, owner, fresh);
             }
+        },
+        Event::Close { owner } => {
+            let st2 = step(st, ev);
+            assert(st2.markers == st.markers && st2.manifests == st.manifests);
         },
         Event::Crash { owner, fresh } => {
             decide_none_iff_unmanifested(st, owner);
@@ -757,6 +806,210 @@ pub proof fn a_delete_keeps_the_listing_exact(st: Store, seq: u64, o: Seq<u8>, a
 {
     a_delete_drops_exactly_its_sequence(st, seq, o);
     a_delete_of_another_sequence_keeps_the_answer(st, o, a, seq);
+}
+
+// ---- The tag fence ----
+
+/// What a cut under an owner tag does, decided under the flush lock from whether the tag is closed and what the owner already cut.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CutDecision {
+    /// The owner already cut this sequence: answer it.
+    Answer(u64),
+    /// The tag is closed and nothing was cut: write nothing, answer `owner_closed`.
+    Refuse,
+    /// Cut afresh.
+    Cut,
+}
+
+/// An answer is answered whether or not the tag is closed; a closed tag with no cut is refused; an open one is cut.
+#[cfg(not(feature = "mut_closed_tag_still_cuts"))]
+pub fn owned_cut_decision(closed: bool, answer: Option<u64>) -> (d: CutDecision)
+    ensures
+        answer is Some ==> d == CutDecision::Answer(answer->Some_0),
+        answer is None && closed ==> d == CutDecision::Refuse,
+        answer is None && !closed ==> d == CutDecision::Cut,
+{
+    match answer {
+        Some(s) => CutDecision::Answer(s),
+        None => if closed { CutDecision::Refuse } else { CutDecision::Cut },
+    }
+}
+
+/// Mutation: a closed tag is cut anyway.
+#[cfg(feature = "mut_closed_tag_still_cuts")]
+pub fn owned_cut_decision(closed: bool, answer: Option<u64>) -> (d: CutDecision)
+    ensures
+        answer is Some ==> d == CutDecision::Answer(answer->Some_0),
+        answer is None && closed ==> d == CutDecision::Refuse,
+        answer is None && !closed ==> d == CutDecision::Cut,
+{
+    match answer {
+        Some(s) => CutDecision::Answer(s),
+        None => CutDecision::Cut,
+    }
+}
+
+/// Like `run`, from any store.
+pub open spec fn run_from(st: Store, trace: Seq<Event>) -> Store
+    decreases trace.len(),
+{
+    if trace.len() == 0 {
+        st
+    } else {
+        step(run_from(st, trace.drop_last()), trace.last())
+    }
+}
+
+pub open spec fn ok_from(st: Store, trace: Seq<Event>) -> bool
+    decreases trace.len(),
+{
+    if trace.len() == 0 {
+        true
+    } else {
+        ok_from(st, trace.drop_last()) && enabled(run_from(st, trace.drop_last()), trace.last())
+    }
+}
+
+/// One enabled event on a store whose tag `o` is closed leaves `o` closed and its listing no larger.
+proof fn a_closed_tag_gains_nothing_in_one_step(st: Store, ev: Event, o: Seq<u8>)
+    requires
+        inv(st),
+        st.closed.contains(o),
+        enabled(st, ev),
+    ensures
+        step(st, ev).closed.contains(o),
+        forall|s: u64| step(st, ev).markers.contains((o, s)) ==> st.markers.contains((o, s)),
+{
+    match ev {
+        Event::Cut { owner, fresh } => {
+            decide_none_iff_unmanifested(st, owner);
+        },
+        Event::Crash { owner, fresh } => {},
+        Event::Delete { sequence } => {},
+        Event::Close { owner } => {},
+    }
+}
+
+/// `a_closed_tags_listing_is_final` (the ordering proof): once `o` is closed, no enabled run of cuts (any owner), crashed cuts, deletes and
+/// closes ever puts a sequence in `o`'s listing that was not already there: a late cut under a closed tag is refused.
+pub proof fn a_closed_tags_listing_is_final(st: Store, trace: Seq<Event>, o: Seq<u8>)
+    requires
+        inv(st),
+        st.closed.contains(o),
+        ok_from(st, trace),
+    ensures
+        run_from(st, trace).closed.contains(o),
+        forall|s: u64| run_from(st, trace).markers.contains((o, s)) ==> st.markers.contains((o, s)),
+    decreases trace.len(),
+{
+    if trace.len() > 0 {
+        let prev = run_from(st, trace.drop_last());
+        a_closed_tags_listing_is_final(st, trace.drop_last(), o);
+        inv_from_inv_run(st, trace.drop_last());
+        a_closed_tag_gains_nothing_in_one_step(prev, trace.last(), o);
+    }
+}
+
+/// `inv` holds along a run from any store that has it.
+proof fn inv_from_inv_run(st: Store, trace: Seq<Event>)
+    requires
+        inv(st),
+        ok_from(st, trace),
+    ensures
+        inv(run_from(st, trace)),
+    decreases trace.len(),
+{
+    if trace.len() > 0 {
+        inv_from_inv_run(st, trace.drop_last());
+        inv_survives_every_event(run_from(st, trace.drop_last()), trace.last());
+    }
+}
+
+/// A closed tag's marker may be removed once no request that began before the close can still be running: every owned cut is bounded by
+/// `bound` seconds (the server cancels it), and a cut that begins after the close is refused. Removable when the marker is older than the bound.
+#[cfg(not(feature = "mut_closed_marker_removed_early"))]
+pub fn closed_marker_removable(age_secs: u64, bound_secs: u64) -> (r: bool)
+    ensures
+        r == (age_secs > bound_secs),
+{
+    age_secs > bound_secs
+}
+
+/// Mutation: removable at any age.
+#[cfg(feature = "mut_closed_marker_removed_early")]
+pub fn closed_marker_removable(age_secs: u64, bound_secs: u64) -> (r: bool)
+    ensures
+        r == (age_secs > bound_secs),
+{
+    true
+}
+
+/// A cut may write its marker or its manifest only while its request is younger than the bound. Checked under the flush lock before each write.
+#[cfg(not(feature = "mut_expired_cut_writes"))]
+pub fn cut_may_write(elapsed_secs: u64, bound_secs: u64) -> (r: bool)
+    ensures
+        r == (elapsed_secs < bound_secs),
+{
+    elapsed_secs < bound_secs
+}
+
+/// Mutation: an expired cut writes anyway.
+#[cfg(feature = "mut_expired_cut_writes")]
+pub fn cut_may_write(elapsed_secs: u64, bound_secs: u64) -> (r: bool)
+    ensures
+        r == (elapsed_secs < bound_secs),
+{
+    true
+}
+
+/// A store config is admitted only if its request timeout fits the slack: `2 * request_timeout + 15 min + clock skew <= STORE_WRITE_SLACK_SECS`.
+/// GlideFS refuses a config that does not at startup, so no config can break the premise of `a_removed_closed_marker_has_no_late_cut_to_stop`.
+#[cfg(not(feature = "mut_store_config_unchecked"))]
+pub fn store_config_admitted(request_timeout_secs: u64) -> (r: bool)
+    ensures
+        r == (request_timeout_secs <= 300),
+{
+    request_timeout_secs <= 300
+}
+
+/// Mutation: every config is admitted.
+#[cfg(feature = "mut_store_config_unchecked")]
+pub fn store_config_admitted(request_timeout_secs: u64) -> (r: bool)
+    ensures
+        r == (request_timeout_secs <= 300),
+{
+    true
+}
+
+/// `a_removed_closed_marker_has_no_late_cut_to_stop`: a cut that started no later than the close wrote only while younger than `bound`
+/// (`cut_may_write`). Its write is signed within `cred` of that check, arrives within `skew_window` (15 minutes + clock skew) of its signing
+/// (AX-s3-sigv4-skew), and lands within `body` of arriving (AX-s3-whole-body, and the client stops sending at its timeout). So everything it will
+/// ever write has landed before the marker is removable: older than `bound + cred + skew_window + body`. A cut that starts after the close meets
+/// the closed tag and writes nothing (`a_closed_tags_listing_is_final`).
+pub proof fn a_removed_closed_marker_has_no_late_cut_to_stop(
+    start: int,
+    close_at: int,
+    write_at: int,
+    signed_at: int,
+    arrives_at: int,
+    lands_at: int,
+    now: int,
+    bound: int,
+    cred: int,
+    skew_window: int,
+    body: int,
+)
+    requires
+        start <= close_at,
+        write_at - start < bound,
+        write_at <= signed_at,
+        signed_at <= write_at + cred,
+        arrives_at <= signed_at + skew_window,
+        lands_at <= arrives_at + body,
+        now - close_at > bound + cred + skew_window + body,
+    ensures
+        lands_at < now,
+{
 }
 
 } // verus!

@@ -17,6 +17,29 @@
 // under the License.
 
 use object_store::ClientOptions;
+
+/// The object-store client's request timeout when none is configured. `glidefs_kernels::snapshot_owner::STORE_WRITE_SLACK_SECS` is at least
+/// the slack's request-timeout terms (`slack_tests`).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A store config refused at startup: its request timeout is longer than the store write slack was derived from.
+#[derive(Debug)]
+pub struct StoreConfigRefused {
+    pub request_timeout: Duration,
+}
+
+impl std::fmt::Display for StoreConfigRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request_timeout {}s exceeds the {}s the store write slack allows",
+            self.request_timeout.as_secs(),
+            glidefs_kernels::snapshot_owner::REQUEST_TIMEOUT_SECS
+        )
+    }
+}
+
+impl std::error::Error for StoreConfigRefused {}
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -177,9 +200,18 @@ where
     let (scheme, path) = ObjectStoreScheme::parse(url)?;
     let path = Path::parse(path)?;
 
+    // The store write slack (`glidefs_kernels::snapshot_owner::STORE_WRITE_SLACK_SECS`) holds only for a request timeout it was derived from: a
+    // config with a longer one is refused here, so no config can break the proof's premise.
+    let request_timeout = request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    if !glidefs_kernels::snapshot_owner::store_config_admitted(request_timeout.as_secs()) {
+        return Err(object_store::Error::Generic {
+            store: "object store config",
+            source: Box::new(StoreConfigRefused { request_timeout }),
+        });
+    }
     let client_options = ClientOptions::default()
         .with_connect_timeout(connect_timeout.unwrap_or(Duration::from_secs(10)))
-        .with_timeout(request_timeout.unwrap_or(Duration::from_secs(300)));
+        .with_timeout(request_timeout);
 
     let store: Box<dyn ObjectStore> = match scheme {
         ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()),
@@ -382,5 +414,120 @@ mod tests {
             let url = Url::parse(s).unwrap();
             assert!(ObjectStoreScheme::parse(&url).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod slack_tests {
+    use super::*;
+
+    fn parse(request_timeout_secs: u64) -> Result<(), object_store::Error> {
+        let url = Url::parse("memory:///x").unwrap();
+        parse_url_opts(&url, Vec::<(String, String)>::new(), None, Some(Duration::from_secs(request_timeout_secs))).map(|_| ())
+    }
+
+    /// The store write slack is built from the client's real timeout: the default fits, and a config with a longer request timeout is refused
+    /// at startup with a typed error (`snapshot_owner::store_config_admitted`; `mut_store_config_unchecked` admits it).
+    #[test]
+    fn a_store_config_that_breaks_the_slack_is_refused() {
+        assert!(DEFAULT_REQUEST_TIMEOUT.as_secs() <= glidefs_kernels::snapshot_owner::REQUEST_TIMEOUT_SECS);
+        parse(300).expect("the default request timeout is admitted");
+        match parse(301) {
+            Err(object_store::Error::Generic { source, .. }) => {
+                assert!(source.downcast_ref::<StoreConfigRefused>().is_some(), "{source}");
+            }
+            other => panic!("a 301 s request timeout must be refused, got {other:?}"),
+        }
+    }
+
+    /// The signature's date is fixed when a request is signed, and object_store 0.12.5 signs once, before its retry loop (`aws/client.rs`
+    /// `with_aws_sigv4` before `.retryable()`; `client/retry.rs` re-sends the same signed request). The slack's 15-minute term starts at that
+    /// signing. A different object_store version turns this red: re-read those two places, then update the version here.
+    #[test]
+    fn object_store_is_the_version_whose_signing_was_read() {
+        let lock = include_str!("../../Cargo.lock");
+        let at = lock.find("name = \"object_store\"").expect("object_store in Cargo.lock");
+        assert!(lock[at..].lines().nth(1).unwrap().contains("version = \"0.12.5\""), "object_store moved: re-read its signing (see this test's doc)");
+    }
+
+    /// A write is signed after the gate: `snapshot_owned` checks `may_write` before each store write (the marker, the manifest and each manifest
+    /// retry), and the signing happens inside the store call that follows (`a_removed_closed_marker_has_no_late_cut_to_stop`: `write_at <=
+    /// signed_at`). Moving a write above its gate turns this red.
+    #[test]
+    fn every_owned_write_is_gated_before_it_is_signed() {
+        let flush = include_str!("block/write_cache/flush.rs");
+        let start = flush.find("pub async fn snapshot_owned").expect("snapshot_owned");
+        let body = &flush[start..];
+        let body = &body[..body.find("pub(crate) async fn owned_cut_answer").expect("end")];
+        for write in ["put_snapshot_owner(", ".put_snapshot("] {
+            let w = body.find(write).unwrap_or_else(|| panic!("no {write}"));
+            let gate = body[..w].rfind("may_write(started)").unwrap_or_else(|| panic!("no gate before {write}"));
+            assert!(body[gate..w].lines().count() < 12, "the gate must sit right before {write}");
+        }
+    }
+
+    /// (b) A PUT the client times out stops sending its body: against a store that stops reading mid-body, the client gives up at its timeout,
+    /// closes the connection, and the store sees the end of the stream with less than the declared Content-Length received, so the store has no
+    /// whole body to apply (AX-s3-whole-body). The router's own cancel of an owned cut drops the same request future.
+    #[tokio::test]
+    async fn an_abandoned_put_stops_sending_its_body() {
+        use object_store::{ObjectStore, PutPayload, aws::AmazonS3Builder};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            // Read the headers, then stop reading while the client is mid-body.
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            let split = loop {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert!(n > 0, "closed before the headers");
+                head.extend_from_slice(&buf[..n]);
+                if let Some(i) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&head[..split]).to_ascii_lowercase();
+            let declared: usize = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .expect("a PUT declares its length")
+                .trim()
+                .parse()
+                .unwrap();
+            let mut received = head.len() - split;
+            tokio::time::sleep(Duration::from_secs(3)).await; // the client times out (1 s) while this sleeps
+            // Drain what was already sent; the end of the stream arrives when the client closed.
+            let end = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break true,
+                        Ok(n) => received += n,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            let _ = conn.shutdown().await;
+            (declared, received, end)
+        });
+        let store = AmazonS3Builder::new()
+            .with_endpoint(format!("http://127.0.0.1:{port}"))
+            .with_bucket_name("b")
+            .with_region("us-east-1")
+            .with_access_key_id("k")
+            .with_secret_access_key("s")
+            .with_retry(object_store::RetryConfig { max_retries: 0, ..Default::default() })
+            .with_client_options(ClientOptions::default().with_allow_http(true).with_timeout(Duration::from_secs(1)))
+            .build()
+            .unwrap();
+        let payload = PutPayload::from(vec![7u8; 64 * 1024 * 1024]);
+        let put = store.put(&Path::from("x"), payload).await;
+        assert!(put.is_err(), "the stalled PUT timed out");
+        let (declared, received, end) = tokio::time::timeout(Duration::from_secs(30), server).await.expect("the store saw the connection").unwrap();
+        assert!(end, "the client closed the connection");
+        assert!(received < declared, "the client stopped sending: {received} of {declared} bytes arrived");
     }
 }
