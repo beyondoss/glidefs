@@ -4174,7 +4174,7 @@ fn owned_cut_check_sits_under_flush_lock() {
     let body = &body[..end];
     let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("snapshot_owned has no {needle}"));
     let lock = at("flush_lock.lock().await");
-    let check = at("owned_cut_answer(");
+    let check = at("owned_cut_view(");
     let flush_pass = at("flush_until_no_skips(");
     let marker = at("put_snapshot_owner(");
     assert!(lock < check && check < flush_pass && flush_pass < marker, "the owner check must sit between the lock and the flush");

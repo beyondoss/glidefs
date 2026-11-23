@@ -11,6 +11,7 @@
 //! * Safety `list_is_exactly_the_tagged_cuts` (the model): after any cut, `o`'s listing gains the cut's own sequence and nothing
 //!   else, and no other owner's listing changes.
 //! * From the empty export `inv_holds_from_empty` (cuts, crashed cuts and deletes) and `a_delete_keeps_the_listing_exact`; the write counter is `seq_counter`.
+//! * [`markers_to_delete`]: the markers a delete of a sequence removes (every owner's marker of it, no other); `ContentStore::delete_snapshot` calls it. [`owned_cut_plan`]: the cut's plan, `retry_answer` then `owned_cut_decision`, called by `WriteCache::snapshot_owned`; its ensures carry the from-empty `inv` row.
 //! * Both in one lemma, `list_by_tag_and_retried_cut`: the property `P.snapshot.glidefs-lists-by-tag-exactly-the-tagged-sequences` states.
 //! * Safety `a_retried_cut_returns_the_same_sequence`: from any state satisfying `inv`, once a cut under `o` answered `a`, every later
 //!   cut under `o` answers `a` and changes nothing; `inv` is preserved by every cut (any owner) and every crashed cut.
@@ -599,10 +600,9 @@ pub open spec fn enabled(st: Store, ev: Event) -> bool {
 pub open spec fn step(st: Store, ev: Event) -> Store {
     match ev {
         // `owned_cut_decision`: an answer is answered; otherwise a closed tag is refused (nothing written) and an open one is cut.
-        Event::Cut { owner, fresh } => if decide(st, owner) is None && st.closed.contains(owner) {
-            st
-        } else {
-            cut(st, owner, fresh, decide(st, owner)).0
+        Event::Cut { owner, fresh } => match cut_decision_spec(st.closed.contains(owner), decide(st, owner)) {
+            CutDecision::Cut => cut(st, owner, fresh, None).0,
+            _ => st,
         },
         Event::Crash { owner, fresh } => crash(st, owner, fresh),
         Event::Delete { sequence } => delete(st, sequence),
@@ -808,6 +808,134 @@ pub proof fn a_delete_keeps_the_listing_exact(st: Store, seq: u64, o: Seq<u8>, a
     a_delete_of_another_sequence_keeps_the_answer(st, o, a, seq);
 }
 
+
+// ---- Deleting a sequence: which markers go ----
+
+/// The set of `(owner, sequence)` the listed markers name.
+pub open spec fn marker_set(ms: Seq<Marker<'_>>) -> ISet<(Seq<u8>, u64)> {
+    ISet::new(|p: (Seq<u8>, u64)| exists|i: int| 0 <= i < ms.len() && p == (ms[i].owner@, ms[i].sequence))
+}
+
+/// The set of `(owner, sequence)` the listed markers name once those at `gone` are deleted.
+pub open spec fn kept_set(ms: Seq<Marker<'_>>, gone: Seq<usize>) -> ISet<(Seq<u8>, u64)> {
+    ISet::new(|p: (Seq<u8>, u64)| exists|i: int| 0 <= i < ms.len() && !gone.contains(i as usize) && p == (ms[i].owner@, ms[i].sequence))
+}
+
+/// What a delete of `seq` leaves, for any store whose markers are the listed ones and the markers at `gone` removed.
+pub open spec fn delete_row_holds(ms: Seq<Marker<'_>>, gone: Seq<usize>, seq: u64, st: Store, o: Seq<u8>, a: u64) -> bool {
+    st.markers == marker_set(ms) ==> ({
+        let st2 = Store { markers: kept_set(ms, gone), manifests: st.manifests.remove(seq), closed: st.closed };
+        &&& listed(st2, o) =~= listed(st, o).remove(seq)
+        &&& (inv(st) && st.markers.contains((o, a)) && st.manifests.contains(a) && seq != a ==> inv(st2) && st2.markers.contains((o, a))
+            && st2.manifests.contains(a))
+    })
+}
+
+/// The markers a delete of `seq` removes: every owner's marker of that sequence, and no other (`delete_snapshot` removes exactly these, after the
+/// manifest). The delete row's whole text, over any store whose markers are the listed ones: the listing of every owner loses `seq` and keeps every
+/// other sequence, and a retried cut under `o` still answers its cut `a` when `a` is not the deleted sequence (`inv`, `a`'s marker and manifest survive).
+#[cfg(not(any(feature = "mut_delete_keeps_markers", feature = "mut_delete_one_owner")))]
+pub fn markers_to_delete(markers: &[Marker<'_>], seq: u64) -> (gone: Vec<usize>)
+    ensures
+        forall|k: int| 0 <= k < gone.len() ==> gone@[k] < markers.len() && markers@[gone@[k] as int].sequence == seq,
+        forall|i: int| 0 <= i < markers.len() && markers@[i].sequence == seq ==> gone@.contains(i as usize),
+        forall|st: Store, o: Seq<u8>, a: u64| #[trigger] delete_row_holds(markers@, gone@, seq, st, o, a),
+{
+    let mut gone: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < markers.len()
+        invariant
+            0 <= i <= markers.len(),
+            forall|k: int| 0 <= k < gone.len() ==> gone@[k] < i && markers@[gone@[k] as int].sequence == seq,
+            forall|j: int| 0 <= j < i && markers@[j].sequence == seq ==> gone@.contains(j as usize),
+        decreases markers.len() - i,
+    {
+        if markers[i].sequence == seq {
+            let ghost old = gone@;
+            gone.push(i);
+            proof {
+                broadcast use vstd::seq_lib::group_seq_properties;
+                assert(gone@ == old.push(i as usize));
+                assert forall|j: int| 0 <= j < i + 1 && markers@[j].sequence == seq implies gone@.contains(j as usize) by {
+                    if j == i as int {
+                        assert(gone@[old.len() as int] == i);
+                    } else {
+                        assert(old.contains(j as usize));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    proof {
+        assert forall|st: Store, o: Seq<u8>, a: u64| #[trigger] delete_row_holds(markers@, gone@, seq, st, o, a) by {
+            if st.markers == marker_set(markers@) {
+            let st2 = Store { markers: kept_set(markers@, gone@), manifests: st.manifests.remove(seq), closed: st.closed };
+            let d = delete(st, seq);
+            assert(st2.markers =~= d.markers) by {
+                assert forall|p: (Seq<u8>, u64)| st2.markers.contains(p) == d.markers.contains(p) by {
+                    if st2.markers.contains(p) {
+                        let i = choose|i: int| 0 <= i < markers.len() && !gone@.contains(i as usize) && p == (markers@[i].owner@, markers@[i].sequence);
+                        assert(markers@[i].sequence != seq);
+                        assert(st.markers.contains(p));
+                    }
+                    if d.markers.contains(p) {
+                        let i = choose|i: int| 0 <= i < markers.len() && p == (markers@[i].owner@, markers@[i].sequence);
+                        assert(markers@[i].sequence != seq);
+                        if gone@.contains(i as usize) {
+                            let k = choose|k: int| 0 <= k < gone.len() && gone@[k] == i as usize;
+                            assert(markers@[gone@[k] as int].sequence == seq);
+                        }
+                    }
+                }
+            }
+            assert(st2.manifests =~= d.manifests);
+            assert(st2 == d);
+            if inv(st) && st.markers.contains((o, a)) && st.manifests.contains(a) && seq != a {
+                a_delete_keeps_the_listing_exact(st, seq, o, a);
+            }
+            a_delete_drops_exactly_its_sequence(st, seq, o);
+            }
+        }
+    }
+    gone
+}
+
+/// Mutation: the markers stay.
+#[cfg(feature = "mut_delete_keeps_markers")]
+pub fn markers_to_delete(markers: &[Marker<'_>], seq: u64) -> (gone: Vec<usize>)
+    ensures
+        forall|k: int| 0 <= k < gone.len() ==> gone@[k] < markers.len() && markers@[gone@[k] as int].sequence == seq,
+        forall|i: int| 0 <= i < markers.len() && markers@[i].sequence == seq ==> gone@.contains(i as usize),
+        forall|st: Store, o: Seq<u8>, a: u64| #[trigger] delete_row_holds(markers@, gone@, seq, st, o, a),
+{
+    Vec::new()
+}
+
+/// Mutation: only the first marker of the sequence goes (another owner's marker of it stays listed).
+#[cfg(feature = "mut_delete_one_owner")]
+pub fn markers_to_delete(markers: &[Marker<'_>], seq: u64) -> (gone: Vec<usize>)
+    ensures
+        forall|k: int| 0 <= k < gone.len() ==> gone@[k] < markers.len() && markers@[gone@[k] as int].sequence == seq,
+        forall|i: int| 0 <= i < markers.len() && markers@[i].sequence == seq ==> gone@.contains(i as usize),
+        forall|st: Store, o: Seq<u8>, a: u64| #[trigger] delete_row_holds(markers@, gone@, seq, st, o, a),
+{
+    let mut gone: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < markers.len()
+        invariant
+            0 <= i <= markers.len(),
+            forall|k: int| 0 <= k < gone.len() ==> gone@[k] < i && markers@[gone@[k] as int].sequence == seq,
+        decreases markers.len() - i,
+    {
+        if markers[i].sequence == seq && gone.len() == 0 {
+            gone.push(i);
+        }
+        i += 1;
+    }
+    gone
+}
+
 // ---- The tag fence ----
 
 /// What a cut under an owner tag does, decided under the flush lock from whether the tag is closed and what the owner already cut.
@@ -821,10 +949,19 @@ pub enum CutDecision {
     Cut,
 }
 
+/// The decision over the model: an answer is answered whether or not the tag is closed; a closed tag with no cut is refused; an open one is cut.
+pub open spec fn cut_decision_spec(closed: bool, answer: Option<u64>) -> CutDecision {
+    match answer {
+        Some(s) => CutDecision::Answer(s),
+        None => if closed { CutDecision::Refuse } else { CutDecision::Cut },
+    }
+}
+
 /// An answer is answered whether or not the tag is closed; a closed tag with no cut is refused; an open one is cut.
 #[cfg(not(feature = "mut_closed_tag_still_cuts"))]
 pub fn owned_cut_decision(closed: bool, answer: Option<u64>) -> (d: CutDecision)
     ensures
+        d == cut_decision_spec(closed, answer),
         answer is Some ==> d == CutDecision::Answer(answer->Some_0),
         answer is None && closed ==> d == CutDecision::Refuse,
         answer is None && !closed ==> d == CutDecision::Cut,
@@ -839,6 +976,7 @@ pub fn owned_cut_decision(closed: bool, answer: Option<u64>) -> (d: CutDecision)
 #[cfg(feature = "mut_closed_tag_still_cuts")]
 pub fn owned_cut_decision(closed: bool, answer: Option<u64>) -> (d: CutDecision)
     ensures
+        d == cut_decision_spec(closed, answer),
         answer is Some ==> d == CutDecision::Answer(answer->Some_0),
         answer is None && closed ==> d == CutDecision::Refuse,
         answer is None && !closed ==> d == CutDecision::Cut,
@@ -847,6 +985,42 @@ pub fn owned_cut_decision(closed: bool, answer: Option<u64>) -> (d: CutDecision)
         Some(s) => CutDecision::Answer(s),
         None => CutDecision::Cut,
     }
+}
+
+/// What the cut row says of one cut over the store `st` it ran on: the plan is the model's decision, and the cut it plans leaves `inv`.
+pub open spec fn plan_row_holds(owned: Seq<Owned>, closed: bool, d: CutDecision, st: Store, o: Seq<u8>, fresh: u64) -> bool {
+    (inv(st) && owned_view(st, o, owned) && closed == st.closed.contains(o) && mono(st, fresh)) ==> {
+        &&& d == cut_decision_spec(st.closed.contains(o), decide(st, o))
+        &&& inv(step(st, Event::Cut { owner: o, fresh }))
+        &&& (d is Cut ==> step(st, Event::Cut { owner: o, fresh }) == cut(st, o, fresh, None).0)
+        &&& (!(d is Cut) ==> step(st, Event::Cut { owner: o, fresh }) == st)
+    }
+}
+
+/// The cut's plan under the flush lock, from the owner's markers (`owned`, with whether each has a manifest) and whether the tag is closed: the
+/// highest manifested sequence answers a retry (`retry_answer`), else a closed tag is refused and an open one is cut (`owned_cut_decision`).
+/// The row's whole text: from an export with no owner markers, every enabled sequence of cuts (each decided by this plan) and crashed cuts leaves
+/// `inv`: an owner's manifested sequence is at least every sequence the owner has a marker for; and one cut decided by this plan, over any
+/// store the owner's view came from, leaves `inv` and writes exactly what the plan says.
+pub fn owned_cut_plan(owned: &[Owned], closed: bool) -> (d: CutDecision)
+    ensures
+        forall|st: Store, o: Seq<u8>, fresh: u64| #[trigger] plan_row_holds(owned@, closed, d, st, o, fresh),
+        forall|trace: Seq<Event>| trace_ok(trace) ==> #[trigger] inv(run(trace)),
+{
+    let answer = retry_answer(owned);
+    let d = owned_cut_decision(closed, answer);
+    proof {
+        assert forall|st: Store, o: Seq<u8>, fresh: u64| #[trigger] plan_row_holds(owned@, closed, d, st, o, fresh) by {
+            if inv(st) && owned_view(st, o, owned@) && closed == st.closed.contains(o) && mono(st, fresh) {
+                decide_is_the_exec_answer(st, o, owned@, answer);
+                inv_survives_every_event(st, Event::Cut { owner: o, fresh });
+            }
+        }
+        assert forall|trace: Seq<Event>| trace_ok(trace) implies #[trigger] inv(run(trace)) by {
+            inv_holds_from_empty(trace);
+        }
+    }
+    d
 }
 
 /// Like `run`, from any store.
