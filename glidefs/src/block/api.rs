@@ -85,7 +85,7 @@ pub struct SnapshotRequest {
     /// If set, also publish the manifest under this tag name.
     #[serde(default)]
     pub tag: Option<String>,
-    /// Owner tag of the cut: stored with the sequence, listed by `GET .../snapshots?owner=`, and the cut is
+    /// Owner tag of the cut: stored with the sequence, listed by `GET .../snapshot-owners/{owner}`, and the cut is
     /// idempotent per owner (a retry answers the same sequence).
     #[serde(default)]
     pub owner: Option<String>,
@@ -959,10 +959,7 @@ where
 
         // GET /api/exports/{name}/snapshots - List snapshot sequences
         (Method::GET, ["api", "exports", name, "snapshots"]) => {
-            let owner = req.uri().query().and_then(|q| {
-                q.split('&').find_map(|kv| kv.strip_prefix("owner=").map(str::to_string))
-            });
-            match router.list_export_snapshots_owned(name, owner.as_deref()).await {
+            match router.list_export_snapshots(name).await {
                 Ok(sequences) => json_response(StatusCode::OK, &sequences),
                 Err(RouterError::ExportNotFound(name)) => error_response(
                     StatusCode::NOT_FOUND,
@@ -971,6 +968,23 @@ where
                 Err(RouterError::InvalidExportName(_)) => error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name}/snapshot-owners/{owner} - The sequences cut under an owner tag. A distinct
+        // route, not a query on the list: a daemon that predates it answers 404, never every sequence of the export.
+        (Method::GET, ["api", "exports", name, "snapshot-owners", owner]) => {
+            match router.list_export_snapshots_owned(name, Some(owner)).await {
+                Ok(sequences) => json_response(StatusCode::OK, &sequences),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}' or owner '{}'", name, owner),
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -2974,7 +2988,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// `POST .../snapshot {"owner"}` is idempotent per owner and `GET .../snapshots?owner=` lists by it.
+    /// `POST .../snapshot {"owner"}` is idempotent per owner and `GET .../snapshot-owners/{owner}` lists by it.
     #[tokio::test]
     async fn test_snapshot_owner_is_idempotent_and_listed() {
         let temp = TempDir::new().unwrap();
@@ -2986,9 +3000,9 @@ mod tests {
         let b = body_json(request(&router, Method::POST, "/api/exports/vol1/snapshot", body).await).await;
         assert_eq!(a["sequence"], b["sequence"], "the same owner's retry is one cut");
 
-        let mine = body_json(request(&router, Method::GET, "/api/exports/vol1/snapshots?owner=cap-1", None).await).await;
+        let mine = body_json(request(&router, Method::GET, "/api/exports/vol1/snapshot-owners/cap-1", None).await).await;
         assert_eq!(mine, serde_json::json!([a["sequence"]]));
-        let other = body_json(request(&router, Method::GET, "/api/exports/vol1/snapshots?owner=cap-2", None).await).await;
+        let other = body_json(request(&router, Method::GET, "/api/exports/vol1/snapshot-owners/cap-2", None).await).await;
         assert_eq!(other, serde_json::json!([]));
 
         let bad = request(&router, Method::POST, "/api/exports/vol1/snapshot", Some(r#"{"owner":"a/b"}"#)).await;
