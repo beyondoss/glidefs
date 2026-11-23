@@ -15,6 +15,15 @@ pub fn snapshot_s3_key(name: &str, sequence: u64) -> String {
     format!("snapshots/{name}/{sequence:020}")
 }
 
+/// Generate S3 key for a snapshot's owner marker: "snapshot-owners/{name}/{owner}/{sequence:020}"
+///
+/// A cut that carries an owner tag writes this empty object before its manifest, so the sequence is listed under
+/// the tag from the first instant it can exist. Several owners can hold the same sequence (the sequence is the
+/// write counter, so two cuts with no write between share it).
+pub fn snapshot_owner_s3_key(name: &str, owner: &str, sequence: u64) -> String {
+    format!("snapshot-owners/{name}/{owner}/{sequence:020}")
+}
+
 /// Magic for the boot block-list codec (a base's precise boot working set).
 const BLOCK_LIST_MAGIC: &[u8; 4] = b"GLHS";
 

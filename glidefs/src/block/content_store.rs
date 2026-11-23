@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 
-use super::manifest::{manifest_s3_key, snapshot_s3_key};
+use super::manifest::{manifest_s3_key, snapshot_owner_s3_key, snapshot_s3_key};
 
 #[derive(Error, Debug)]
 pub enum ContentStoreError {
@@ -280,7 +280,57 @@ impl ContentStore {
         Ok(sequences)
     }
 
-    /// Delete a versioned snapshot manifest from S3 (idempotent).
+    /// Record that `owner` cut `sequence` (idempotent). Written before the manifest, so a crash between the two
+    /// leaves a marker the owner can list and drop, never a manifest nothing can attribute.
+    #[instrument(skip(self), fields(name = %name, owner = %owner, sequence))]
+    pub async fn put_snapshot_owner(
+        &self,
+        name: &str,
+        owner: &str,
+        sequence: u64,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, snapshot_owner_s3_key(name, owner, sequence));
+        let result = self.object_store.put(&ObjectPath::from(key), PutPayload::default()).await;
+        self.record_s3_result(&result);
+        result?;
+        Ok(())
+    }
+
+    /// The sequences `owner` has cut of an export, ascending: markers, whether or not the manifest was ever
+    /// written (a cut that crashed after its marker is still listed, and deleting it is idempotent).
+    #[instrument(skip(self), fields(name = %name, owner = %owner))]
+    pub async fn list_snapshots_owned(
+        &self,
+        name: &str,
+        owner: &str,
+    ) -> Result<Vec<u64>, ContentStoreError> {
+        self.check_circuit()?;
+        let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/{}/", self.base_path, name, owner));
+        let mut sequences = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(filename) = meta.location.filename() && let Ok(seq) = filename.parse::<u64>() {
+                sequences.push(seq);
+            }
+        }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        sequences.sort_unstable();
+        Ok(sequences)
+    }
+
+    /// Delete a versioned snapshot manifest from S3 (idempotent), then every owner marker of that sequence.
+    /// Manifest first: a crash between the two leaves a marker with no manifest, which the owner still lists
+    /// and a retry clears; the other order would leave a manifest nothing lists.
     #[instrument(skip(self), fields(name = %name, sequence))]
     pub async fn delete_snapshot(
         &self,
@@ -293,10 +343,32 @@ impl ContentStore {
         let result = self.object_store.delete(&path).await;
         self.record_s3_result(&result);
         match result {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
         }
+        let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
+        let seq_name = format!("{sequence:020}");
+        let mut markers = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if meta.location.filename() == Some(seq_name.as_str()) {
+                markers.push(meta.location);
+            }
+        }
+        for marker in markers {
+            match self.object_store.delete(&marker).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Delete all snapshot manifests for an export (idempotent, best-effort).
@@ -306,6 +378,11 @@ impl ContentStore {
     #[instrument(skip(self), fields(name = %name))]
     pub async fn delete_all_snapshots(&self, name: &str) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
+        let owners = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
+        let mut owner_stream = self.object_store.list(Some(&owners));
+        while let Some(Ok(meta)) = owner_stream.next().await {
+            let _ = self.object_store.delete(&meta.location).await;
+        }
         let prefix_str = format!("{}/snapshots/{}/", self.base_path, name);
         let prefix = ObjectPath::from(prefix_str);
         let store = Arc::clone(&self.object_store);
