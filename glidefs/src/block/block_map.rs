@@ -699,13 +699,7 @@ impl SequenceNumber {
     pub fn next(&self) -> u64 {
         match self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                if v == u64::MAX {
-                    None
-                } else {
-                    Some(v + 1)
-                }
-            }) {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, glidefs_kernels::seq_counter::next_value) {
             Ok(prev) => prev + 1,
             Err(_) => {
                 tracing::error!(
@@ -733,7 +727,7 @@ impl SequenceNumber {
         let _ = self
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                if v < target { Some(target) } else { None }
+                glidefs_kernels::seq_counter::advance_value(v, target)
             });
     }
 }
@@ -1030,6 +1024,17 @@ mod tests {
             prev = next;
         }
         assert_eq!(seq.current(), 1000);
+    }
+
+    /// The counter saturates at the top and never wraps (`glidefs_kernels::seq_counter`; `mut_counter_wraps` wraps it).
+    #[test]
+    fn sequence_number_never_wraps() {
+        let seq = SequenceNumber::new(u64::MAX - 1);
+        assert_eq!(seq.next(), u64::MAX);
+        assert_eq!(seq.next(), u64::MAX, "saturated, not wrapped");
+        assert_eq!(seq.current(), u64::MAX);
+        seq.advance_to(5);
+        assert_eq!(seq.current(), u64::MAX, "advance_to never lowers it");
     }
 
     #[test]

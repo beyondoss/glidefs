@@ -10,6 +10,7 @@
 //!   has one, so a bare marker of a crashed cut never answers.
 //! * Safety `list_is_exactly_the_tagged_cuts` (the model): after any cut, `o`'s listing gains the cut's own sequence and nothing
 //!   else, and no other owner's listing changes.
+//! * From the empty export `inv_holds_from_empty` (cuts, crashed cuts and deletes) and `a_delete_keeps_the_listing_exact`; the write counter is `seq_counter`.
 //! * Both in one lemma, `list_by_tag_and_retried_cut`: the property `P.snapshot.glidefs-lists-by-tag-exactly-the-tagged-sequences` states.
 //! * Safety `a_retried_cut_returns_the_same_sequence`: from any state satisfying `inv`, once a cut under `o` answered `a`, every later
 //!   cut under `o` answers `a` and changes nothing; `inv` is preserved by every cut (any owner) and every crashed cut.
@@ -513,6 +514,249 @@ pub proof fn list_by_tag_and_retried_cut(
     a_cut_leaves_what_a_retry_needs(st, o, owned, fresh, r);
     let (st2, a) = cut(st, o, fresh, r);
     a_retried_cut_returns_the_same_sequence(st2, o, a, owned2, fresh2, r2);
+}
+
+// ---- Reachability from the empty export, and delete ----
+
+/// What the export's owner state can do: a cut under a tag, a cut that crashed after its marker, a delete of one sequence.
+pub enum Event {
+    Cut { owner: Seq<u8>, fresh: u64 },
+    Crash { owner: Seq<u8>, fresh: u64 },
+    Delete { sequence: u64 },
+}
+
+pub open spec fn empty_store() -> Store {
+    Store { markers: ISet::empty(), manifests: ISet::empty() }
+}
+
+/// The decision `retry_answer` makes, over the store: the manifested marker of `owner` that is at least every marker of `owner` (unique under
+/// `inv`), else `None`.
+pub open spec fn decide(st: Store, o: Seq<u8>) -> Option<u64> {
+    if exists|s: u64| #[trigger] st.markers.contains((o, s)) && st.manifests.contains(s)
+        && (forall|m: u64| st.markers.contains((o, m)) ==> m <= s) {
+        Some(choose|s: u64| #[trigger] st.markers.contains((o, s)) && st.manifests.contains(s)
+            && (forall|m: u64| st.markers.contains((o, m)) ==> m <= s))
+    } else {
+        None
+    }
+}
+
+/// A delete removes the sequence's manifest and every owner's marker of it.
+pub open spec fn delete(st: Store, seq: u64) -> Store {
+    Store {
+        markers: ISet::new(|m: (Seq<u8>, u64)| st.markers.contains(m) && m.1 != seq),
+        manifests: ISet::new(|s: u64| st.manifests.contains(s) && s != seq),
+    }
+}
+
+pub open spec fn enabled(st: Store, ev: Event) -> bool {
+    match ev {
+        Event::Cut { owner, fresh } => mono(st, fresh),
+        Event::Crash { owner, fresh } => mono(st, fresh) && decide(st, owner) is None,
+        Event::Delete { sequence } => true,
+    }
+}
+
+pub open spec fn step(st: Store, ev: Event) -> Store {
+    match ev {
+        Event::Cut { owner, fresh } => cut(st, owner, fresh, decide(st, owner)).0,
+        Event::Crash { owner, fresh } => crash(st, owner, fresh),
+        Event::Delete { sequence } => delete(st, sequence),
+    }
+}
+
+/// The store after `trace`, every step enabled in the store before it.
+pub open spec fn run(trace: Seq<Event>) -> Store
+    decreases trace.len(),
+{
+    if trace.len() == 0 {
+        empty_store()
+    } else {
+        step(run(trace.drop_last()), trace.last())
+    }
+}
+
+pub open spec fn trace_ok(trace: Seq<Event>) -> bool
+    decreases trace.len(),
+{
+    if trace.len() == 0 {
+        true
+    } else {
+        trace_ok(trace.drop_last()) && enabled(run(trace.drop_last()), trace.last())
+    }
+}
+
+/// Under `inv`, `decide` is `None` exactly when no marker of `o` has a manifest.
+proof fn decide_none_iff_unmanifested(st: Store, o: Seq<u8>)
+    requires
+        inv(st),
+    ensures
+        decide(st, o) is None <==> (forall|s: u64| st.markers.contains((o, s)) ==> !st.manifests.contains(s)),
+{
+    if exists|s0: u64| st.markers.contains((o, s0)) && st.manifests.contains(s0) {
+        let s0 = choose|s0: u64| st.markers.contains((o, s0)) && st.manifests.contains(s0);
+        assert(forall|m: u64| st.markers.contains((o, m)) ==> m <= s0);
+        assert(st.markers.contains((o, s0)) && st.manifests.contains(s0) && (forall|m: u64| st.markers.contains((o, m)) ==> m <= s0));
+    }
+}
+
+/// `inv` for a store whose only new marker is `(o, fresh)` and whose manifests are `st`'s, or those and `fresh`, when `o` had no manifested marker.
+proof fn none_preserves_inv(st: Store, o: Seq<u8>, fresh: u64)
+    requires
+        inv(st),
+        mono(st, fresh),
+        forall|s: u64| st.markers.contains((o, s)) ==> !st.manifests.contains(s),
+    ensures
+        inv(cut(st, o, fresh, None).0),
+        inv(crash(st, o, fresh)),
+{
+    let st2 = cut(st, o, fresh, None).0;
+    let stc = crash(st, o, fresh);
+    assert forall|o3: Seq<u8>, s: u64, m: u64|
+        st2.markers.contains((o3, s)) && st2.manifests.contains(s) && st2.markers.contains((o3, m)) implies m <= s by {
+        if s == fresh {
+            if st.markers.contains((o3, m)) {
+                assert(m <= fresh);
+            }
+        } else {
+            assert(st.markers.contains((o3, s)) && st.manifests.contains(s));
+            if st.markers.contains((o3, m)) {
+                assert(m <= s);
+            } else {
+                assert(o3 == o);
+            }
+        }
+    }
+    assert forall|o3: Seq<u8>, s: u64, m: u64|
+        stc.markers.contains((o3, s)) && stc.manifests.contains(s) && stc.markers.contains((o3, m)) implies m <= s by {
+        if st.markers.contains((o3, s)) {
+            if st.markers.contains((o3, m)) {
+                assert(m <= s);
+            } else {
+                assert(o3 == o);
+            }
+        } else {
+            assert(o3 == o && s == fresh);
+            if st.markers.contains((o3, m)) {
+                assert(m <= fresh);
+            }
+        }
+    }
+}
+
+/// `inv` survives every enabled event.
+pub proof fn inv_survives_every_event(st: Store, ev: Event)
+    requires
+        inv(st),
+        enabled(st, ev),
+    ensures
+        inv(step(st, ev)),
+{
+    match ev {
+        Event::Cut { owner, fresh } => {
+            decide_none_iff_unmanifested(st, owner);
+            if decide(st, owner) is None {
+                none_preserves_inv(st, owner, fresh);
+            }
+        },
+        Event::Crash { owner, fresh } => {
+            decide_none_iff_unmanifested(st, owner);
+            none_preserves_inv(st, owner, fresh);
+        },
+        Event::Delete { sequence } => {
+            let st2 = delete(st, sequence);
+            assert forall|o: Seq<u8>, s: u64, m: u64|
+                st2.markers.contains((o, s)) && st2.manifests.contains(s) && st2.markers.contains((o, m)) implies m <= s by {
+                assert(st.markers.contains((o, s)) && st.manifests.contains(s) && st.markers.contains((o, m)));
+            }
+        },
+    }
+}
+
+/// `inv_holds_from_empty`: the export that starts with no markers satisfies `inv` after every enabled trace of cuts, crashed cuts and deletes.
+pub proof fn inv_holds_from_empty(trace: Seq<Event>)
+    requires
+        trace_ok(trace),
+    ensures
+        inv(run(trace)),
+    decreases trace.len(),
+{
+    if trace.len() > 0 {
+        inv_holds_from_empty(trace.drop_last());
+        inv_survives_every_event(run(trace.drop_last()), trace.last());
+    }
+}
+
+/// A delete removes the sequence from every owner's listing and leaves every other sequence listed.
+pub proof fn a_delete_drops_exactly_its_sequence(st: Store, seq: u64, o: Seq<u8>)
+    ensures
+        listed(delete(st, seq), o) =~= listed(st, o).remove(seq),
+        delete(st, seq).manifests =~= st.manifests.remove(seq),
+{
+}
+
+/// A retry after a delete of some other sequence still answers the owner's cut: `a` is still a manifested marker and `inv` still holds.
+pub proof fn a_delete_of_another_sequence_keeps_the_answer(st: Store, o: Seq<u8>, a: u64, seq: u64)
+    requires
+        inv(st),
+        st.markers.contains((o, a)),
+        st.manifests.contains(a),
+        seq != a,
+    ensures
+        ({
+            let st2 = delete(st, seq);
+            inv(st2) && st2.markers.contains((o, a)) && st2.manifests.contains(a)
+        }),
+{
+    inv_survives_every_event(st, Event::Delete { sequence: seq });
+}
+
+/// What `retry_answer` returns over the store's view of `o` is `decide`: the trace model runs the decision the exec fn makes.
+pub proof fn decide_is_the_exec_answer(st: Store, o: Seq<u8>, owned: Seq<Owned>, r: Option<u64>)
+    requires
+        inv(st),
+        owned_view(st, o, owned),
+        is_answer(owned, r),
+    ensures
+        r == decide(st, o),
+{
+    match r {
+        Some(a) => {
+            let i = choose|i: int| 0 <= i < owned.len() && owned[i] == (a, true);
+            assert(st.markers.contains((o, a)) && st.manifests.contains(a));
+            assert(forall|m: u64| st.markers.contains((o, m)) ==> m <= a);
+            let s = choose|s: u64| st.markers.contains((o, s)) && st.manifests.contains(s)
+                && (forall|m: u64| st.markers.contains((o, m)) ==> m <= s);
+            let j = choose|j: int| 0 <= j < owned.len() && owned[j].0 == s;
+            assert(owned[j].1);
+            assert(s <= a && a <= s);
+        },
+        None => {
+            assert forall|s: u64| st.markers.contains((o, s)) implies !st.manifests.contains(s) by {
+                let i = choose|i: int| 0 <= i < owned.len() && owned[i].0 == s;
+            }
+            decide_none_iff_unmanifested(st, o);
+        },
+    }
+}
+
+/// The delete row's whole text: a delete of `seq` removes it from every owner's listing and leaves every other sequence listed, and a retried cut
+/// under `o` still answers its cut `a` when `a` is not the deleted sequence (`inv` and `a`'s marker and manifest survive).
+pub proof fn a_delete_keeps_the_listing_exact(st: Store, seq: u64, o: Seq<u8>, a: u64)
+    requires
+        inv(st),
+        st.markers.contains((o, a)),
+        st.manifests.contains(a),
+        seq != a,
+    ensures
+        listed(delete(st, seq), o) =~= listed(st, o).remove(seq),
+        ({
+            let st2 = delete(st, seq);
+            inv(st2) && st2.markers.contains((o, a)) && st2.manifests.contains(a)
+        }),
+{
+    a_delete_drops_exactly_its_sequence(st, seq, o);
+    a_delete_of_another_sequence_keeps_the_answer(st, o, a, seq);
 }
 
 } // verus!

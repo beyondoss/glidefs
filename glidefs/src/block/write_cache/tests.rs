@@ -4161,3 +4161,27 @@ async fn plain_writer_takes_over_a_stale_materialization_claim() {
     assert!(got[..4096].iter().all(|&b| b == 0x22), "page 0 lost");
     assert!(got[4096..].iter().all(|&b| b == 0x33), "page 1 lost");
 }
+
+/// Cuts of one export never interleave: the owner check of an owned cut runs after `flush_lock` is taken and before the flush and the
+/// marker, inside `snapshot_owned`, and nowhere else but the `mut_owner_check_outside_lock` mutation
+/// (`glidefs_kernels::snapshot_owner`'s serialisation premise). Moving the check above the lock turns this red.
+#[test]
+fn owned_cut_check_sits_under_flush_lock() {
+    let flush = include_str!("flush.rs");
+    let start = flush.find("pub async fn snapshot_owned").expect("snapshot_owned");
+    let body = &flush[start..];
+    let end = body.find("pub(crate) async fn owned_cut_answer").expect("end of snapshot_owned");
+    let body = &body[..end];
+    let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("snapshot_owned has no {needle}"));
+    let lock = at("flush_lock.lock().await");
+    let check = at("owned_cut_answer(");
+    let flush_pass = at("flush_until_no_skips(");
+    let marker = at("put_snapshot_owner(");
+    assert!(lock < check && check < flush_pass && flush_pass < marker, "the owner check must sit between the lock and the flush");
+    let router = include_str!("../router.rs");
+    for (i, _) in router.match_indices(".owned_cut_answer(") {
+        let before = &router[..i];
+        let cfg = before.rfind("mut_owner_check_outside_lock").unwrap_or(0);
+        assert!(i - cfg < 400, "router.rs calls owned_cut_answer outside the flush lock");
+    }
+}
