@@ -518,3 +518,19 @@ jobs:
         run: cargo fuzz run fuzz_volume_manifest -- -max_total_time=30
       - name: Fuzz block decompress (LZ4 + zstd auto-detect)
         run: cargo fuzz run fuzz_decompress_block -- -max_total_time=30
+
+  verus:
+    name: Verus kernels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the kernels
+        run: scripts/verify-kernels.sh
+      - name: Each mutation goes red
+        run: |
+          for f in mut_list_ignores_owner mut_retry_answers_bare_marker mut_retry_answers_lowest; do
+            if scripts/verify-kernels.sh --features "$f"; then echo "mutation $f verified: the proof is vacuous"; exit 1; fi
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Kernel tests
+        run: cargo test -p glidefs-kernels

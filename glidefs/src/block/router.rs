@@ -2144,6 +2144,36 @@ impl ExportRouter {
         self.snapshot_export_owned(name, tag, None).await
     }
 
+    /// The response for an owned cut that already exists: its sequence, re-registered in the snapshot index.
+    async fn answer_owned_cut(
+        &self,
+        name: &str,
+        pool: &str,
+        tag: Option<&str>,
+        owner: Option<&str>,
+        sequence: u64,
+    ) -> Result<SnapshotResponse, RouterError> {
+        info!(export = %name, owner = ?owner, sequence, "owned snapshot already cut; answering it");
+        let snapshot_id = crate::block::registry::snapshot_id(name, sequence);
+        let parent = self.load_export(name).await.ok().flatten().and_then(|c| c.source);
+        let entry = SnapshotEntry {
+            id: snapshot_id.clone(),
+            pool: pool.to_string(),
+            volume: name.to_string(),
+            sequence,
+            label: tag.map(|t| t.to_string()),
+            parent,
+        };
+        self.save_snapshot_entry(&entry).await?;
+        Ok(SnapshotResponse {
+            manifest_etag: None,
+            sequence,
+            snapshot_id,
+            snapshot_persisted: true,
+            tag: tag.map(|t| t.to_string()),
+        })
+    }
+
     /// [`Self::snapshot_export`] with an owner tag (opaque, export-name charset). The cut is idempotent per
     /// (export, owner): a retry with the same owner answers the sequence the first cut persisted and cuts no
     /// second one. The owner's sequences are listed with [`Self::list_export_snapshots_owned`], including a
@@ -2182,40 +2212,15 @@ impl ExportRouter {
             )
         };
 
-        // A retry of an owned cut answers the sequence the first one persisted.
-        if let Some(owner) = owner {
-            let owned = content_store
-                .list_snapshots_owned(name, owner)
+        // Mutation: the retry check runs before the flush lock, as it did before the proof found the race.
+        #[cfg(feature = "mut_owner_check_outside_lock")]
+        if let Some(owner) = owner
+            && let Some(sequence) = cache
+                .owned_cut_answer(&content_store, owner)
                 .await
-                .map_err(RouterError::ContentStore)?;
-            for sequence in owned.into_iter().rev() {
-                if content_store
-                    .get_snapshot(name, sequence)
-                    .await
-                    .map_err(RouterError::ContentStore)?
-                    .is_some()
-                {
-                    info!(export = %name, owner, sequence, "owned snapshot already cut; answering it");
-                    let snapshot_id = crate::block::registry::snapshot_id(name, sequence);
-                    let parent = self.load_export(name).await.ok().flatten().and_then(|c| c.source);
-                    let entry = SnapshotEntry {
-                        id: snapshot_id.clone(),
-                        pool: pool.clone(),
-                        volume: name.to_string(),
-                        sequence,
-                        label: tag.map(|t| t.to_string()),
-                        parent,
-                    };
-                    self.save_snapshot_entry(&entry).await?;
-                    return Ok(SnapshotResponse {
-                        manifest_etag: None,
-                        sequence,
-                        snapshot_id,
-                        snapshot_persisted: true,
-                        tag: tag.map(|t| t.to_string()),
-                    });
-                }
-            }
+                .map_err(RouterError::Cache)?
+        {
+            return self.answer_owned_cut(name, &pool, tag, Some(owner), sequence).await;
         }
 
         info!("Taking snapshot of export '{}'...", name);
@@ -2223,6 +2228,11 @@ impl ExportRouter {
             .snapshot_owned(&content_store, &pack_index_cache, &volume_manifest, owner)
             .await
             .map_err(RouterError::Cache)?;
+
+        // A retry of an owned cut answers the sequence the first one persisted (decided under the flush lock).
+        if result.already_cut {
+            return self.answer_owned_cut(name, &pool, tag, owner, result.sequence).await;
+        }
 
         info!(
             "Snapshot of '{}' complete: seq={}, blocks_claimed={}, packs_uploaded={}",
@@ -5061,6 +5071,68 @@ mod tests {
         );
     }
 
+    /// A retry answers the highest sequence the owner has a manifest for (an owner can hold two after a crashed cut and a
+    /// later cut whose sequence a peer's cut had already manifested).
+    #[tokio::test]
+    async fn test_retry_answers_the_highest_manifested_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        router
+            .create_export(test_export_config("high-vol"), false, None, None)
+            .await
+            .unwrap();
+        let cs = Arc::clone(&router.exports.get("high-vol").unwrap().value().content_store);
+        for seq in [3u64, 9, 5] {
+            cs.put_snapshot_owner("high-vol", "cap-a", seq).await.unwrap();
+            cs.put_snapshot("high-vol", seq, vec![1, 2, 3]).await.unwrap();
+        }
+        let answer = router.snapshot_export_owned("high-vol", None, Some("cap-a")).await.unwrap();
+        assert_eq!(answer.sequence, 9);
+    }
+
+    /// Two same-owner cuts in flight at once (a timed-out cut and its retry) are one cut: the retry's check runs under the
+    /// flush lock, so it waits for the first and answers it, even while writes move the sequence on. Checked outside the
+    /// lock (`mut_owner_check_outside_lock`), both pass the check and cut two sequences.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_owned_cuts_answer_one_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = Arc::new(create_test_router(&temp_dir).await);
+        router
+            .create_export(test_export_config("race-vol"), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("race-vol").await.unwrap();
+        for round in 0..12u64 {
+            let owner = format!("cap-{round}");
+            let writer = {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    for i in 0..40u64 {
+                        handler.write((round * 40 + i) * 4096, &[0xDD; 4096], false).await.unwrap();
+                    }
+                })
+            };
+            let (a, b) = tokio::join!(
+                {
+                    let (router, owner) = (Arc::clone(&router), owner.clone());
+                    tokio::spawn(async move { router.snapshot_export_owned("race-vol", None, Some(&owner)).await.unwrap() })
+                },
+                {
+                    let (router, owner) = (Arc::clone(&router), owner.clone());
+                    tokio::spawn(async move { router.snapshot_export_owned("race-vol", None, Some(&owner)).await.unwrap() })
+                },
+            );
+            writer.await.unwrap();
+            let (a, b) = (a.unwrap(), b.unwrap());
+            assert_eq!(a.sequence, b.sequence, "round {round}: one tag, one sequence");
+            assert_eq!(
+                router.list_export_snapshots_owned("race-vol", Some(&owner)).await.unwrap(),
+                vec![a.sequence],
+                "round {round}: the tag lists exactly the one cut"
+            );
+        }
+    }
+
     /// A cut that crashed after its owner marker and before its manifest is still listed by the owner, and its
     /// delete clears it; the owner's retry then cuts afresh.
     #[tokio::test]
@@ -5080,6 +5152,10 @@ mod tests {
         let retry = router.snapshot_export_owned("crash-vol", None, Some("cap-a")).await.unwrap();
         let listed = router.list_export_snapshots_owned("crash-vol", Some("cap-a")).await.unwrap();
         assert!(listed.contains(&7) && listed.contains(&retry.sequence));
+        assert!(
+            cs.get_snapshot("crash-vol", retry.sequence).await.unwrap().is_some(),
+            "the answer is a sequence with a manifest, never the bare marker"
+        );
 
         for seq in listed {
             router.delete_export_snapshot("crash-vol", seq).await.unwrap();

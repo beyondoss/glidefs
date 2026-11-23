@@ -306,8 +306,9 @@ impl ContentStore {
         owner: &str,
     ) -> Result<Vec<u64>, ContentStoreError> {
         self.check_circuit()?;
-        let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/{}/", self.base_path, name, owner));
-        let mut sequences = Vec::new();
+        // Every marker of the export; `glidefs_kernels::snapshot_owner::owned_sequences` picks the owner's.
+        let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
+        let mut found: Vec<(String, u64)> = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
             let meta = match result {
@@ -317,13 +318,24 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() && let Ok(seq) = filename.parse::<u64>() {
-                sequences.push(seq);
+            // `{owner}/{sequence:020}` under the export's prefix.
+            if let Some(rel) = meta.location.prefix_match(&prefix) {
+                let parts: Vec<_> = rel.collect();
+                if let [marker_owner, filename] = parts.as_slice()
+                    && let Ok(seq) = filename.as_ref().parse::<u64>()
+                {
+                    found.push((marker_owner.as_ref().to_string(), seq));
+                }
             }
         }
         if let Some(cb) = &self.circuit_breaker {
             cb.record_success();
         }
+        let markers: Vec<glidefs_kernels::snapshot_owner::Marker<'_>> = found
+            .iter()
+            .map(|(o, s)| glidefs_kernels::snapshot_owner::Marker { owner: o.as_bytes(), sequence: *s })
+            .collect();
+        let mut sequences = glidefs_kernels::snapshot_owner::owned_sequences(&markers, owner.as_bytes());
         sequences.sort_unstable();
         Ok(sequences)
     }

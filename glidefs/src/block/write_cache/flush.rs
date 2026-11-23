@@ -2032,6 +2032,24 @@ impl WriteCache<Active> {
         owner: Option<&str>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
+
+        // A retry of an owned cut answers the sequence the first one persisted. Decided under the flush lock, so a
+        // retry that overlaps its still-running first cut waits for it and then answers it, never cuts a second.
+        // (`glidefs_kernels::snapshot_owner`: `a_retried_cut_returns_the_same_sequence`.)
+        #[cfg(not(feature = "mut_owner_check_outside_lock"))]
+        if let Some(owner) = owner
+            && let Some(sequence) = self.owned_cut_answer(content_store, owner).await?
+        {
+            return Ok(SnapshotResult {
+                manifest_etag: None,
+                sequence,
+                snapshot_persisted: true,
+                stats: FlushStats::default(),
+                manifest_bytes: Vec::new(),
+                already_cut: true,
+            });
+        }
+
         let (stats, seq_cutpoint) = self
             .flush_until_no_skips(content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
             .await?;
@@ -2079,6 +2097,21 @@ impl WriteCache<Active> {
             snapshot_persisted,
             stats,
             manifest_bytes,
+            already_cut: false,
         })
+    }
+
+    /// The sequence `owner` already cut of this export, if any: the highest owner marker that has a manifest.
+    pub(crate) async fn owned_cut_answer(
+        &self,
+        content_store: &ContentStore,
+        owner: &str,
+    ) -> Result<Option<u64>, CacheError> {
+        let name = &self.inner.export_name;
+        let mut owned = Vec::new();
+        for sequence in content_store.list_snapshots_owned(name, owner).await? {
+            owned.push((sequence, content_store.get_snapshot(name, sequence).await?.is_some()));
+        }
+        Ok(glidefs_kernels::snapshot_owner::retry_answer(&owned))
     }
 }

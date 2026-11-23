@@ -13,6 +13,12 @@ categories = ["filesystem", "network-programming"]
 
 [features]
 default = []
+# Mutations of the snapshot-owner decisions: glidefs-kernels' (forwarded) and the retry check's place.
+# `mut_owner_check_outside_lock` must fail `test_concurrent_owned_cuts_answer_one_sequence`.
+mut_list_ignores_owner = ["glidefs-kernels/mut_list_ignores_owner"]
+mut_retry_answers_bare_marker = ["glidefs-kernels/mut_retry_answers_bare_marker"]
+mut_retry_answers_lowest = ["glidefs-kernels/mut_retry_answers_lowest"]
+mut_owner_check_outside_lock = []
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests
 test-utils = []
@@ -35,6 +41,7 @@ loom = ["dep:loom"]
 test-fault-injection = []
 
 [dependencies]
+glidefs-kernels = { path = "../kernels" }
 console-subscriber = { version = "0.5", optional = true }
 tikv-jemallocator = "0.6"
 tokio = { version = "1.49", features = ["full", "tracing"] }
