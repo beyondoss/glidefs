@@ -24,6 +24,12 @@ pub fn snapshot_owner_s3_key(name: &str, owner: &str, sequence: u64) -> String {
     format!("snapshot-owners/{name}/{owner}/{sequence:020}")
 }
 
+/// The fence of an owner tag: once it exists, a cut under that tag that cut nothing is refused (`snapshot_owner::owned_cut_decision`).
+/// Its name is not a sequence, so the owner's listing never reads it.
+pub fn snapshot_owner_closed_s3_key(name: &str, owner: &str) -> String {
+    format!("snapshot-owners/{name}/{owner}/closed")
+}
+
 /// Magic for the boot block-list codec (a base's precise boot working set).
 const BLOCK_LIST_MAGIC: &[u8; 4] = b"GLHS";
 

@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 
-use super::manifest::{manifest_s3_key, snapshot_owner_s3_key, snapshot_s3_key};
+use super::manifest::{manifest_s3_key, snapshot_owner_closed_s3_key, snapshot_owner_s3_key, snapshot_s3_key};
 
 #[derive(Error, Debug)]
 pub enum ContentStoreError {
@@ -295,6 +295,65 @@ impl ContentStore {
         self.record_s3_result(&result);
         result?;
         Ok(())
+    }
+
+    /// Close an owner tag (idempotent): a cut under it that cut nothing is refused from now on.
+    #[instrument(skip(self), fields(name = %name, owner = %owner))]
+    pub async fn put_owner_closed(&self, name: &str, owner: &str) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, snapshot_owner_closed_s3_key(name, owner));
+        let result = self.object_store.put(&ObjectPath::from(key), PutPayload::default()).await;
+        self.record_s3_result(&result);
+        result?;
+        Ok(())
+    }
+
+    /// Whether `owner` is closed.
+    #[instrument(skip(self), fields(name = %name, owner = %owner))]
+    pub async fn owner_closed(&self, name: &str, owner: &str) -> Result<bool, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, snapshot_owner_closed_s3_key(name, owner));
+        let result = self.object_store.head(&ObjectPath::from(key)).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove the closed markers of an export that `glidefs_kernels::snapshot_owner::closed_marker_removable` says no cut can still meet
+    /// (older than the request bound). Returns how many went.
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn gc_closed_owners(&self, name: &str, bound_secs: u64) -> Result<usize, ContentStoreError> {
+        self.check_circuit()?;
+        let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
+        let now = chrono::Utc::now();
+        let mut due = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if meta.location.filename() == Some("closed") {
+                let age = u64::try_from((now - meta.last_modified).num_seconds()).unwrap_or(0);
+                if glidefs_kernels::snapshot_owner::closed_marker_removable(age, bound_secs) {
+                    due.push(meta.location);
+                }
+            }
+        }
+        let n = due.len();
+        for marker in due {
+            match self.object_store.delete(&marker).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(n)
     }
 
     /// The sequences `owner` has cut of an export, ascending: markers, whether or not the manifest was ever
