@@ -2187,11 +2187,22 @@ impl ExportRouter {
     ) -> Result<SnapshotResponse, RouterError> {
         // An owned cut is bounded: a closed tag's marker is removed once older than this bound (`closed_marker_removable`), so no cut that began
         // before the close outlives it.
+        self.snapshot_export_owned_at(name, tag, owner, std::time::Instant::now()).await
+    }
+
+    /// [`Self::snapshot_export_owned`] for a request that arrived at `started`: an owned cut older than the bound writes nothing.
+    pub(crate) async fn snapshot_export_owned_at(
+        &self,
+        name: &str,
+        tag: Option<&str>,
+        owner: Option<&str>,
+        started: std::time::Instant,
+    ) -> Result<SnapshotResponse, RouterError> {
         if owner.is_none() {
-            return self.snapshot_export_owned_inner(name, tag, owner).await;
+            return self.snapshot_export_owned_inner(name, tag, owner, started).await;
         }
         let bound = std::time::Duration::from_secs(glidefs_kernels::snapshot_owner::OWNED_CUT_REQUEST_BOUND_SECS);
-        match tokio::time::timeout(bound, self.snapshot_export_owned_inner(name, tag, owner)).await {
+        match tokio::time::timeout(bound, self.snapshot_export_owned_inner(name, tag, owner, started)).await {
             Ok(r) => r,
             Err(_) => Err(RouterError::Manifest(format!(
                 "owned snapshot of '{name}' exceeded {}s and was cancelled",
@@ -2220,6 +2231,7 @@ impl ExportRouter {
         name: &str,
         tag: Option<&str>,
         owner: Option<&str>,
+        started: std::time::Instant,
     ) -> Result<SnapshotResponse, RouterError> {
         validate_export_name(name)?;
         if let Some(t) = tag {
@@ -2261,7 +2273,7 @@ impl ExportRouter {
 
         info!("Taking snapshot of export '{}'...", name);
         let result: SnapshotResult = cache
-            .snapshot_owned(&content_store, &pack_index_cache, &volume_manifest, owner)
+            .snapshot_owned(&content_store, &pack_index_cache, &volume_manifest, owner, started)
             .await
             .map_err(RouterError::Cache)?;
 
@@ -5132,6 +5144,25 @@ mod tests {
         router.snapshot_export_owned("fence-vol", None, Some("cap-other")).await.unwrap();
     }
 
+    /// An owned cut whose request is older than the bound writes no marker and no manifest, so a closed tag's marker can expire.
+    #[tokio::test]
+    async fn test_an_expired_owned_cut_writes_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        router
+            .create_export(test_export_config("exp-vol"), false, None, None)
+            .await
+            .unwrap();
+        let old = std::time::Instant::now()
+            - std::time::Duration::from_secs(glidefs_kernels::snapshot_owner::OWNED_CUT_REQUEST_BOUND_SECS + 1);
+        let late = router.snapshot_export_owned_at("exp-vol", None, Some("cap-old"), old).await;
+        assert!(matches!(late, Err(RouterError::Cache(CacheError::OwnedCutExpired))), "{late:?}");
+        assert!(router.list_export_snapshots_owned("exp-vol", Some("cap-old")).await.unwrap().is_empty(), "no marker");
+        assert!(router.list_export_snapshots("exp-vol").await.unwrap().is_empty(), "no manifest");
+        // A young one cuts.
+        router.snapshot_export_owned("exp-vol", None, Some("cap-new")).await.unwrap();
+    }
+
     /// A closed marker goes only when older than the request bound, and goes with its export.
     #[tokio::test]
     async fn test_a_closed_marker_is_removed_only_when_older_than_the_request_bound() {
@@ -5144,7 +5175,7 @@ mod tests {
         let cs = Arc::clone(&router.exports.get("gc-vol").unwrap().value().content_store);
         router.close_snapshot_owner("gc-vol", "cap-a").await.unwrap();
         // Fresh marker: kept at the real bound, removed at a zero bound.
-        assert_eq!(cs.gc_closed_owners("gc-vol", glidefs_kernels::snapshot_owner::OWNED_CUT_REQUEST_BOUND_SECS).await.unwrap(), 0);
+        assert_eq!(cs.gc_closed_owners("gc-vol", glidefs_kernels::snapshot_owner::CLOSED_MARKER_KEEP_SECS).await.unwrap(), 0);
         assert!(cs.owner_closed("gc-vol", "cap-a").await.unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert_eq!(cs.gc_closed_owners("gc-vol", 0).await.unwrap(), 1);

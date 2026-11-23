@@ -20,7 +20,7 @@
 //! sequence is at least every marker's; a sequence an owner cut is not deleted (the owner deletes it, and the listing drops it with it).
 //!
 //! Mutations (`verify-kernels.sh --features mut_x` must go red, and the named glidefs test fail): `mut_list_ignores_owner`,
-//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`.
+//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`, `mut_expired_cut_writes`.
 //!
 //! The tag fence: `close` (under the flush lock) marks a tag closed; a cut under a closed tag that cut nothing is refused (`owned_cut_decision`), so
 //! `a_closed_tags_listing_is_final`: after the close returns, the tag's listing only shrinks. A closed marker is removed when older than the
@@ -28,9 +28,17 @@
 
 use vstd::prelude::*;
 
-/// The longest an owned cut may run: the server cancels it after this (`ExportRouter::snapshot_export_owned`). instd's client times out at the
-/// same bound, so a cut the client gave up on is over (or refused by the fence) within it.
+/// The longest an owned cut may run before it writes: `WriteCache::snapshot_owned` refuses to write its marker or its manifest once the request
+/// is older than this, checked under the flush lock (`cut_may_write`), and the router cancels the request at it. instd's client times out at the
+/// same bound.
 pub const OWNED_CUT_REQUEST_BOUND_SECS: u64 = 900;
+
+/// The longest one store write that began before the bound can take to land: the object-store client's request timeout (300 s) plus its retry
+/// window (180 s), rounded up. An environment premise of the proof, named in `a_removed_closed_marker_has_no_late_cut_to_stop`.
+pub const STORE_WRITE_SLACK_SECS: u64 = 900;
+
+/// The age a closed marker must pass before it is removed: the bound plus the slack.
+pub const CLOSED_MARKER_KEEP_SECS: u64 = OWNED_CUT_REQUEST_BOUND_SECS + STORE_WRITE_SLACK_SECS;
 
 verus! {
 
@@ -920,15 +928,44 @@ pub fn closed_marker_removable(age_secs: u64, bound_secs: u64) -> (r: bool)
     true
 }
 
-/// `a_removed_closed_marker_has_no_late_cut_to_stop`: a request that began no later than the close and lives at most `bound` seconds is over by the
-/// time the marker is removable (older than `bound`); one that begins later was refused while the marker stood.
-pub proof fn a_removed_closed_marker_has_no_late_cut_to_stop(start: int, close_at: int, end: int, now: int, bound: int)
+/// A cut may write its marker or its manifest only while its request is younger than the bound. Checked under the flush lock before each write.
+#[cfg(not(feature = "mut_expired_cut_writes"))]
+pub fn cut_may_write(elapsed_secs: u64, bound_secs: u64) -> (r: bool)
+    ensures
+        r == (elapsed_secs < bound_secs),
+{
+    elapsed_secs < bound_secs
+}
+
+/// Mutation: an expired cut writes anyway.
+#[cfg(feature = "mut_expired_cut_writes")]
+pub fn cut_may_write(elapsed_secs: u64, bound_secs: u64) -> (r: bool)
+    ensures
+        r == (elapsed_secs < bound_secs),
+{
+    true
+}
+
+/// `a_removed_closed_marker_has_no_late_cut_to_stop`: a cut that started no later than the close wrote only while it was younger than `bound`
+/// (`cut_may_write`), and a write takes at most `slack` to land (the premise), so everything it will ever write has landed by
+/// `start + bound + slack`, which is before any time the marker is removable (older than `bound + slack`). A cut that starts after the close meets
+/// the closed tag and writes nothing (`a_closed_tags_listing_is_final`).
+pub proof fn a_removed_closed_marker_has_no_late_cut_to_stop(
+    start: int,
+    close_at: int,
+    write_at: int,
+    lands_at: int,
+    now: int,
+    bound: int,
+    slack: int,
+)
     requires
         start <= close_at,
-        end <= start + bound,
-        now - close_at > bound,
+        write_at - start < bound,
+        lands_at <= write_at + slack,
+        now - close_at > bound + slack,
     ensures
-        end < now,
+        lands_at < now,
 {
 }
 
