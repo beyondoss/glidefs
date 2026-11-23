@@ -20,7 +20,7 @@
 //! sequence is at least every marker's; a sequence an owner cut is not deleted (the owner deletes it, and the listing drops it with it).
 //!
 //! Mutations (`verify-kernels.sh --features mut_x` must go red, and the named glidefs test fail): `mut_list_ignores_owner`,
-//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`, `mut_expired_cut_writes`.
+//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`, `mut_expired_cut_writes`, `mut_store_config_unchecked`.
 //!
 //! The tag fence: `close` (under the flush lock) marks a tag closed; a cut under a closed tag that cut nothing is refused (`owned_cut_decision`), so
 //! `a_closed_tags_listing_is_final`: after the close returns, the tag's listing only shrinks. A closed marker is removed when older than the
@@ -33,9 +33,25 @@ use vstd::prelude::*;
 /// same bound.
 pub const OWNED_CUT_REQUEST_BOUND_SECS: u64 = 900;
 
-/// The longest one store write that began before the bound can take to land: the object-store client's request timeout (300 s) plus its retry
-/// window (180 s), rounded up. An environment premise of the proof, named in `a_removed_closed_marker_has_no_late_cut_to_stop`.
-pub const STORE_WRITE_SLACK_SECS: u64 = 900;
+/// S3 rejects a SigV4-signed request whose `X-Amz-Date` is more than 15 minutes from S3's clock (`RequestTimeTooSkewed`): axiom AX-s3-sigv4-skew.
+pub const SIGV4_WINDOW_SECS: u64 = 900;
+
+/// The most GlideFS's clock and S3's clock differ by (chrony/NTP): FA-clock-sync.
+pub const CLOCK_SKEW_SECS: u64 = 60;
+
+/// The object-store client's request timeout, and the longest a store write may take to be signed (credential fetch) or to send its body:
+/// the largest `request_timeout` a store config may carry (`store_config_admitted`; GlideFS refuses a larger one at startup).
+pub const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// The longest, after a cut's write passed `cut_may_write`, that the write can still be applied by the store. The client signs a request once
+/// (object_store `aws/client.rs` `with_aws_sigv4` runs before `.retryable()`, and the retry loop re-sends the same signed request), so the date
+/// in its signature is fixed at signing, which is at most one request timeout after the check (credential fetch). S3 applies a request only if
+/// that date is within 15 minutes (+ clock skew) of its arrival (AX-s3-sigv4-skew), and only on receiving the whole body (AX-s3-whole-body); the
+/// body takes at most one request timeout after arrival, because the client abandons the request then and stops sending
+/// (`parse_object_store::an_abandoned_put_stops_sending_its_body`).
+pub const STORE_WRITE_SLACK_SECS: u64 = REQUEST_TIMEOUT_SECS + SIGV4_WINDOW_SECS + CLOCK_SKEW_SECS + REQUEST_TIMEOUT_SECS;
+
+const _: () = assert!(STORE_WRITE_SLACK_SECS == 2 * 300 + 900 + 60, "store_config_admitted's 300 is REQUEST_TIMEOUT_SECS");
 
 /// The age a closed marker must pass before it is removed: the bound plus the slack.
 pub const CLOSED_MARKER_KEEP_SECS: u64 = OWNED_CUT_REQUEST_BOUND_SECS + STORE_WRITE_SLACK_SECS;
@@ -946,24 +962,51 @@ pub fn cut_may_write(elapsed_secs: u64, bound_secs: u64) -> (r: bool)
     true
 }
 
-/// `a_removed_closed_marker_has_no_late_cut_to_stop`: a cut that started no later than the close wrote only while it was younger than `bound`
-/// (`cut_may_write`), and a write takes at most `slack` to land (the premise), so everything it will ever write has landed by
-/// `start + bound + slack`, which is before any time the marker is removable (older than `bound + slack`). A cut that starts after the close meets
+/// A store config is admitted only if its request timeout fits the slack: `2 * request_timeout + 15 min + clock skew <= STORE_WRITE_SLACK_SECS`.
+/// GlideFS refuses a config that does not at startup, so no config can break the premise of `a_removed_closed_marker_has_no_late_cut_to_stop`.
+#[cfg(not(feature = "mut_store_config_unchecked"))]
+pub fn store_config_admitted(request_timeout_secs: u64) -> (r: bool)
+    ensures
+        r == (request_timeout_secs <= 300),
+{
+    request_timeout_secs <= 300
+}
+
+/// Mutation: every config is admitted.
+#[cfg(feature = "mut_store_config_unchecked")]
+pub fn store_config_admitted(request_timeout_secs: u64) -> (r: bool)
+    ensures
+        r == (request_timeout_secs <= 300),
+{
+    true
+}
+
+/// `a_removed_closed_marker_has_no_late_cut_to_stop`: a cut that started no later than the close wrote only while younger than `bound`
+/// (`cut_may_write`). Its write is signed within `cred` of that check, arrives within `skew_window` (15 minutes + clock skew) of its signing
+/// (AX-s3-sigv4-skew), and lands within `body` of arriving (AX-s3-whole-body, and the client stops sending at its timeout). So everything it will
+/// ever write has landed before the marker is removable: older than `bound + cred + skew_window + body`. A cut that starts after the close meets
 /// the closed tag and writes nothing (`a_closed_tags_listing_is_final`).
 pub proof fn a_removed_closed_marker_has_no_late_cut_to_stop(
     start: int,
     close_at: int,
     write_at: int,
+    signed_at: int,
+    arrives_at: int,
     lands_at: int,
     now: int,
     bound: int,
-    slack: int,
+    cred: int,
+    skew_window: int,
+    body: int,
 )
     requires
         start <= close_at,
         write_at - start < bound,
-        lands_at <= write_at + slack,
-        now - close_at > bound + slack,
+        write_at <= signed_at,
+        signed_at <= write_at + cred,
+        arrives_at <= signed_at + skew_window,
+        lands_at <= arrives_at + body,
+        now - close_at > bound + cred + skew_window + body,
     ensures
         lands_at < now,
 {

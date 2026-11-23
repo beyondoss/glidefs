@@ -26,6 +26,8 @@ mut_closed_tag_still_cuts = []
 mut_closed_marker_removed_early = []
 # An owned cut older than the request bound writes its marker and manifest anyway: glidefs `test_an_expired_owned_cut_writes_nothing`.
 mut_expired_cut_writes = []
+# Every object-store config is admitted at startup: glidefs `parse_object_store::slack_tests::a_store_config_that_breaks_the_slack_is_refused`.
+mut_store_config_unchecked = []
 
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.

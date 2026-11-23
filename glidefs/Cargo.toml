@@ -22,6 +22,7 @@ mut_counter_wraps = ["glidefs-kernels/mut_counter_wraps"]
 mut_closed_tag_still_cuts = ["glidefs-kernels/mut_closed_tag_still_cuts"]
 mut_closed_marker_removed_early = ["glidefs-kernels/mut_closed_marker_removed_early"]
 mut_expired_cut_writes = ["glidefs-kernels/mut_expired_cut_writes"]
+mut_store_config_unchecked = ["glidefs-kernels/mut_store_config_unchecked"]
 mut_owner_check_outside_lock = []
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests
