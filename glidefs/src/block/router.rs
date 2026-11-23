@@ -1169,7 +1169,7 @@ impl ExportRouter {
         my_gen: u64,
         my_lease: u64,
     ) -> Result<crate::block::fence::Fence, RouterError> {
-        use crate::block::fence::{compose_token, fence_attach, Fence};
+        use crate::block::fence::Fence;
 
         let (content_store, volume_manifest, cache) = {
             let entry = self
@@ -1191,24 +1191,19 @@ impl ExportRouter {
                 let m = volume_manifest.read();
                 (m.generation, m.lease_revision)
             };
-            if fence_attach(stored_gen, stored_lease, my_gen, my_lease) == Fence::Reject {
+            // The decision is the proven kernel's (`fence_kernel::attach_seize`): grant iff the caller's composite token is at least the
+            // stored one, the volume then holds the caller's token (a refusal leaves the stored one), and a grant stamps only a higher token.
+            // The `0/0` caller against an unfenced volume is granted with equal tokens: nothing to stamp.
+            let d = crate::block::fence::attach_seize(stored_gen, stored_lease, my_gen, my_lease);
+            if d.fence == Fence::Reject {
                 return Ok(Fence::Reject);
             }
-
-            // Granted. The accepted token is the higher composite of the two
-            // (== my token once the fence passes, unless this is the 0/0 bypass).
-            // Decompose it back into (generation, lease_revision) to stamp.
-            let stored_token = compose_token(stored_gen, stored_lease);
-            let my_token = compose_token(my_gen, my_lease);
-            let effective_token = stored_token.max(my_token);
-            let effective_gen = (effective_token >> 64) as u64;
-            let effective_lease = (effective_token & u128::from(u64::MAX)) as u64;
+            let (effective_gen, effective_lease) = (d.holder_generation, d.holder_lease_revision);
             *cache.inner.current_generation.lock() = effective_gen;
             *cache.inner.current_lease_revision.lock() = effective_lease;
 
-            // No seize needed: a fully non-participating caller (0/0 bypass), or
-            // an equal-token re-attach that doesn't change the stored value.
-            if (my_gen == 0 && my_lease == 0) || effective_token == stored_token {
+            // No seize needed: an equal-token re-attach (which includes a fully non-participating 0/0 caller) doesn't change the stored value.
+            if !d.seize {
                 return Ok(Fence::Grant);
             }
 
@@ -3466,7 +3461,7 @@ impl ExportRouter {
                 .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
                 .await
                 .map_err(RouterError::Cache)?;
-            if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 {
+            if crate::block::detach::drained(stats.blocks_claimed as u64, cache.dirty_block_count()) {
                 info!("Export '{}' drained successfully", name);
                 return Ok(());
             }
@@ -3806,7 +3801,7 @@ impl ExportRouter {
             }
         }
 
-        if remaining > 0 {
+        if !crate::block::detach::detach_reported(remaining) {
             return Err(RouterError::DrainIncomplete {
                 name: name.to_string(),
                 remaining,
@@ -4000,7 +3995,7 @@ impl ExportRouter {
             let mut backoff = Duration::from_millis(100);
             for _ in 0..MAX_DRAIN_ITERATIONS {
                 match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                    Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
+                    Ok(stats) if crate::block::detach::drained(stats.blocks_claimed as u64, cache.dirty_block_count()) => {
                         drain_done = true;
                         break;
                     }
@@ -4026,11 +4021,7 @@ impl ExportRouter {
                     }
                 }
             }
-            let remaining = if drain_done {
-                0
-            } else {
-                cache.dirty_block_count()
-            };
+            let remaining = crate::block::detach::remaining_after_drain(drain_done, cache.dirty_block_count());
             if remaining > 0 {
                 warn!(
                     "Teardown drain for '{}' incomplete, {} dirty blocks remain",

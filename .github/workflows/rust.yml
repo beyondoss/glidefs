@@ -528,7 +528,7 @@ jobs:
         run: scripts/verify-kernels.sh
       - name: Each mutation goes red
         run: |
-          for f in mut_list_ignores_owner mut_retry_answers_bare_marker mut_retry_answers_lowest mut_counter_wraps mut_closed_tag_still_cuts mut_closed_marker_removed_early mut_expired_cut_writes mut_store_config_unchecked; do
+          for f in mut_list_ignores_owner mut_retry_answers_bare_marker mut_retry_answers_lowest mut_counter_wraps mut_closed_tag_still_cuts mut_closed_marker_removed_early mut_expired_cut_writes mut_store_config_unchecked mut_attach_admits_older mut_token_revision_dominates mut_seize_stamps_the_lower mut_detach_reports_before_flush; do
             if scripts/verify-kernels.sh --features "$f"; then echo "mutation $f verified: the proof is vacuous"; exit 1; fi
           done
       - uses: dtolnay/rust-toolchain@stable

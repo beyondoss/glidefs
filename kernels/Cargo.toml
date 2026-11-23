@@ -33,6 +33,10 @@ mut_store_config_unchecked = []
 mut_attach_admits_older = []
 # The revision takes the token's high bits: the same test.
 mut_token_revision_dominates = []
+# A granted attach leaves the stored (lower) token as the volume's holder: Verus only (`attach_seize`).
+mut_seize_stamps_the_lower = []
+# `detach_kernel`: a detach reports before the device is drained (the remaining count is taken as 0): Verus only.
+mut_detach_reports_before_flush = []
 
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.

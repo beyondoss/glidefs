@@ -25,7 +25,7 @@
 //! generation is refused whatever the revisions, and a token that caught up is
 //! admitted. instd's `recovery_kernel.rs` states the same lemmas over its twin.
 
-pub use glidefs_kernels::fence_kernel::{Fence, attach_fence, compose_token, fence_attach};
+pub use glidefs_kernels::fence_kernel::{Attach, Fence, attach_fence, attach_seize, compose_token, fence_attach};
 
 #[cfg(test)]
 mod tests {
@@ -61,6 +61,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// P.volume.glidefs-grants-an-attach-only-at-the-highest-token (Verus: `fence_kernel::thm_of_two_racing_attaches_only_the_higher_is_the_holder`):
+    /// of two attaches with different tokens against a volume at or below the higher, either order leaves the higher as the holder, and the lower
+    /// one is refused when it comes second.
+    #[test]
+    fn of_two_racing_attaches_only_the_higher_holds() {
+        let stored = (5u64, 1u64);
+        let lo = (6u64, 2u64);
+        let hi = (6u64, 9u64);
+        let step = |s: (u64, u64), m: (u64, u64)| {
+            let d = attach_seize(s.0, s.1, m.0, m.1);
+            (d.fence, (d.holder_generation, d.holder_lease_revision))
+        };
+        let (f1, s1) = step(stored, lo);
+        assert_eq!(f1, Fence::Grant);
+        let (f2, s2) = step(s1, hi);
+        assert_eq!((f2, s2), (Fence::Grant, hi), "lower first, then higher: the higher holds");
+        let (g1, t1) = step(stored, hi);
+        assert_eq!((g1, t1), (Fence::Grant, hi));
+        let (g2, t2) = step(t1, lo);
+        assert_eq!((g2, t2), (Fence::Reject, hi), "higher first: the lower is refused and the holder stays");
+    }
+
+    /// An equal-token re-attach (and a `0/0` caller against an unfenced volume) is granted and stamps nothing.
+    #[test]
+    fn an_equal_token_attach_stamps_nothing() {
+        let d = attach_seize(5, 3, 5, 3);
+        assert_eq!((d.fence, d.seize), (Fence::Grant, false));
+        let d = attach_seize(0, 0, 0, 0);
+        assert_eq!((d.fence, d.seize), (Fence::Grant, false));
+        let d = attach_seize(5, 3, 5, 4);
+        assert_eq!((d.fence, d.seize), (Fence::Grant, true));
     }
 
     #[test]
