@@ -1,0 +1,30 @@
+[package]
+name = "glidefs-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "GlideFS's pure decision kernels: no I/O, no clock, proven with Verus"
+
+[lib]
+name = "glidefs_kernels"
+
+[features]
+default = []
+# Mutations of the snapshot-owner decisions (`snapshot_owner`): `cargo verus verify --features mut_x` (see
+# `scripts/verify-kernels.sh`) must go red under each, and the named glidefs test must fail.
+# `list_snapshots_owned` lists every owner's markers: router `test_owned_snapshot_is_listed_by_owner_and_idempotent`.
+mut_list_ignores_owner = []
+# A bare marker (a cut that crashed before its manifest) answers a retry: router `test_owner_marker_without_manifest_is_listed_and_clears`.
+mut_retry_answers_bare_marker = []
+# A retry answers the lowest manifested sequence, not the highest: router `test_retry_answers_the_highest_manifested_sequence`.
+mut_retry_answers_lowest = []
+
+[dependencies]
+# The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }

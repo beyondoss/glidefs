@@ -116,6 +116,9 @@ pub struct SnapshotResult {
     /// Serialized manifest bytes captured under the flush lock.
     /// Used for tag publishing to ensure point-in-time consistency.
     pub manifest_bytes: Vec<u8>,
+    /// The owner's earlier cut answered (no new cut was made): `sequence` is that cut's, and `manifest_bytes`
+    /// and `stats` are empty.
+    pub already_cut: bool,
 }
 
 /// Write-behind cache with typestate lifecycle management.
