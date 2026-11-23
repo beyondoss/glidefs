@@ -399,6 +399,33 @@ impl ContentStore {
         Ok(sequences)
     }
 
+    /// Every sequence the export has cut: each snapshot manifest and each owner marker (a cut that crashed before its manifest still took its
+    /// sequence). A restarted or relocated export seeds its write counter above all of them (`glidefs_kernels::seq_counter::seeded_value`).
+    pub async fn cut_sequences(&self, name: &str) -> Result<Vec<u64>, ContentStoreError> {
+        let mut cuts = self.list_snapshots(name).await?;
+        self.check_circuit()?;
+        let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(rel) = meta.location.prefix_match(&prefix) {
+                let parts: Vec<_> = rel.collect();
+                if let [_owner, filename] = parts.as_slice()
+                    && let Ok(seq) = filename.as_ref().parse::<u64>()
+                {
+                    cuts.push(seq);
+                }
+            }
+        }
+        Ok(cuts)
+    }
+
     /// Delete a versioned snapshot manifest from S3 (idempotent), then every owner marker of that sequence.
     /// Manifest first: a crash between the two leaves a marker with no manifest, which the owner still lists
     /// and a retry clears; the other order would leave a manifest nothing lists.
