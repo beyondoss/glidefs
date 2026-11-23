@@ -10,6 +10,7 @@
 //!   has one, so a bare marker of a crashed cut never answers.
 //! * Safety `list_is_exactly_the_tagged_cuts` (the model): after any cut, `o`'s listing gains the cut's own sequence and nothing
 //!   else, and no other owner's listing changes.
+//! * Both in one lemma, `list_by_tag_and_retried_cut`: the property `P.snapshot.glidefs-lists-by-tag-exactly-the-tagged-sequences` states.
 //! * Safety `a_retried_cut_returns_the_same_sequence`: from any state satisfying `inv`, once a cut under `o` answered `a`, every later
 //!   cut under `o` answers `a` and changes nothing; `inv` is preserved by every cut (any owner) and every crashed cut.
 //!
@@ -477,6 +478,41 @@ pub proof fn a_cut_leaves_what_a_retry_needs(st: Store, o: Seq<u8>, owned: Seq<O
     if let Some(s) = r {
         let k = choose|k: int| 0 <= k < owned.len() && owned[k] == (s, true);
     }
+}
+
+/// The row's whole text, in one lemma: from any state with `inv` (and the counter at least every marker), a cut under `o` leaves the listing
+/// under `o` exactly its old listing plus the cut's own sequence `a` and no other owner's listing changed (list-by-tag returns exactly the
+/// sequences cut with that tag), and any cut under `o` retried in the state it left, with whatever fresh sequence, answers the same `a` and
+/// changes nothing (a cut retried with the same tag returns the same sequence).
+pub proof fn list_by_tag_and_retried_cut(
+    st: Store,
+    o: Seq<u8>,
+    o2: Seq<u8>,
+    owned: Seq<Owned>,
+    fresh: u64,
+    r: Option<u64>,
+    owned2: Seq<Owned>,
+    fresh2: u64,
+    r2: Option<u64>,
+)
+    requires
+        inv(st),
+        mono(st, fresh),
+        owned_view(st, o, owned),
+        is_answer(owned, r),
+        owned_view(cut(st, o, fresh, r).0, o, owned2),
+        is_answer(owned2, r2),
+    ensures
+        ({
+            let (st2, a) = cut(st, o, fresh, r);
+            listed(st2, o) =~= listed(st, o).insert(a) && (o2 != o ==> listed(st2, o2) =~= listed(st, o2))
+                && cut(st2, o, fresh2, r2) == (st2, a)
+        }),
+{
+    list_is_exactly_the_tagged_cuts(st, o, o2, owned, fresh, r);
+    a_cut_leaves_what_a_retry_needs(st, o, owned, fresh, r);
+    let (st2, a) = cut(st, o, fresh, r);
+    a_retried_cut_returns_the_same_sequence(st2, o, a, owned2, fresh2, r2);
 }
 
 } // verus!
