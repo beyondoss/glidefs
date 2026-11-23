@@ -17,6 +17,10 @@
 // under the License.
 
 use object_store::ClientOptions;
+
+/// The object-store client's request timeout when none is configured. `glidefs_kernels::snapshot_owner::STORE_WRITE_SLACK_SECS` is at least
+/// this plus the client's retry window (`owned_cut_slack_covers_the_store_clients_settings`).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -179,7 +183,7 @@ where
 
     let client_options = ClientOptions::default()
         .with_connect_timeout(connect_timeout.unwrap_or(Duration::from_secs(10)))
-        .with_timeout(request_timeout.unwrap_or(Duration::from_secs(300)));
+        .with_timeout(request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT));
 
     let store: Box<dyn ObjectStore> = match scheme {
         ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()),
@@ -382,5 +386,23 @@ mod tests {
             let url = Url::parse(s).unwrap();
             assert!(ObjectStoreScheme::parse(&url).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod slack_tests {
+    use super::*;
+
+    /// The slack a closed tag's marker keeps past the request bound covers the object-store client's real settings: one request's timeout
+    /// plus its retry window. A longer client timeout or retry window turns this red (`snapshot_owner::a_removed_closed_marker_has_no_late_cut_to_stop`
+    /// takes the slack as its premise). A configured `request_timeout` above the default is not covered: raise the slack with it.
+    #[test]
+    fn owned_cut_slack_covers_the_store_clients_settings() {
+        let client = DEFAULT_REQUEST_TIMEOUT.as_secs() + object_store::RetryConfig::default().retry_timeout.as_secs();
+        assert!(
+            glidefs_kernels::snapshot_owner::STORE_WRITE_SLACK_SECS >= client,
+            "STORE_WRITE_SLACK_SECS {} < request timeout + retry window {client}",
+            glidefs_kernels::snapshot_owner::STORE_WRITE_SLACK_SECS
+        );
     }
 }
