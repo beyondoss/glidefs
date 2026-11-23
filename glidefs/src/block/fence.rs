@@ -19,79 +19,49 @@
 //!   NOT advance the orchestrator generation, so without the lease revision two
 //!   incarnations would carry equal tokens and neither would fence the other.
 //!
-//! The composite is the only value monotonic across BOTH transitions. This is
-//! the GlideFS copy of the rule model-checked and unit-tested on the instd side —
-//! `recovery_kernel.rs::attach_fence` (K4) and its `compose_token`. There is no
-//! shared crate; the formal spec (`12-recovery-formal-spec.md` §2.5/§6.1) pins
-//! the copies together. Keep this byte-for-byte equivalent to those.
+//! The composite is the only value monotonic across BOTH transitions. The rule
+//! ([`compose_token`], [`attach_fence`], [`fence_attach`]) is the pure kernel
+//! `glidefs_kernels::fence_kernel`, proven with Verus: a stale placement
+//! generation is refused whatever the revisions, and a token that caught up is
+//! admitted. instd's `recovery_kernel.rs` states the same lemmas over its twin.
 
-/// Outcome of [`attach_fence`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fence {
-    /// `my_token >= stored_token` — admit; this token becomes the accepted
-    /// writer, fencing any strictly-older holder out.
-    Grant,
-    /// `my_token < stored_token` — a newer token owns the volume; reject. A
-    /// partitioned / superseded predecessor's writes must not land.
-    Reject,
-}
-
-/// Pack the composite fencing token: `(generation, lease_revision)`
-/// lexicographically into a `u128`, so a plain `>=` realises the lexicographic
-/// order. The orchestrator generation dominates (high bits); within a fixed
-/// placement the lease revision orders same-node incarnations (low bits).
-///
-/// Mirror of `recovery_kernel.rs::compose_token`. Keep identical.
-#[must_use]
-pub fn compose_token(generation: u64, lease_revision: u64) -> u128 {
-    ((generation as u128) << 64) | (lease_revision as u128)
-}
-
-/// Decide whether an attach/commit carrying composite token `my_token` is
-/// admitted, given `stored_token` (the highest token that has owned the volume).
-///
-/// `>=` (NOT `>`) is deliberate, exactly as instd's K4: a node
-/// re-reading/re-attaching its OWN token must still be admitted; only a strictly
-/// NEWER token fences an older one out.
-///
-/// This is the pure rule. The back-compat bypass (a caller that does not
-/// participate in fencing) lives at the call sites, NOT here — see
-/// [`fence_attach`] — so this function stays a faithful mirror of instd.
-#[must_use]
-pub fn attach_fence(stored_token: u128, my_token: u128) -> Fence {
-    if my_token >= stored_token {
-        Fence::Grant
-    } else {
-        Fence::Reject
-    }
-}
-
-/// Call-site wrapper around [`attach_fence`], composing the caller's
-/// `(generation, lease_revision)` against the stored token.
-///
-/// A `(0, 0)` caller is only admitted against an unfenced volume
-/// (stored token also `(0, 0)` — first attach / homelab with no
-/// orchestrator generation). Once the volume holds a real token,
-/// `(0, 0)` is `Reject`: the same machine as
-/// `attach_fence(stored, compose(0, 0))`. A caller that sends only a
-/// `lease_revision` (generation 0, lease > 0) participates and is
-/// ordered on the composite.
-#[must_use]
-pub fn fence_attach(
-    stored_generation: u64,
-    stored_lease_revision: u64,
-    my_generation: u64,
-    my_lease_revision: u64,
-) -> Fence {
-    attach_fence(
-        compose_token(stored_generation, stored_lease_revision),
-        compose_token(my_generation, my_lease_revision),
-    )
-}
+pub use glidefs_kernels::fence_kernel::{Fence, attach_fence, compose_token, fence_attach};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POINTS: [u64; 6] = [0, 1, 2, 7, u64::MAX - 1, u64::MAX];
+
+    /// P.volume.a-stale-placement-generation-is-refused-at-the-attach (Verus: `fence_kernel::thm_a_stale_placement_generation_is_refused`).
+    #[test]
+    fn a_stale_generation_is_refused_whatever_its_revision() {
+        for sg in POINTS {
+            for sr in POINTS {
+                for g in POINTS.into_iter().filter(|g| *g < sg) {
+                    for r in POINTS {
+                        assert_eq!(fence_attach(sg, sr, g, r), Fence::Reject, "stored ({sg},{sr}) mine ({g},{r})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// P.volume.a-refused-attach-is-admitted-once-its-token-catches-up (Verus: `fence_kernel::thm_a_caught_up_token_is_admitted`).
+    #[test]
+    fn a_caught_up_token_is_admitted() {
+        for sg in POINTS {
+            for sr in POINTS {
+                for g in POINTS {
+                    for r in POINTS {
+                        let up = g > sg || (g == sg && r >= sr);
+                        let want = if up { Fence::Grant } else { Fence::Reject };
+                        assert_eq!(fence_attach(sg, sr, g, r), want, "stored ({sg},{sr}) mine ({g},{r})");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn newer_generation_grants() {
