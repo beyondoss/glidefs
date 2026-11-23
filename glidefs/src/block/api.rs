@@ -85,6 +85,10 @@ pub struct SnapshotRequest {
     /// If set, also publish the manifest under this tag name.
     #[serde(default)]
     pub tag: Option<String>,
+    /// Owner tag of the cut: stored with the sequence, listed by `GET .../snapshot-owners/{owner}`, and the cut is
+    /// idempotent per owner (a retry answers the same sequence).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Request body for POST /api/exports/{name}/tag.
@@ -885,14 +889,14 @@ where
         // POST /api/exports/{name}/snapshot - Snapshot export to S3 manifest
         (Method::POST, ["api", "exports", name, "snapshot"]) => {
             // Parse optional body for tag
-            let tag = match req.into_body().collect().await {
+            let (tag, owner) = match req.into_body().collect().await {
                 Ok(b) => {
                     let bytes = b.to_bytes();
                     if bytes.is_empty() {
-                        None
+                        (None, None)
                     } else {
                         match serde_json::from_slice::<SnapshotRequest>(&bytes) {
-                            Ok(r) => r.tag,
+                            Ok(r) => (r.tag, r.owner),
                             Err(e) => {
                                 return Ok(error_response(
                                     StatusCode::BAD_REQUEST,
@@ -902,9 +906,9 @@ where
                         }
                     }
                 }
-                Err(_) => None,
+                Err(_) => (None, None),
             };
-            match router.snapshot_export(name, tag.as_deref()).await {
+            match router.snapshot_export_owned(name, tag.as_deref(), owner.as_deref()).await {
                 Ok(result) => json_response(StatusCode::OK, &result),
                 Err(RouterError::ExportNotFound(name)) => error_response(
                     StatusCode::NOT_FOUND,
@@ -964,6 +968,23 @@ where
                 Err(RouterError::InvalidExportName(_)) => error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name}/snapshot-owners/{owner} - The sequences cut under an owner tag. A distinct
+        // route, not a query on the list: a daemon that predates it answers 404, never every sequence of the export.
+        (Method::GET, ["api", "exports", name, "snapshot-owners", owner]) => {
+            match router.list_export_snapshots_owned(name, Some(owner)).await {
+                Ok(sequences) => json_response(StatusCode::OK, &sequences),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}' or owner '{}'", name, owner),
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -2965,6 +2986,27 @@ mod tests {
 
         let resp = request(&router, Method::POST, "/api/exports/vol1/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `POST .../snapshot {"owner"}` is idempotent per owner and `GET .../snapshot-owners/{owner}` lists by it.
+    #[tokio::test]
+    async fn test_snapshot_owner_is_idempotent_and_listed() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        request(&router, Method::PUT, "/api/exports/vol1", Some(r#"{"size_gb": 0.01}"#)).await;
+
+        let body = Some(r#"{"owner":"cap-1"}"#);
+        let a = body_json(request(&router, Method::POST, "/api/exports/vol1/snapshot", body).await).await;
+        let b = body_json(request(&router, Method::POST, "/api/exports/vol1/snapshot", body).await).await;
+        assert_eq!(a["sequence"], b["sequence"], "the same owner's retry is one cut");
+
+        let mine = body_json(request(&router, Method::GET, "/api/exports/vol1/snapshot-owners/cap-1", None).await).await;
+        assert_eq!(mine, serde_json::json!([a["sequence"]]));
+        let other = body_json(request(&router, Method::GET, "/api/exports/vol1/snapshot-owners/cap-2", None).await).await;
+        assert_eq!(other, serde_json::json!([]));
+
+        let bad = request(&router, Method::POST, "/api/exports/vol1/snapshot", Some(r#"{"owner":"a/b"}"#)).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

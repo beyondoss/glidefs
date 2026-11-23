@@ -182,6 +182,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 │   ├── manifests/{tag_name}                     ← Named manifest tag (same format, arbitrary name)
 │   ├── manifests/bases/{image_name}             ← Blessed base image VolumeManifest (glidefs bless)
 │   ├── snapshots/{export_name}/{sequence:020}   ← Versioned VolumeManifest (zero-padded sequence)
+│   ├── snapshot-owners/{export_name}/{owner}/{sequence:020}  ← empty marker: the owner's cut (written before the manifest)
 │   └── chunks/{chunk_idx:04}/
 │       └── {pack_id:016x}.pack                 ← GLPK pack (self-describing: header+index+data)
 └── index/                                       ← Logical→physical resolution (name-keyed, prefix-independent)
@@ -497,6 +498,7 @@ router.create_export(config{s3_prefix="prod-vm"}, readonly=false, manifest_name=
 | Snapshots accumulate | Each snapshot has unique `{seq:020}` key; deleted only by the orchestrator via `DELETE /api/exports/{name}/snapshots/{seq}` |
 | Fork reads parent blocks | VolumeManifest → PackIndexCache → S3 range GET on parent's pack files |
 | Snapshot deletion is idempotent | S3 NotFound on delete returns Ok |
+| An owned cut is idempotent and always listed by its owner | `snapshot_export_owned`: marker before manifest; same owner answers the existing sequence; `list_snapshots_owned` reads markers |
 | Non-purge remove preserves snapshots | `remove_export(name, purge=false)` does not call `delete_all_snapshots()` |
 | Snapshot on empty export succeeds | Returns sequence=0 and an empty VolumeManifest |
 
@@ -741,8 +743,9 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/exports/{name}` | `GET` | Get export info (size, readonly, transport, device path) |
 | `/api/exports/{name}` | `DELETE` | Remove export. `?purge=true` also deletes local cache and all S3 snapshots. |
 | `/api/exports` | `GET` | List all active exports. Each carries `stored_bytes` (non-zero blocks × block_size; see VolumeManifest), omitted when it cannot be computed exactly |
-| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest, and register the snapshot in the logical index. Optional body `{"tag":"name"}` also publishes a named alias. Returns `{snapshot_id, sequence, manifest_etag}` — fork from it via `from: "snapshot:<snapshot_id>"`. |
+| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest, and register the snapshot in the logical index. Optional body `{"tag":"name"}` also publishes a named alias. Optional `{"owner":"<tag>"}` (export-name charset) stores the cut under an owner: its marker is written before the manifest, and a retry with the same owner answers the sequence the first cut persisted (no second cut), so a caller that lost the answer, or crashed before recording it, can still list and delete what it cut. Returns `{snapshot_id, sequence, manifest_etag}` — fork from it via `from: "snapshot:<snapshot_id>"`. |
 | `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order |
+| `/api/exports/{name}/snapshot-owners/{owner}` | `GET` | List only the sequences cut under that owner tag (a marker counts even when its manifest was never written; `DELETE .../snapshots/{seq}` removes the manifest, then the sequence's markers). A separate route so a daemon without it answers 404, never every sequence |
 | `/api/exports/{name}/snapshots/{seq}` | `GET` | A snapshot's `stored_bytes`, sized from the snapshot's own manifest (exact or omitted; same rules and process-wide cap as an export's). Resolves the location from the durable name index, so it works after the export is released. 404 when the snapshot does not exist. |
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
 | `/api/exports/{name}/tag` | `POST` | Publish current manifest under a named alias without re-flushing. Body: `{"tag":"name"}`. |

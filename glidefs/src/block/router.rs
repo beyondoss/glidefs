@@ -2141,9 +2141,26 @@ impl ExportRouter {
         name: &str,
         tag: Option<&str>,
     ) -> Result<SnapshotResponse, RouterError> {
+        self.snapshot_export_owned(name, tag, None).await
+    }
+
+    /// [`Self::snapshot_export`] with an owner tag (opaque, export-name charset). The cut is idempotent per
+    /// (export, owner): a retry with the same owner answers the sequence the first cut persisted and cuts no
+    /// second one. The owner's sequences are listed with [`Self::list_export_snapshots_owned`], including a
+    /// cut that crashed after its marker and before its manifest, so a caller that lost the answer can always
+    /// find and delete what it cut.
+    pub async fn snapshot_export_owned(
+        &self,
+        name: &str,
+        tag: Option<&str>,
+        owner: Option<&str>,
+    ) -> Result<SnapshotResponse, RouterError> {
         validate_export_name(name)?;
         if let Some(t) = tag {
             validate_export_name(t)?;
+        }
+        if let Some(o) = owner {
+            validate_export_name(o)?;
         }
 
         // Clone Arc'd components from the per-shard guard, then drop the
@@ -2165,9 +2182,45 @@ impl ExportRouter {
             )
         };
 
+        // A retry of an owned cut answers the sequence the first one persisted.
+        if let Some(owner) = owner {
+            let owned = content_store
+                .list_snapshots_owned(name, owner)
+                .await
+                .map_err(RouterError::ContentStore)?;
+            for sequence in owned.into_iter().rev() {
+                if content_store
+                    .get_snapshot(name, sequence)
+                    .await
+                    .map_err(RouterError::ContentStore)?
+                    .is_some()
+                {
+                    info!(export = %name, owner, sequence, "owned snapshot already cut; answering it");
+                    let snapshot_id = crate::block::registry::snapshot_id(name, sequence);
+                    let parent = self.load_export(name).await.ok().flatten().and_then(|c| c.source);
+                    let entry = SnapshotEntry {
+                        id: snapshot_id.clone(),
+                        pool: pool.clone(),
+                        volume: name.to_string(),
+                        sequence,
+                        label: tag.map(|t| t.to_string()),
+                        parent,
+                    };
+                    self.save_snapshot_entry(&entry).await?;
+                    return Ok(SnapshotResponse {
+                        manifest_etag: None,
+                        sequence,
+                        snapshot_id,
+                        snapshot_persisted: true,
+                        tag: tag.map(|t| t.to_string()),
+                    });
+                }
+            }
+        }
+
         info!("Taking snapshot of export '{}'...", name);
         let result: SnapshotResult = cache
-            .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+            .snapshot_owned(&content_store, &pack_index_cache, &volume_manifest, owner)
             .await
             .map_err(RouterError::Cache)?;
 
@@ -2842,7 +2895,19 @@ impl ExportRouter {
         &self,
         name: &str,
     ) -> Result<Vec<u64>, RouterError> {
+        self.list_export_snapshots_owned(name, None).await
+    }
+
+    /// The sequences cut under an owner tag (`None`: every sequence of the export).
+    pub async fn list_export_snapshots_owned(
+        &self,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<Vec<u64>, RouterError> {
         validate_export_name(name)?;
+        if let Some(o) = owner {
+            validate_export_name(o)?;
+        }
         let cs = {
             let entry = self
                 .exports
@@ -2850,9 +2915,11 @@ impl ExportRouter {
                 .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
             Arc::clone(&entry.value().content_store)
         };
-        cs.list_snapshots(name)
-            .await
-            .map_err(RouterError::ContentStore)
+        match owner {
+            Some(o) => cs.list_snapshots_owned(name, o).await,
+            None => cs.list_snapshots(name).await,
+        }
+        .map_err(RouterError::ContentStore)
     }
 
     /// A registered snapshot's stored bytes (non-zero blocks x block size),
@@ -4943,6 +5010,81 @@ mod tests {
 
         let snap = result.unwrap();
         assert!(snap.sequence > 0, "Snapshot sequence should be > 0");
+    }
+
+    /// A cut under an owner tag is listed by the tag, and the same cut retried with the same tag is one sequence.
+    #[tokio::test]
+    async fn test_owned_snapshot_is_listed_by_owner_and_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        router
+            .create_export(test_export_config("own-vol"), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("own-vol").await.unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
+
+        let first = router.snapshot_export_owned("own-vol", None, Some("cap-a")).await.unwrap();
+        // The retry answers the same sequence even though the disk has moved on.
+        handler.write(4096, &[0xBB; 4096], false).await.unwrap();
+        let retry = router.snapshot_export_owned("own-vol", None, Some("cap-a")).await.unwrap();
+        assert_eq!(retry.sequence, first.sequence, "the same owner's retry is the same cut");
+        assert_eq!(router.list_export_snapshots("own-vol").await.unwrap(), vec![first.sequence]);
+        assert_eq!(
+            router.list_export_snapshots_owned("own-vol", Some("cap-a")).await.unwrap(),
+            vec![first.sequence]
+        );
+
+        // Another owner's cut after a write is its own sequence, and each lists only its own.
+        let other = router.snapshot_export_owned("own-vol", None, Some("cap-b")).await.unwrap();
+        assert_ne!(other.sequence, first.sequence);
+        assert_eq!(
+            router.list_export_snapshots_owned("own-vol", Some("cap-b")).await.unwrap(),
+            vec![other.sequence]
+        );
+        assert!(router.list_export_snapshots_owned("own-vol", Some("cap-c")).await.unwrap().is_empty());
+
+        // An untagged cut belongs to no owner.
+        handler.write(8192, &[0xCC; 4096], false).await.unwrap();
+        let bare = router.snapshot_export("own-vol", None).await.unwrap();
+        assert_eq!(router.list_export_snapshots("own-vol").await.unwrap().len(), 3);
+        assert!(!router.list_export_snapshots_owned("own-vol", Some("cap-a")).await.unwrap().contains(&bare.sequence));
+
+        // Deleting the sequence clears the owner's listing; the delete is idempotent.
+        router.delete_export_snapshot("own-vol", first.sequence).await.unwrap();
+        router.delete_export_snapshot("own-vol", first.sequence).await.unwrap();
+        assert!(router.list_export_snapshots_owned("own-vol", Some("cap-a")).await.unwrap().is_empty());
+        assert_eq!(
+            router.list_export_snapshots_owned("own-vol", Some("cap-b")).await.unwrap(),
+            vec![other.sequence],
+            "another owner's sequence stays"
+        );
+    }
+
+    /// A cut that crashed after its owner marker and before its manifest is still listed by the owner, and its
+    /// delete clears it; the owner's retry then cuts afresh.
+    #[tokio::test]
+    async fn test_owner_marker_without_manifest_is_listed_and_clears() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        router
+            .create_export(test_export_config("crash-vol"), false, None, None)
+            .await
+            .unwrap();
+        let cs = Arc::clone(&router.exports.get("crash-vol").unwrap().value().content_store);
+        cs.put_snapshot_owner("crash-vol", "cap-a", 7).await.unwrap();
+        assert!(cs.list_snapshots("crash-vol").await.unwrap().is_empty(), "no manifest was written");
+        assert_eq!(router.list_export_snapshots_owned("crash-vol", Some("cap-a")).await.unwrap(), vec![7]);
+
+        // The retry does not mistake the bare marker for a finished cut.
+        let retry = router.snapshot_export_owned("crash-vol", None, Some("cap-a")).await.unwrap();
+        let listed = router.list_export_snapshots_owned("crash-vol", Some("cap-a")).await.unwrap();
+        assert!(listed.contains(&7) && listed.contains(&retry.sequence));
+
+        for seq in listed {
+            router.delete_export_snapshot("crash-vol", seq).await.unwrap();
+        }
+        assert!(router.list_export_snapshots_owned("crash-vol", Some("cap-a")).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -2017,6 +2017,20 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<SnapshotResult, CacheError> {
+        self.snapshot_owned(content_store, pack_index_cache, volume_manifest, None).await
+    }
+
+    /// [`Self::snapshot`] for an owner: when `owner` is set, its marker for the cut sequence is written before the
+    /// manifest, so the owner can always list what it cut, even after a crash between the two.
+    #[must_use = "snapshot errors must be handled"]
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
+    pub async fn snapshot_owned(
+        &self,
+        content_store: &ContentStore,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        owner: Option<&str>,
+    ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
             .flush_until_no_skips(content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
@@ -2024,6 +2038,12 @@ impl WriteCache<Active> {
 
         let manifest_bytes = volume_manifest.read().serialize()?;
         let manifest_etag = self.inner.manifest_etag.lock().clone();
+
+        if let Some(owner) = owner {
+            content_store
+                .put_snapshot_owner(&self.inner.export_name, owner, seq_cutpoint)
+                .await?;
+        }
 
         let snapshot_persisted = {
             let mut persisted = false;
