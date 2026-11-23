@@ -918,6 +918,24 @@ where
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
                 ),
+                Err(RouterError::Cache(e @ CacheError::OwnerClosed(_))) => error_response(StatusCode::CONFLICT, &e.to_string()),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/exports/{name}/snapshot-owners/{owner}/close - Close an owner tag: a later cut under it that cut nothing is refused
+        // (409 `owner_closed:`), so after this returns the tag's listing only shrinks. Idempotent.
+        (Method::POST, ["api", "exports", name, "snapshot-owners", owner, "close"]) => {
+            match router.close_snapshot_owner(name, owner).await {
+                Ok(()) => json_response(StatusCode::OK, &serde_json::json!({})),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}' or owner '{}'", name, owner),
+                ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }

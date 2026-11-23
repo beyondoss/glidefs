@@ -19,6 +19,8 @@ mut_list_ignores_owner = ["glidefs-kernels/mut_list_ignores_owner"]
 mut_retry_answers_bare_marker = ["glidefs-kernels/mut_retry_answers_bare_marker"]
 mut_retry_answers_lowest = ["glidefs-kernels/mut_retry_answers_lowest"]
 mut_counter_wraps = ["glidefs-kernels/mut_counter_wraps"]
+mut_closed_tag_still_cuts = ["glidefs-kernels/mut_closed_tag_still_cuts"]
+mut_closed_marker_removed_early = ["glidefs-kernels/mut_closed_marker_removed_early"]
 mut_owner_check_outside_lock = []
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests

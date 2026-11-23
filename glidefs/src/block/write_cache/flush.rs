@@ -2037,17 +2037,25 @@ impl WriteCache<Active> {
         // retry that overlaps its still-running first cut waits for it and then answers it, never cuts a second.
         // (`glidefs_kernels::snapshot_owner`: `a_retried_cut_returns_the_same_sequence`.)
         #[cfg(not(feature = "mut_owner_check_outside_lock"))]
-        if let Some(owner) = owner
-            && let Some(sequence) = self.owned_cut_answer(content_store, owner).await?
-        {
-            return Ok(SnapshotResult {
-                manifest_etag: None,
-                sequence,
-                snapshot_persisted: true,
-                stats: FlushStats::default(),
-                manifest_bytes: Vec::new(),
-                already_cut: true,
-            });
+        if let Some(owner) = owner {
+            let answer = self.owned_cut_answer(content_store, owner).await?;
+            let closed = content_store.owner_closed(&self.inner.export_name, owner).await?;
+            match glidefs_kernels::snapshot_owner::owned_cut_decision(closed, answer) {
+                glidefs_kernels::snapshot_owner::CutDecision::Answer(sequence) => {
+                    return Ok(SnapshotResult {
+                        manifest_etag: None,
+                        sequence,
+                        snapshot_persisted: true,
+                        stats: FlushStats::default(),
+                        manifest_bytes: Vec::new(),
+                        already_cut: true,
+                    });
+                }
+                glidefs_kernels::snapshot_owner::CutDecision::Refuse => {
+                    return Err(CacheError::OwnerClosed(owner.to_string()));
+                }
+                glidefs_kernels::snapshot_owner::CutDecision::Cut => {}
+            }
         }
 
         let (stats, seq_cutpoint) = self
@@ -2099,6 +2107,18 @@ impl WriteCache<Active> {
             manifest_bytes,
             already_cut: false,
         })
+    }
+
+    /// Close an owner tag. Takes the flush lock, so every cut of the tag ahead of it has landed (and is listed) and every one behind it is
+    /// refused: once this returns the tag's listing only shrinks (`snapshot_owner::a_closed_tags_listing_is_final`). Idempotent. Also
+    /// removes the export's closed markers older than the request bound.
+    pub async fn close_owner(&self, content_store: &ContentStore, owner: &str) -> Result<(), CacheError> {
+        let _flush_guard = self.inner.flush_lock.lock().await;
+        content_store.put_owner_closed(&self.inner.export_name, owner).await?;
+        content_store
+            .gc_closed_owners(&self.inner.export_name, glidefs_kernels::snapshot_owner::OWNED_CUT_REQUEST_BOUND_SECS)
+            .await?;
+        Ok(())
     }
 
     /// The sequence `owner` already cut of this export, if any: the highest owner marker that has a manifest.

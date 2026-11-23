@@ -20,6 +20,10 @@ mut_retry_answers_bare_marker = []
 mut_retry_answers_lowest = []
 # `next_value` wraps to zero at u64::MAX: glidefs `block_map::tests::sequence_number_never_wraps`.
 mut_counter_wraps = []
+# A closed tag is cut anyway: glidefs `test_a_closed_owner_refuses_a_late_cut`.
+mut_closed_tag_still_cuts = []
+# A closed marker is removable at any age: glidefs `test_a_closed_marker_is_removed_only_when_older_than_the_request_bound`.
+mut_closed_marker_removed_early = []
 
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
