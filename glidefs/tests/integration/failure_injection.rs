@@ -927,7 +927,7 @@ async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
 
     // Enable delete failures — delete_all_snapshots should still return Ok
     s3.set_fail_deletes(true);
-    let result = content_store.delete_all_snapshots("vol1").await;
+    let result = content_store.delete_all_snapshots("test", "vol1").await;
     assert!(
         result.is_ok(),
         "delete_all_snapshots should return Ok even when deletes fail"
@@ -943,7 +943,7 @@ async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
     );
 
     // Retry without failures — should succeed
-    content_store.delete_all_snapshots("vol1").await.unwrap();
+    content_store.delete_all_snapshots("test", "vol1").await.unwrap();
     let remaining = content_store.list_snapshots("vol1").await.unwrap();
     assert_eq!(remaining.len(), 0, "all snapshots should be deleted on retry");
 }
