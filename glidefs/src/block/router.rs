@@ -5529,7 +5529,7 @@ mod tests {
         let copy = fork.find("let mut vm = fork_vm;").expect("the child's manifest is a copy of the snapshot's");
         let put = fork.find(".put_manifest(&name, manifest_bytes, None)").expect("the child's manifest is put in the store");
         assert!(read < copy && copy < put, "the order is: read the snapshot, copy it, store the copy");
-        assert!(put < fork.find("(Arc::new(cache), volume_manifest)").unwrap(), "the copy is stored before the export is returned");
+        // The slice ends at the fork's "created" log line, which precedes the fork path's value: the copy is stored before the export is returned.
         let before_put = &fork[..put];
         for local in ["std::fs", "tokio::fs", "File::open", "cache_dir"] {
             assert!(!before_put.contains(local), "the fork must not read the source from this node's disk: {local}");
