@@ -3676,9 +3676,10 @@ async fn publish_flush_fails_on_unexplained_crc_skip() {
     h.cache.inner().data_file.read().write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
 
     let _g = h.cache.flush_lock().lock().await;
+    let hold = glidefs_kernels::cut_hold::CutHold::under(&_g);
     let res = h
         .cache
-        .flush_until_no_skips(&h.content_store, &h.pack_index_cache, &h.volume_manifest, 3)
+        .flush_until_no_skips(&hold, &h.content_store, &h.pack_index_cache, &h.volume_manifest, 3)
         .await;
     assert!(
         matches!(res, Err(super::CacheError::FlushSkippedBlocks { crc_mismatched: 1 })),
@@ -4189,22 +4190,60 @@ async fn plain_writer_takes_over_a_stale_materialization_claim() {
     assert!(got[4096..].iter().all(|&b| b == 0x33), "page 1 lost");
 }
 
-/// Cuts of one export never interleave: the owner check of an owned cut runs after `flush_lock` is taken and before the flush and the
-/// marker, inside `snapshot_owned`, and nowhere else but the `mut_owner_check_outside_lock` mutation
-/// (`glidefs_kernels::snapshot_owner`'s serialisation premise). Moving the check above the lock turns this red.
+/// Cuts of one export never interleave (`glidefs_kernels::cut_hold::thm_cuts_of_an_export_never_interleave`): the proof's sink is the type.
+/// Every step of an owned cut takes `&CutHold`, and a `CutHold` is made only by `CutHold::under(&guard)` right after `flush_lock.lock().await`:
+/// in `snapshot_owned` and `flush_to_s3`, and (a lie the mutation tells) in `owned_cut_answer` under `mut_owner_check_outside_lock`; tests
+/// mint their own. The owner check sits between the lock and the flush, the flush before the marker, the marker before the manifest. A second
+/// mint, a step without the hold, or a store write outside `put_cut_marker` and `put_cut_manifest` turns this red.
 #[test]
-fn owned_cut_check_sits_under_flush_lock() {
+fn cut_hold_structure() {
     let flush = include_str!("flush.rs");
-    let start = flush.find("pub async fn snapshot_owned").expect("snapshot_owned");
-    let body = &flush[start..];
-    let end = body.find("pub(crate) async fn owned_cut_answer").expect("end of snapshot_owned");
+    let prod = &flush[..flush.find("\n#[cfg(test)]").unwrap_or(flush.len())];
+
+    // The mints: exactly two, each on the line after the lock is taken; a third (the mutation's) lives behind its feature.
+    let mints: Vec<usize> = prod.match_indices("CutHold::under(").map(|(i, _)| i).collect();
+    assert_eq!(mints.len(), 3, "CutHold::under must be called in snapshot_owned, flush_to_s3 and the mutation only");
+    for &i in &mints[..2] {
+        let before = &prod[..i];
+        let lock = before.rfind("flush_lock.lock().await").expect("a mint without a lock before it");
+        assert!(before[lock..].lines().count() <= 4, "a CutHold must be minted right after the lock is taken");
+        assert!(prod[i..].starts_with("CutHold::under(&_flush_guard)"), "a CutHold borrows the lock's guard");
+    }
+    assert!(
+        prod[..mints[2]].rfind("mut_owner_check_outside_lock").is_some_and(|c| mints[2] - c < 600),
+        "the third mint must be the mutation's"
+    );
+
+    // The sinks take the hold, and nothing else writes a cut's marker or manifest.
+    for sig in [
+        "async fn flush_until_no_skips(\n        &self,\n        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,",
+        "async fn owned_cut_view(\n        &self,\n        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,",
+        "async fn put_cut_marker(\n        &self,\n        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,",
+        "async fn put_cut_manifest(\n        &self,\n        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,",
+    ] {
+        assert!(prod.contains(sig), "a cut step must take the hold: {sig}");
+    }
+    assert_eq!(prod.matches(".put_snapshot_owner(").count(), 1, "only put_cut_marker writes a marker");
+    assert_eq!(prod.matches(".put_snapshot(").count(), 1, "only put_cut_manifest writes a cut's manifest");
+
+    // Order inside snapshot_owned: lock, hold, owner check, flush, marker, manifest.
+    let start = prod.find("pub async fn snapshot_owned").expect("snapshot_owned");
+    let body = &prod[start..];
+    let end = body.find("pub async fn close_owner").expect("end of snapshot_owned");
     let body = &body[..end];
     let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("snapshot_owned has no {needle}"));
     let lock = at("flush_lock.lock().await");
-    let check = at("owned_cut_view(");
-    let flush_pass = at("flush_until_no_skips(");
-    let marker = at("put_snapshot_owner(");
-    assert!(lock < check && check < flush_pass && flush_pass < marker, "the owner check must sit between the lock and the flush");
+    let mint = at("CutHold::under(");
+    let check = at("owned_cut_view(&hold");
+    let flush_pass = at("flush_until_no_skips(&hold");
+    let marker = at("put_cut_marker(&hold");
+    let manifest = at("put_cut_manifest(&hold");
+    assert!(
+        lock < mint && mint < check && check < flush_pass && flush_pass < marker && marker < manifest,
+        "a cut runs its steps in one hold, in order"
+    );
+
+    // The router's mutation call stays behind its feature.
     let router = include_str!("../router.rs");
     for (i, _) in router.match_indices(".owned_cut_answer(") {
         let before = &router[..i];

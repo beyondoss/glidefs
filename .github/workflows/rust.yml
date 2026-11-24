@@ -533,7 +533,7 @@ jobs:
           done
       - name: Each volume mutation goes red
         run: |
-          for f in mut_evict_before_manifest mut_write_keeps_syncing mut_stranded_marked_absent mut_attach_keeps_deviceless mut_gc_reclaims_named mut_gc_ignores_manifests; do
+          for f in mut_evict_before_manifest mut_write_keeps_syncing mut_stranded_marked_absent mut_attach_keeps_deviceless mut_gc_reclaims_named mut_gc_ignores_manifests mut_drop_counts_inflight_registration mut_cut_steps_skip_the_lock mut_keep_omits_clock_skew mut_purge_gate_admits_packs; do
             if scripts/verify-kernels.sh --features "$f"; then echo "mutation $f verified: the proof is vacuous"; exit 1; fi
           done
       - uses: dtolnay/rust-toolchain@stable

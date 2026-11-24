@@ -1191,7 +1191,7 @@ mod tests {
         content_store.put_manifest("child", child.serialize().unwrap(), None).await.unwrap();
 
         // The snapshot disk is deleted (a purge removes its manifest, never a pack), then the collector runs with no grace.
-        content_store.delete_manifest("snapshot-disk").await.unwrap();
+        content_store.delete_manifest("test", "snapshot-disk").await.unwrap();
         let mut state = new_gc_state_for_test();
         let report = reconcile_prefix_for_test(&content_store, &mut state, Duration::ZERO, 100, false).await.unwrap();
 
@@ -1978,7 +1978,7 @@ mod tests {
         assert_eq!(report.packs_deleted(), 0);
 
         // Simulate fork cleanup: delete fork manifest (as our purge fix does)
-        content_store.delete_manifest("fork-1").await.unwrap();
+        content_store.delete_manifest("test", "fork-1").await.unwrap();
 
         // GC run 2: only base manifest, pack_d should be dead
         let mut state2 = new_gc_state_for_test();

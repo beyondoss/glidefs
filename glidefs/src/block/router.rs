@@ -1378,7 +1378,10 @@ impl ExportRouter {
     /// Delete export definition from S3 (idempotent).
     async fn delete_export_definition(&self, name: &str) -> Result<(), RouterError> {
         let path = self.export_json_path(name);
-        match self.object_store.delete(&path).await {
+        let Some(target) = glidefs_kernels::purge_gate::purge_gate(&self.db_path, path.as_ref()) else {
+            return Err(RouterError::ContentStore(crate::block::content_store::ContentStoreError::PurgeRefused(path.to_string())));
+        };
+        match self.object_store.delete(&Path::from(target.key())).await {
             Ok(()) => {
                 debug!("Deleted export definition from S3: {}", path);
                 Ok(())
@@ -1414,7 +1417,10 @@ impl ExportRouter {
         drop(list);
         let mut deleted = 0;
         for path in found {
-            match self.object_store.delete(&path).await {
+            let Some(target) = glidefs_kernels::purge_gate::purge_gate(&self.db_path, path.as_ref()) else {
+                return Err(RouterError::ContentStore(crate::block::content_store::ContentStoreError::PurgeRefused(path.to_string())));
+            };
+            match self.object_store.delete(&Path::from(target.key())).await {
                 Ok(()) => deleted += 1,
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
@@ -1434,11 +1440,11 @@ impl ExportRouter {
         // Deletes this disk's manifest, snapshots, snapshot index and, last, its definition. No pack: packs are shared by every disk
         // forked from the same pool, and only the collector reclaims one (`pack_liveness`), and only one no manifest names.
         let mut first_err: Option<RouterError> = None;
-        if let Err(e) = cs.delete_manifest(name).await {
+        if let Err(e) = cs.delete_manifest(&self.db_path, name).await {
             warn!("Failed to delete manifest from S3: {}", e);
             first_err.get_or_insert(RouterError::ContentStore(e));
         }
-        if let Err(e) = cs.delete_all_snapshots(name).await {
+        if let Err(e) = cs.delete_all_snapshots(&self.db_path, name).await {
             warn!("Failed to delete snapshots from S3: {}", e);
             first_err.get_or_insert(RouterError::ContentStore(e));
         }
@@ -5235,7 +5241,7 @@ mod tests {
         assert!(!cs.owner_closed("gc-vol", "cap-a").await.unwrap());
         // The marker goes with its export.
         router.close_snapshot_owner("gc-vol", "cap-b").await.unwrap();
-        cs.delete_all_snapshots("gc-vol").await.unwrap();
+        cs.delete_all_snapshots("test", "gc-vol").await.unwrap();
         assert!(!cs.owner_closed("gc-vol", "cap-b").await.unwrap());
     }
 

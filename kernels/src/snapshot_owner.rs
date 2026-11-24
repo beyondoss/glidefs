@@ -21,7 +21,7 @@
 //! sequence is at least every marker's; a sequence an owner cut is not deleted (the owner deletes it, and the listing drops it with it).
 //!
 //! Mutations (`verify-kernels.sh --features mut_x` must go red, and the named glidefs test fail): `mut_list_ignores_owner`,
-//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`, `mut_expired_cut_writes`, `mut_store_config_unchecked`.
+//! `mut_retry_answers_bare_marker`, `mut_retry_answers_lowest`, `mut_closed_tag_still_cuts`, `mut_closed_marker_removed_early`, `mut_expired_cut_writes`, `mut_store_config_unchecked`, `mut_keep_omits_clock_skew`.
 //!
 //! The tag fence: `close` (under the flush lock) marks a tag closed; a cut under a closed tag that cut nothing is refused (`owned_cut_decision`), so
 //! `a_closed_tags_listing_is_final`: after the close returns, the tag's listing only shrinks. A closed marker is removed when older than the
@@ -54,8 +54,16 @@ pub const STORE_WRITE_SLACK_SECS: u64 = REQUEST_TIMEOUT_SECS + SIGV4_WINDOW_SECS
 
 const _: () = assert!(STORE_WRITE_SLACK_SECS == 2 * 300 + 900 + 60, "store_config_admitted's 300 is REQUEST_TIMEOUT_SECS");
 
-/// The age a closed marker must pass before it is removed: the bound plus the slack.
+/// The age a closed marker must pass before it is removed: the bound, the slack, and once more the clock skew, because the age is read
+/// against the marker's `last_modified`, which is S3's clock, while the cuts' times are GlideFS's (`a_removed_closed_marker_has_no_late_cut_to_stop`).
+#[cfg(not(feature = "mut_keep_omits_clock_skew"))]
+pub const CLOSED_MARKER_KEEP_SECS: u64 = OWNED_CUT_REQUEST_BOUND_SECS + STORE_WRITE_SLACK_SECS + CLOCK_SKEW_SECS;
+/// Mutation: the age is not widened for the clock skew (the proof's red; the code's was this value before).
+#[cfg(feature = "mut_keep_omits_clock_skew")]
 pub const CLOSED_MARKER_KEEP_SECS: u64 = OWNED_CUT_REQUEST_BOUND_SECS + STORE_WRITE_SLACK_SECS;
+
+#[cfg(not(feature = "mut_keep_omits_clock_skew"))]
+const _: () = assert!(CLOSED_MARKER_KEEP_SECS == 900 + (300 + 900 + 60 + 300) + 60, "keep_s() in the proof is this value");
 
 verus! {
 
@@ -1155,32 +1163,66 @@ pub fn store_config_admitted(request_timeout_secs: u64) -> (r: bool)
     true
 }
 
-/// `a_removed_closed_marker_has_no_late_cut_to_stop`: a cut that started no later than the close wrote only while younger than `bound`
-/// (`cut_may_write`). Its write is signed within `cred` of that check, arrives within `skew_window` (15 minutes + clock skew) of its signing
-/// (AX-s3-sigv4-skew), and lands within `body` of arriving (AX-s3-whole-body, and the client stops sending at its timeout). So everything it will
-/// ever write has landed before the marker is removable: older than `bound + cred + skew_window + body`. A cut that starts after the close meets
-/// the closed tag and writes nothing (`a_closed_tags_listing_is_final`).
+/// The slack and the keep age in the proof's terms (the Rust constants above, as spec values).
+pub open spec fn bound_s() -> int { 900 }
+pub open spec fn request_timeout_s() -> int { 300 }
+pub open spec fn sigv4_window_s() -> int { 900 }
+pub open spec fn clock_skew_s() -> int { 60 }
+#[cfg(not(feature = "mut_keep_omits_clock_skew"))]
+pub open spec fn keep_s() -> int { bound_s() + (request_timeout_s() + sigv4_window_s() + clock_skew_s() + request_timeout_s()) + clock_skew_s() }
+
+/// Mutation: the age is not widened for the marker's `last_modified` being S3's clock.
+#[cfg(feature = "mut_keep_omits_clock_skew")]
+pub open spec fn keep_s() -> int { bound_s() + (request_timeout_s() + sigv4_window_s() + clock_skew_s() + request_timeout_s()) }
+
+/// The Rust constants are these values: `CLOSED_MARKER_KEEP_SECS` is `keep_s()`, so the age `closed_marker_removable` is asked about (the
+/// production call, `gc_closed_owners` with `CLOSED_MARKER_KEEP_SECS`) is the one the theorem reasons from.
+pub proof fn lemma_the_keep_age_is_the_constants()
+    ensures
+        keep_s() >= 900 + (300 + 900 + 60 + 300),
+{
+}
+
+/// P.snapshot.glidefs-a-closed-tags-marker-is-removed-only-when-no-late-cut-can-write: a closed tag's marker is removed (`closed_marker_removable(age,
+/// KEEP)`, called by `gc_closed_owners`) only when every write of every cut that began before the close has landed.
+///
+/// Times are seconds on GlideFS's clock unless named otherwise. The cut began at `start <= close_at` (the close takes the flush lock, so a cut
+/// that began after it meets the closed tag: `a_closed_tags_listing_is_final`). Its write passed `cut_may_write` at `write_at`
+/// (`write_at - start < bound`); it is signed within the request timeout of that (`signed_at`; the client signs once, before its retry loop);
+/// it arrives at S3 at `arrives_at`, where S3's clock reads `arrives_at + off_arrive`; it lands by `lands_at <= arrives_at + request_timeout`
+/// (the client stops sending at its timeout and S3 applies only a whole body: AX-s3-whole-body). Premises that are not ours:
+/// * AX-s3-sigv4-skew: S3 applies a signed request only if its signing time is within `sigv4_window` of S3's clock at arrival.
+/// * FA-clock-sync: S3's clock and GlideFS's differ by at most `clock_skew` at every moment: `off_arrive` and `off_lm`.
+/// The marker was put at `close_lands >= close_at` and S3 stamped it `close_lands + off_lm` (its `last_modified`); the age is `now` minus that stamp.
 pub proof fn a_removed_closed_marker_has_no_late_cut_to_stop(
     start: int,
     close_at: int,
+    close_lands: int,
     write_at: int,
     signed_at: int,
     arrives_at: int,
     lands_at: int,
     now: int,
-    bound: int,
-    cred: int,
-    skew_window: int,
-    body: int,
+    off_arrive: int,
+    off_lm: int,
+    age: int,
 )
     requires
+        // the cut and its write
         start <= close_at,
-        write_at - start < bound,
+        write_at - start < bound_s(),
         write_at <= signed_at,
-        signed_at <= write_at + cred,
-        arrives_at <= signed_at + skew_window,
-        lands_at <= arrives_at + body,
-        now - close_at > bound + cred + skew_window + body,
+        signed_at <= write_at + request_timeout_s(),
+        lands_at <= arrives_at + request_timeout_s(),
+        // AX-s3-sigv4-skew
+        -sigv4_window_s() <= signed_at - (arrives_at + off_arrive) <= sigv4_window_s(),
+        // FA-clock-sync
+        -clock_skew_s() <= off_arrive <= clock_skew_s(),
+        -clock_skew_s() <= off_lm <= clock_skew_s(),
+        // the close and the production check
+        close_at <= close_lands,
+        age == now - (close_lands + off_lm),
+        age > keep_s(),
     ensures
         lands_at < now,
 {

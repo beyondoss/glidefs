@@ -27,6 +27,9 @@ pub enum ContentStoreError {
 
     #[error("S3 concurrency semaphore closed")]
     SemaphoreClosed,
+
+    #[error("purge refused to delete {0}: it is a pack's key")]
+    PurgeRefused(String),
 }
 
 impl From<object_store::Error> for ContentStoreError {
@@ -155,12 +158,14 @@ impl ContentStore {
         Ok(put_result.e_tag)
     }
 
-    /// Delete a manifest from S3 (idempotent).
+    /// Delete a manifest from S3 (idempotent). `db` is the store's `db_path`: the key passes `glidefs_kernels::purge_gate::purge_gate` first, which
+    /// refuses a pack's key (a purge deletes no pack).
     #[instrument(skip(self), fields(name = %name))]
-    pub async fn delete_manifest(&self, name: &str) -> Result<(), ContentStoreError> {
+    pub async fn delete_manifest(&self, db: &str, name: &str) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
-        let path = ObjectPath::from(key);
+        let target = glidefs_kernels::purge_gate::purge_gate(db, &key).ok_or(ContentStoreError::PurgeRefused(key))?;
+        let path = ObjectPath::from(target.key());
         let result = self.object_store.delete(&path).await;
         self.record_s3_result(&result);
         match result {
@@ -489,23 +494,30 @@ impl ContentStore {
     /// Streams the S3 list directly into concurrent deletes (`buffer_unordered`)
     /// so listing and deletion overlap without materializing the full snapshot list.
     #[instrument(skip(self), fields(name = %name))]
-    pub async fn delete_all_snapshots(&self, name: &str) -> Result<(), ContentStoreError> {
+    pub async fn delete_all_snapshots(&self, db: &str, name: &str) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
         let owners = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
         let mut owner_stream = self.object_store.list(Some(&owners));
         while let Some(Ok(meta)) = owner_stream.next().await {
-            let _ = self.object_store.delete(&meta.location).await;
+            // Every object a listing returns passes the purge gate before it is deleted (`purge_gate`: a purge deletes no pack).
+            let Some(target) = glidefs_kernels::purge_gate::purge_gate(db, meta.location.as_ref()) else {
+                tracing::error!(key = %meta.location, "purge refused an owner marker that is a pack's key");
+                continue;
+            };
+            let _ = self.object_store.delete(&ObjectPath::from(target.key())).await;
         }
         let prefix_str = format!("{}/snapshots/{}/", self.base_path, name);
         let prefix = ObjectPath::from(prefix_str);
         let store = Arc::clone(&self.object_store);
         let cb = self.circuit_breaker.clone();
+        let db = db.to_string();
 
         self.object_store
             .list(Some(&prefix))
             .map(move |result| {
                 let store = Arc::clone(&store);
                 let cb = cb.clone();
+                let db = db.clone();
                 async move {
                     let meta = match result {
                         Ok(m) => m,
@@ -515,7 +527,11 @@ impl ContentStore {
                         }
                     };
                     let seq_str = meta.location.filename().unwrap_or_default().to_string();
-                    let result = store.delete(&meta.location).await;
+                    let Some(target) = glidefs_kernels::purge_gate::purge_gate(&db, meta.location.as_ref()) else {
+                        tracing::error!(key = %meta.location, "purge refused a snapshot that is a pack's key");
+                        return;
+                    };
+                    let result = store.delete(&ObjectPath::from(target.key())).await;
                     if let Some(cb) = &cb {
                         match &result {
                             Ok(_) => cb.record_success(),
@@ -1096,6 +1112,64 @@ mod tests {
         ContentStore::new(object_store, base_path)
     }
 
+    /// A purge deletes no pack (`glidefs_kernels::purge_gate::thm_the_keys_a_purge_deletes_are_not_packs`): the keys `ContentStore` writes a pack
+    /// under are the keys the gate refuses, and purging a disk leaves its pool's packs in the store.
+    #[tokio::test]
+    async fn a_purge_leaves_every_pack_in_the_store() {
+        use futures::TryStreamExt;
+        let object_store = Arc::new(InMemory::new());
+        let store = ContentStore::new(Arc::clone(&object_store) as Arc<dyn ObjectStore>, "db/exports/vol");
+        store.put_chunk_pack(3, 0xab, vec![1, 2, 3]).await.unwrap();
+        store.put_manifest("vol", b"m".to_vec(), None).await.unwrap();
+        store.put_snapshot("vol", 7, b"s".to_vec()).await.unwrap();
+        store.put_snapshot_owner("vol", "cap-a", 7).await.unwrap();
+        let keys: Vec<String> =
+            object_store.list(None).map_ok(|m| m.location.to_string()).try_collect().await.unwrap();
+        let packs: Vec<&String> = keys.iter().filter(|k| k.ends_with(".pack")).collect();
+        assert_eq!(packs.len(), 1);
+        assert!(glidefs_kernels::purge_gate::purge_gate("db", packs[0]).is_none(), "the gate must refuse a pack's key");
+        store.delete_manifest("db", "vol").await.unwrap();
+        store.delete_all_snapshots("db", "vol").await.unwrap();
+        let after: Vec<String> =
+            object_store.list(None).map_ok(|m| m.location.to_string()).try_collect().await.unwrap();
+        assert_eq!(after, vec![packs[0].clone()], "only the pack is left");
+    }
+
+    /// Every deleter a purge reaches passes each key through `purge_gate` before the delete, and `purge_s3_state` reaches nothing else. A
+    /// delete without its gate, a fifth step in `purge_s3_state` or a direct store call there turns this red.
+    #[test]
+    fn purge_gate_structure() {
+        fn body<'a>(src: &'a str, head: &str) -> &'a str {
+            let start = src.find(head).unwrap_or_else(|| panic!("no {head}"));
+            let rest = &src[start..];
+            &rest[..rest.find("\n    }\n").unwrap_or_else(|| panic!("no end of {head}"))]
+        }
+        let router = include_str!("router.rs");
+        let purge = body(router, "async fn purge_s3_state");
+        for call in [".delete_manifest(", ".delete_all_snapshots(", ".delete_snapshot_index_entries(", ".delete_export_definition("] {
+            assert!(purge.contains(call), "purge_s3_state must call {call}");
+        }
+        assert!(!purge.contains("object_store") && !purge.contains(".delete(") && !purge.contains("chunk"), "purge_s3_state reaches only the gated deleters");
+        let store = include_str!("content_store.rs");
+        let deleters = [
+            body(store, "pub async fn delete_manifest("),
+            body(store, "pub async fn delete_all_snapshots("),
+            body(router, "async fn delete_snapshot_index_entries("),
+            body(router, "async fn delete_export_definition("),
+        ];
+        for d in deleters {
+            let deletes = d.matches(".delete(").count();
+            assert_eq!(d.matches("purge_gate(").count(), deletes, "each delete has its gate: {d}");
+            assert!(d.find("purge_gate(").unwrap() < d.find(".delete(").unwrap(), "the gate comes before the delete");
+            assert!(d.matches("target.key()").count() >= deletes, "a delete's path comes from the gate's target");
+            assert!(!d.contains("delete(&meta.location)"), "a delete takes the gate's target, not the listed location");
+        }
+        // `PurgeTarget` has one mint.
+        let gate = include_str!("../../../kernels/src/purge_gate.rs");
+        assert_eq!(gate.matches("PurgeTarget {").count(), 3, "the struct, its impl and the one mint in purge_gate");
+        assert!(!gate.contains("derive(") || !gate[gate.find("pub struct PurgeTarget").unwrap() - 40..gate.find("pub struct PurgeTarget").unwrap()].contains("derive"));
+    }
+
     #[tokio::test]
     async fn test_put_get_manifest() {
         let store = test_store("test-bucket");
@@ -1129,7 +1203,7 @@ mod tests {
 
         // First delete succeeds
         store
-            .delete_manifest(name)
+            .delete_manifest("test", name)
             .await
             .expect("delete should succeed");
 
@@ -1138,7 +1212,7 @@ mod tests {
 
         // Second delete is idempotent (NotFound is Ok)
         store
-            .delete_manifest(name)
+            .delete_manifest("test", name)
             .await
             .expect("delete of missing manifest should succeed");
     }
