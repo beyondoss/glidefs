@@ -11,6 +11,7 @@
 //! * [`drained`]: a successful drain pass is the last when it claimed no block and left none dirty or syncing.
 //! * [`remaining_after_drain`]: what the detach still owes once the loop ended: nothing only after a `Done` drain with the final manifest sync
 //!   held, or when a newer fence token owns the volume and nothing is dirty (the superseded writer's blocks were never committed).
+//! * [`leaves_the_map`]: the export leaves the router's map only when nothing is owed, so a failed detach is retried against the same export.
 //! * [`detach_reported`]: the detach is reported only with nothing owed.
 //!
 //! [`thm_a_reported_detach_has_flushed_every_dirty_block`] states them together. A purge (`?purge=true`) is a delete, not a detach: it throws
@@ -18,7 +19,7 @@
 //!
 //! Mutations (`scripts/verify-kernels.sh --features <m>` must go red): `mut_detach_reports_before_flush` (an unfinished drain owes nothing),
 //! `mut_drained_ignores_syncing` (a pass with blocks still syncing ends the drain), `mut_detach_ignores_the_final_sync` (a failed final manifest
-//! sync owes nothing).
+//! sync owes nothing), `mut_export_leaves_before_the_final_sync` (the export leaves the map before the final sync held).
 
 use vstd::prelude::*;
 
@@ -84,6 +85,19 @@ pub fn remaining_after_drain(end: DrainEnd, dirty_now: u64, syncing_now: u64, fi
             }
         },
     }
+}
+
+/// Whether the export may leave the router's map. It leaves only when nothing is owed, final manifest sync included: before that, a retry of
+/// the detach (or a restart, which re-opens the export from its device map and WAL) finds it and resumes the owed flush and sync.
+pub fn leaves_the_map(end: DrainEnd, dirty_now: u64, syncing_now: u64, final_sync_ok: bool) -> (leaves: bool)
+    ensures
+        leaves == (remaining_spec(end, dirty_now, syncing_now, final_sync_ok) == 0),
+{
+    // `mut_export_leaves_before_the_final_sync`: a clean drain frees the export without waiting for the final manifest sync.
+    if cfg!(feature = "mut_export_leaves_before_the_final_sync") && end == DrainEnd::Done {
+        return true;
+    }
+    remaining_after_drain(end, dirty_now, syncing_now, final_sync_ok) == 0
 }
 
 /// A detach is reported only with nothing owed.

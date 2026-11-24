@@ -3742,8 +3742,11 @@ impl ExportRouter {
             });
             if let Some((cache, content_store, pack_index_cache, volume_manifest, metrics)) = parts {
                 let end = Self::drain_until_clean(name, &cache, &content_store, &pack_index_cache, &volume_manifest, &metrics).await;
-                if end == crate::block::detach::DrainEnd::Exhausted {
-                    let remaining = crate::block::detach::remaining_after_drain(end, cache.dirty_block_count(), cache.syncing_block_count(), true);
+                // The final manifest sync is part of the gate: the export leaves the map only when nothing is owed (`detach::leaves_the_map`).
+                let final_sync_ok = end == crate::block::detach::DrainEnd::Fenced || cache.sync_manifest(&content_store, &volume_manifest).await.is_ok();
+                let (dirty, syncing) = (cache.dirty_block_count(), cache.syncing_block_count());
+                if !crate::block::detach::leaves_the_map(end, dirty, syncing, final_sync_ok) {
+                    let remaining = crate::block::detach::remaining_after_drain(end, dirty, syncing, final_sync_ok);
                     return Err(RouterError::DrainIncomplete { name: name.to_string(), remaining, iterations: MAX_DRAIN_ITERATIONS });
                 }
             }
@@ -6799,6 +6802,9 @@ mod tests {
     struct ManifestFailingStore {
         inner: object_store::memory::InMemory,
         fail_manifest: std::sync::atomic::AtomicBool,
+        /// Manifest PUTs seen so far (attempts, failed or not), and the 1-based count from which they fail (`usize::MAX`: never).
+        manifest_puts: std::sync::atomic::AtomicUsize,
+        fail_from: std::sync::atomic::AtomicUsize,
     }
 
     impl std::fmt::Display for ManifestFailingStore {
@@ -6815,7 +6821,9 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            if self.fail_manifest.load(Ordering::SeqCst) && location.as_ref().contains("manifests/") {
+            let is_manifest = location.as_ref().contains("manifests/");
+            let nth = if is_manifest { self.manifest_puts.fetch_add(1, Ordering::SeqCst) + 1 } else { 0 };
+            if is_manifest && (self.fail_manifest.load(Ordering::SeqCst) || nth >= self.fail_from.load(Ordering::SeqCst)) {
                 return Err(object_store::Error::Generic {
                     store: "ManifestFailingStore",
                     source: Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "simulated manifest PUT outage")),
@@ -6858,6 +6866,8 @@ mod tests {
         let store = Arc::new(ManifestFailingStore {
             inner: object_store::memory::InMemory::new(),
             fail_manifest: std::sync::atomic::AtomicBool::new(false),
+            manifest_puts: std::sync::atomic::AtomicUsize::new(0),
+            fail_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
         });
         let mk = |dir: &TempDir, store: Arc<dyn ObjectStore>| {
             let cfg = RouterConfig {
@@ -6906,5 +6916,60 @@ mod tests {
         let h = other.get_handler("durable").await.unwrap();
         let got = h.read(0, 4096).await.unwrap();
         assert_eq!(&got[..4], &[0xAB; 4], "the written block is in the store for the next attach");
+    }
+
+    /// A clean drain pass, then the FINAL manifest sync fails: the detach is not reported, the export is still in the map, and the retry
+    /// resumes it and is reported (P.volume.a-glidefs-detach-flushes-the-device-to-the-store; Verus: `detach_kernel::leaves_the_map`).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_final_sync_keeps_the_export_for_the_retry() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(ManifestFailingStore {
+            inner: object_store::memory::InMemory::new(),
+            fail_manifest: std::sync::atomic::AtomicBool::new(false),
+            manifest_puts: std::sync::atomic::AtomicUsize::new(0),
+            fail_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        let cfg = RouterConfig {
+            object_store: store.clone(),
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+            ublk_nr_queues: 1,
+            ublk_max_devices: None,
+            nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
+        };
+        let router = ExportRouter::new(cfg).await.unwrap();
+        // Probe: how many manifest PUTs one clean detach of one written block makes (the last is the final sync).
+        router.create_export(test_export_config("probe"), false, None, None).await.unwrap();
+        router.get_handler("probe").await.unwrap().write(0, &[0x11; 128 * 1024], false).await.unwrap();
+        let before = store.manifest_puts.load(Ordering::SeqCst);
+        router.remove_export("probe", false).await.unwrap();
+        let per_detach = store.manifest_puts.load(Ordering::SeqCst) - before;
+        assert!(per_detach >= 2, "a detach drains and then syncs: {per_detach} manifest PUTs");
+
+        router.create_export(test_export_config("durable"), false, None, None).await.unwrap();
+        router.get_handler("durable").await.unwrap().write(0, &[0xCD; 128 * 1024], false).await.unwrap();
+        // A detach's manifest PUTs: the drain's, the gate's final sync, then the teardown's own pass and sync (two). Everything passes except the
+        // gate's final sync, the third from the end, and what follows it.
+        assert!(per_detach >= 4, "{per_detach} manifest PUTs per detach");
+        let start = store.manifest_puts.load(Ordering::SeqCst);
+        store.fail_from.store(start + per_detach - 2, Ordering::SeqCst);
+        let first = router.remove_export("durable", false).await;
+        assert!(first.is_err(), "the final manifest sync failed, so the detach must not be reported: {first:?}");
+        assert!(router.get_export_info("durable").await.is_some(), "the export stays in the map so the retry finds it");
+
+        store.fail_from.store(usize::MAX, Ordering::SeqCst);
+        let again = router.remove_export("durable", false).await;
+        assert!(again.is_ok(), "the retry resumes the owed sync and is reported: {again:?}");
+        assert!(router.get_export_info("durable").await.is_none());
     }
 }
