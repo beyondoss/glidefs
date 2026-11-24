@@ -2,6 +2,7 @@
 //! `vstd` only (`tests/dependencies.rs` checks it), so Verus can verify it where it cannot verify `glidefs`. The proofs live
 //! in each module's `verus!` block and `scripts/verify-kernels.sh` checks them.
 
+pub mod detach_kernel;
 pub mod fence_kernel;
 pub mod seq_counter;
 pub mod snapshot_owner;

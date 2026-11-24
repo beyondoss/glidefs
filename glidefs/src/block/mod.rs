@@ -5,6 +5,7 @@ pub mod cache;
 #[allow(unsafe_code)] // libc::statvfs FFI
 pub mod capacity_monitor;
 pub mod error;
+pub mod detach;
 pub mod fence;
 pub mod flush_scheduler;
 pub mod foyer_engine;
