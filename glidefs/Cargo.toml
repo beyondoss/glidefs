@@ -16,6 +16,7 @@ default = []
 # Mutations of the snapshot-owner decisions: glidefs-kernels' (forwarded) and the retry check's place.
 # `mut_owner_check_outside_lock` must fail `test_concurrent_owned_cuts_answer_one_sequence`.
 mut_list_ignores_owner = ["glidefs-kernels/mut_list_ignores_owner"]
+mut_count_by_deltas = ["glidefs-kernels/mut_count_by_deltas"]
 mut_retry_answers_bare_marker = ["glidefs-kernels/mut_retry_answers_bare_marker"]
 mut_retry_answers_lowest = ["glidefs-kernels/mut_retry_answers_lowest"]
 mut_counter_wraps = ["glidefs-kernels/mut_counter_wraps"]

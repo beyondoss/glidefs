@@ -76,6 +76,9 @@ mut_keep_omits_clock_skew = []
 # The purge gate admits every key, a pack's included: Verus red on `purge_gate::not_a_pack`.
 mut_purge_gate_admits_packs = []
 
+# The recovered counters are the deltas of the load, not the final phases: Verus red on `block_counters::recount`; glidefs `block::write_cache::tests::a_restart_counts_the_dirty_blocks_the_metadata_holds`.
+mut_count_by_deltas = []
+
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
 vstd = "=0.0.0-2026-11-01-0251"
