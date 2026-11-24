@@ -57,6 +57,8 @@ mut_write_keeps_syncing = []
 
 # An export whose definition is saved is kept whether or not its device is registered: Verus red on `attach_kernel::attach_fate`.
 mut_attach_keeps_deviceless = []
+# A registration still running when the attach is dropped counts as registered at the guard's decision: Verus red on `attach_kernel::lemma_every_registration_event_keeps_the_invariant`.
+mut_drop_counts_inflight_registration = []
 
 # A named pack past its grace period is reclaimed; only snapshots name a pack: Verus red on `pack_liveness::pack_verdict`.
 mut_gc_reclaims_named = []
@@ -64,6 +66,15 @@ mut_gc_ignores_manifests = []
 
 # A stranded SYNCING block (flush and SSD copy both failed) is marked NOT_PRESENT: Verus red on `flush_kernel::step`.
 mut_stranded_marked_absent = []
+
+# A step of an owned cut is enabled without its hold of the export's flush lock: Verus red on `cut_hold::lemma_every_event_keeps_the_invariant`.
+mut_cut_steps_skip_the_lock = []
+
+# The closed marker's keep age leaves out the clock skew of reading S3's `last_modified` against GlideFS's clock: Verus red on `snapshot_owner::a_removed_closed_marker_has_no_late_cut_to_stop`.
+mut_keep_omits_clock_skew = []
+
+# The purge gate admits every key, a pack's included: Verus red on `purge_gate::not_a_pack`.
+mut_purge_gate_admits_packs = []
 
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.

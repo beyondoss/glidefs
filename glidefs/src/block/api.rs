@@ -593,11 +593,21 @@ async fn create_or_attach_volume(
             // Persist the index entry and register the device concurrently.
             // save_export MUST succeed; register_device must succeed for a transport that exists only as its device.
             let t_io = Instant::now();
+            // A registration still running when the client goes away is not cancelled with this future (the device is made by blocking
+            // work): `registering` tells the guard's drop, which never counts it as a device (`attach_kernel::drop_fate`).
+            #[cfg(target_os = "linux")]
+            {
+                attach.registering = true;
+            }
             #[cfg(target_os = "linux")]
             let (save_result, register_result) = tokio::join!(
                 router.save_export(&effective),
                 router.register_device(name, &transport),
             );
+            #[cfg(target_os = "linux")]
+            {
+                attach.registering = false;
+            }
             #[cfg(not(target_os = "linux"))]
             let save_result = router.save_export(&effective).await;
             attach.saved = save_result.is_ok();
@@ -680,6 +690,8 @@ struct AttachGuard {
     needs_device: bool,
     registered: bool,
     saved: bool,
+    /// `register_device` is in flight (set before the join, cleared after it): true at a drop means the registration was cut off.
+    registering: bool,
     finished: bool,
 }
 
@@ -692,6 +704,7 @@ impl AttachGuard {
             needs_device,
             registered: false,
             saved: false,
+            registering: false,
             finished: false,
         }
     }
@@ -707,7 +720,7 @@ impl Drop for AttachGuard {
         if self.finished {
             return;
         }
-        if attach_kernel::attach_fate(self.needs_device, self.registered, self.saved) == attach_kernel::Fate::Keep {
+        if attach_kernel::drop_fate(self.needs_device, self.registered, self.saved, self.registering) == attach_kernel::Fate::Keep {
             return;
         }
         warn!(export = %self.name, "attach interrupted before it was whole; tearing the export down");
@@ -1805,6 +1818,24 @@ impl ApiServer {
 
 #[cfg(test)]
 mod tests {
+    /// A registration still running when the attach is dropped is not a device (`attach_kernel::drop_fate`,
+    /// `thm_a_registration_running_when_the_attach_is_dropped_leaves_no_export_without_a_device`): the guard's drop asks `drop_fate` (never
+    /// `attach_fate` alone), the handler sets `registering` before the join and clears it after, and sets `registered` only from the join's
+    /// result, after it.
+    #[test]
+    fn the_guard_never_counts_a_running_registration() {
+        let src = include_str!("api.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("tests module")];
+        let drop_impl = &prod[prod.find("impl Drop for AttachGuard").expect("Drop")..];
+        assert!(drop_impl.contains("attach_kernel::drop_fate(self.needs_device, self.registered, self.saved, self.registering)"));
+        assert!(!drop_impl[..drop_impl.find("\n}\n").unwrap()].contains("attach_kernel::attach_fate("));
+        let set = prod.find("attach.registering = true;").expect("registering set");
+        let join = prod.find("tokio::join!(").expect("join");
+        let clear = prod.find("attach.registering = false;").expect("registering cleared");
+        let registered = prod.find("attach.registered = register_result.is_ok();").expect("registered set");
+        assert!(set < join && join < clear && clear < registered, "registering brackets the join; registered is set after it");
+    }
+
     use super::*;
     use crate::block::cache::SimpleBlockCache;
     use crate::block::router::RouterConfig;

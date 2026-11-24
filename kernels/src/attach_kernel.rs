@@ -9,8 +9,15 @@
 //! * [`thm_an_interrupted_attach_leaves_no_export_without_a_device`]: whatever step the client went away at, the export that remains has its
 //!   block device, or the attach was unwound and no export remains.
 //!
-//! Mutation (`scripts/verify-kernels.sh --features mut_attach_keeps_deviceless` must go red): an export whose definition is saved is kept
-//! whether or not its device is registered.
+//! * [`drop_fate`]: the same decision at the guard's drop, where a `register_device` may still be running (the join was cancelled): a
+//!   registration in flight is not a registered device, so it never makes an export `Keep`.
+//! * [`thm_a_registration_running_when_the_attach_is_dropped_leaves_no_export_without_a_device`]: the model with the registration as a step that
+//!   can finish (or fail) after the client went away and after the spawned teardown: once the attach ended and its teardown ran, an export
+//!   that needs its device and remains in the map has it.
+//!
+//! Mutations (`scripts/verify-kernels.sh --features mut_x` must go red): `mut_attach_keeps_deviceless` (an export whose definition is saved
+//! is kept whether or not its device is registered), `mut_drop_counts_inflight_registration` (a registration still running counts as registered
+//! when the guard decides).
 
 use vstd::prelude::*;
 
@@ -151,6 +158,160 @@ pub proof fn thm_a_pending_unwind_always_runs(needs_device: bool, a: Attach)
         enabled(a, AEvent::Cleanup),
         !astep(needs_device, a, AEvent::Cleanup).in_map,
         !astep(needs_device, a, AEvent::Cleanup).pending,
+{
+}
+
+
+// ---- A registration still running when the attach is dropped ----
+
+/// What the guard's drop decides: the export's fate from what the attach had completed. `registering` (a `register_device` is in flight, its
+/// future dropped with the attach) is not part of it: a registration that has not completed is no device, and it may still fail.
+#[cfg(not(feature = "mut_drop_counts_inflight_registration"))]
+pub open spec fn drop_fate_spec(needs_device: bool, registered: bool, saved: bool, registering: bool) -> Fate {
+    fate_spec(needs_device, registered, saved)
+}
+
+/// Mutation: a registration still running counts as registered.
+#[cfg(feature = "mut_drop_counts_inflight_registration")]
+pub open spec fn drop_fate_spec(needs_device: bool, registered: bool, saved: bool, registering: bool) -> Fate {
+    fate_spec(needs_device, registered || registering, saved)
+}
+
+#[cfg(not(feature = "mut_drop_counts_inflight_registration"))]
+pub fn drop_fate(needs_device: bool, registered: bool, saved: bool, registering: bool) -> (f: Fate)
+    ensures
+        f == drop_fate_spec(needs_device, registered, saved, registering),
+{
+    attach_fate(needs_device, registered, saved)
+}
+
+#[cfg(feature = "mut_drop_counts_inflight_registration")]
+pub fn drop_fate(needs_device: bool, registered: bool, saved: bool, registering: bool) -> (f: Fate)
+    ensures
+        f == drop_fate_spec(needs_device, registered, saved, registering),
+{
+    if saved && (!needs_device || registered || registering) { Fate::Keep } else { Fate::Unwind }
+}
+
+/// The attach with its registration as a step of its own. `registered` is the guard's flag (set when the join returns with the registration
+/// done); `device` is the kernel device existing now. A registration still in flight (`registering`) when the client goes away is not
+/// cancelled with the future: it finishes or fails later (`LateRegisterDone`), before or after the spawned teardown.
+pub struct RAttach {
+    pub in_map: bool,
+    pub registering: bool,
+    pub registered: bool,
+    pub device: bool,
+    pub saved: bool,
+    pub over: bool,
+    pub pending: bool,
+}
+
+pub enum REvent {
+    Create,
+    Save,
+    /// `register_device` started (the join's other arm).
+    StartRegister,
+    /// The registration finished while the handler still ran: on success the device exists and the guard's flag is set.
+    RegisterDone { ok: bool },
+    /// The handler reached its end after its registration returned: `Unwind` tears the export and its device down before it answers.
+    Finish,
+    /// The client went away (the future is dropped, a registration possibly still running): the guard asks [`drop_fate`].
+    ClientGone,
+    /// The spawned teardown ran: it removes the export and the device that exists now.
+    Cleanup,
+    /// A registration still running when the client went away finished (`ok`) or failed, after the guard decided.
+    LateRegisterDone { ok: bool },
+}
+
+pub open spec fn renabled(a: RAttach, e: REvent) -> bool {
+    match e {
+        REvent::Create => !a.in_map && !a.over,
+        REvent::Save => a.in_map && !a.over,
+        REvent::StartRegister => a.in_map && !a.over && !a.registering && !a.registered,
+        REvent::RegisterDone { .. } => a.registering && !a.over,
+        REvent::Finish => a.in_map && !a.over && !a.registering,
+        REvent::ClientGone => a.in_map && !a.over,
+        REvent::Cleanup => a.pending,
+        REvent::LateRegisterDone { .. } => a.registering && a.over,
+    }
+}
+
+pub open spec fn rstep(needs_device: bool, a: RAttach, e: REvent) -> RAttach {
+    let fate = drop_fate_spec(needs_device, a.registered, a.saved, a.registering);
+    match e {
+        REvent::Create => RAttach { in_map: true, ..a },
+        REvent::Save => RAttach { saved: true, ..a },
+        REvent::StartRegister => RAttach { registering: true, ..a },
+        REvent::RegisterDone { ok } => RAttach {
+            registering: false,
+            registered: ok || a.registered,
+            device: ok || a.device,
+            ..a
+        },
+        REvent::Finish => match fate {
+            Fate::Keep => RAttach { over: true, ..a },
+            Fate::Unwind => RAttach { in_map: false, registered: false, device: false, over: true, ..a },
+        },
+        REvent::ClientGone => match fate {
+            Fate::Keep => RAttach { over: true, ..a },
+            Fate::Unwind => RAttach { over: true, pending: true, ..a },
+        },
+        REvent::Cleanup => RAttach { in_map: false, registered: false, device: false, pending: false, ..a },
+        REvent::LateRegisterDone { ok } => RAttach { registering: false, device: ok || a.device, ..a },
+    }
+}
+
+pub open spec fn rstart() -> RAttach {
+    RAttach { in_map: false, registering: false, registered: false, device: false, saved: false, over: false, pending: false }
+}
+
+/// The invariant over every reachable state: the guard's flag means a device exists and no registration is running; an unwind in flight belongs
+/// to an ended attach; a registration running in a live attach is on an export in the map; and once an attach ended with no unwind pending, an
+/// export that remains is saved and, if it needs its device, was registered by the time the guard decided.
+pub open spec fn rinv(needs_device: bool, a: RAttach) -> bool {
+    &&& a.registered ==> (a.device && !a.registering)
+    &&& a.pending ==> a.over
+    &&& (a.registering && !a.over) ==> a.in_map
+    &&& (a.over && !a.pending && a.in_map) ==> (a.saved && (!needs_device || a.registered))
+}
+
+pub proof fn lemma_the_start_is_in_the_registration_invariant(needs_device: bool)
+    ensures
+        rinv(needs_device, rstart()),
+{
+}
+
+pub proof fn lemma_every_registration_event_keeps_the_invariant(needs_device: bool, a: RAttach, e: REvent)
+    requires
+        rinv(needs_device, a),
+        renabled(a, e),
+    ensures
+        rinv(needs_device, rstep(needs_device, a, e)),
+{
+}
+
+/// P.volume.a-device-registration-still-running-when-its-attach-is-dropped-leaves-no-export-without-a-block-device: over every reachable state
+/// (every interleaving of the attach's steps, the client going away at any await point, a registration still running at that moment finishing or
+/// failing before or after the spawned teardown, and the teardown), once the attach has ended and its teardown has run, an export that needs
+/// its block device and remains in the map has it.
+pub proof fn thm_a_registration_running_when_the_attach_is_dropped_leaves_no_export_without_a_device(needs_device: bool, a: RAttach)
+    requires
+        rinv(needs_device, a),
+        a.over,
+        !a.pending,
+    ensures
+        (a.in_map && needs_device) ==> a.device,
+{
+}
+
+/// A registration still running at the drop always finishes the attach's account (`LateRegisterDone` is enabled), and a teardown in flight
+/// always runs.
+pub proof fn thm_a_late_registration_and_a_pending_teardown_always_run(needs_device: bool, a: RAttach)
+    requires
+        rinv(needs_device, a),
+    ensures
+        (a.registering && a.over) ==> renabled(a, REvent::LateRegisterDone { ok: true }) && renabled(a, REvent::LateRegisterDone { ok: false }),
+        a.pending ==> renabled(a, REvent::Cleanup),
 {
 }
 

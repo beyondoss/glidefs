@@ -459,7 +459,7 @@ mod slack_tests {
         let start = flush.find("pub async fn snapshot_owned").expect("snapshot_owned");
         let body = &flush[start..];
         let body = &body[..body.find("pub(crate) async fn owned_cut_answer").expect("end")];
-        for write in ["put_snapshot_owner(", ".put_snapshot("] {
+        for write in ["put_cut_marker(", "put_cut_manifest("] {
             let w = body.find(write).unwrap_or_else(|| panic!("no {write}"));
             let gate = body[..w].rfind("may_write(started)").unwrap_or_else(|| panic!("no gate before {write}"));
             assert!(body[gate..w].lines().count() < 12, "the gate must sit right before {write}");

@@ -1842,6 +1842,7 @@ impl WriteCache<Active> {
     /// nothing.
     pub(crate) async fn flush_until_no_skips(
         &self,
+        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
@@ -1890,8 +1891,9 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
+        let hold = glidefs_kernels::cut_hold::CutHold::under(&_flush_guard);
         let (stats, _seq_cutpoint) = self
-            .flush_until_no_skips(content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
+            .flush_until_no_skips(&hold, content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
             .await?;
         if stats.packs_uploaded == 0 {
             // No packs uploaded → atomic flush skipped its internal sync.
@@ -2001,13 +2003,16 @@ impl WriteCache<Active> {
         started: std::time::Instant,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
+        // The cut's one hold of the lock: its owner check, flush, marker and manifest each take it (`glidefs_kernels::cut_hold`: cuts of an
+        // export never interleave).
+        let hold = glidefs_kernels::cut_hold::CutHold::under(&_flush_guard);
 
         // A retry of an owned cut answers the sequence the first one persisted. Decided under the flush lock, so a
         // retry that overlaps its still-running first cut waits for it and then answers it, never cuts a second.
         // (`glidefs_kernels::snapshot_owner`: `a_retried_cut_returns_the_same_sequence`.)
         #[cfg(not(feature = "mut_owner_check_outside_lock"))]
         if let Some(owner) = owner {
-            let view = self.owned_cut_view(content_store, owner).await?;
+            let view = self.owned_cut_view(&hold, content_store, owner).await?;
             let closed = content_store.owner_closed(&self.inner.export_name, owner).await?;
             match glidefs_kernels::snapshot_owner::owned_cut_plan(&view, closed) {
                 glidefs_kernels::snapshot_owner::CutDecision::Answer(sequence) => {
@@ -2028,7 +2033,7 @@ impl WriteCache<Active> {
         }
 
         let (stats, seq_cutpoint) = self
-            .flush_until_no_skips(content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
+            .flush_until_no_skips(&hold, content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize()?;
@@ -2048,9 +2053,7 @@ impl WriteCache<Active> {
             return Err(CacheError::OwnedCutExpired);
         }
         if let Some(owner) = owner {
-            content_store
-                .put_snapshot_owner(&self.inner.export_name, owner, seq_cutpoint)
-                .await?;
+            self.put_cut_marker(&hold, content_store, owner, seq_cutpoint).await?;
         }
         if !may_write(started) {
             return Err(CacheError::OwnedCutExpired);
@@ -2062,10 +2065,7 @@ impl WriteCache<Active> {
                 if !may_write(started) {
                     return Err(CacheError::OwnedCutExpired);
                 }
-                match content_store
-                    .put_snapshot(&self.inner.export_name, seq_cutpoint, manifest_bytes.clone())
-                    .await
-                {
+                match self.put_cut_manifest(&hold, content_store, seq_cutpoint, manifest_bytes.clone()).await {
                     Ok(_) => {
                         persisted = true;
                         break;
@@ -2119,6 +2119,7 @@ impl WriteCache<Active> {
     /// What `owner` cut of this export: one entry per owner marker, with whether its manifest exists.
     pub(crate) async fn owned_cut_view(
         &self,
+        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,
         content_store: &ContentStore,
         owner: &str,
     ) -> Result<Vec<(u64, bool)>, CacheError> {
@@ -2130,13 +2131,39 @@ impl WriteCache<Active> {
         Ok(owned)
     }
 
-    /// The sequence `owner` already cut of this export, if any: the highest owner marker that has a manifest.
+    /// A cut's marker write: the only caller of `ContentStore::put_snapshot_owner`, and only with the cut's hold of the flush lock.
+    async fn put_cut_marker(
+        &self,
+        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,
+        content_store: &ContentStore,
+        owner: &str,
+        sequence: u64,
+    ) -> Result<(), CacheError> {
+        content_store.put_snapshot_owner(&self.inner.export_name, owner, sequence).await?;
+        Ok(())
+    }
+
+    /// A cut's manifest write: the only caller of `ContentStore::put_snapshot` outside tests and the collector's fixtures, and only with the
+    /// cut's hold of the flush lock.
+    async fn put_cut_manifest(
+        &self,
+        _hold: &glidefs_kernels::cut_hold::CutHold<'_>,
+        content_store: &ContentStore,
+        sequence: u64,
+        manifest_bytes: Vec<u8>,
+    ) -> Result<(), crate::block::content_store::ContentStoreError> {
+        content_store.put_snapshot(&self.inner.export_name, sequence, manifest_bytes).await.map(|_| ())
+    }
+
+    /// The sequence `owner` already cut of this export, if any: the highest owner marker that has a manifest. Only the
+    /// `mut_owner_check_outside_lock` mutation calls it (outside the lock, with a false hold): the proof's red.
+    #[cfg(feature = "mut_owner_check_outside_lock")]
     pub(crate) async fn owned_cut_answer(
         &self,
         content_store: &ContentStore,
         owner: &str,
     ) -> Result<Option<u64>, CacheError> {
-        let owned = self.owned_cut_view(content_store, owner).await?;
+        let owned = self.owned_cut_view(&glidefs_kernels::cut_hold::CutHold::under(&()), content_store, owner).await?;
         Ok(glidefs_kernels::snapshot_owner::retry_answer(&owned))
     }
 }
