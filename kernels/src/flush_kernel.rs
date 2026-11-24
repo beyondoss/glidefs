@@ -20,6 +20,7 @@
 //! manifest names it), `mut_write_keeps_syncing` (a write to a SYNCING block leaves it SYNCING, so the eviction drops the newer content),
 //! `mut_stranded_marked_absent` (a claimed block whose flush and SSD copy both failed is marked NOT_PRESENT: the guest's write is dropped).
 
+#[cfg(verus_only)]
 use crate::detach_kernel::drained_spec;
 use vstd::prelude::*;
 
