@@ -1,14 +1,12 @@
 //! Which packs of a store a disk's deletion and the garbage collector may take, as pure functions proven with Verus, called verbatim by
-//! `glidefs`'s `cli::gc::reconcile_prefix` (the verdict on every pack no live manifest names) and `ExportRouter::purge_s3_state` (the steps
-//! of a disk's purge).
+//! `glidefs`'s `cli::gc::reconcile_prefix` (the verdict on every pack no live manifest names) and the collector is the only deleter of a pack: a disk's purge (`ExportRouter::purge_s3_state`)
+//! deletes its manifest, snapshots, snapshot index and definition and no pack, which the model's `Purge` event states.
 //!
 //! A disk forked from a snapshot disk copies the snapshot disk's manifest and puts it in the store before it serves a read
 //! (`ExportRouter::create_export`): the packs the child names are named by the child's own manifest, whatever becomes of the snapshot disk.
-//! A purge removes the disk's own manifest, snapshots, snapshot index and definition ([`PurgeStep`]) and no pack. The only deleter of a pack
-//! is the collector, and [`pack_verdict`] reclaims only a pack no manifest and no snapshot names.
+//! The only deleter of a pack is the collector, and [`pack_verdict`] reclaims only a pack no manifest and no snapshot names.
 //!
 //! * [`pack_verdict`]: `Keep` for a pack any live manifest or snapshot names; otherwise `Reclaim` once the grace period has elapsed, else `Wait`.
-//! * [`purge_plan`]: the four object kinds a purge deletes, the definition last (it is the retry handle).
 //! * [`thm_a_snapshot_child_disk_does_not_depend_on_its_snapshot_disk`]: the disk forked from a snapshot disk keeps every pack it names in the
 //!   store after the snapshot disk is purged and the collector then runs, however often.
 //!
@@ -71,23 +69,6 @@ pub fn pack_verdict(in_manifest: bool, in_snapshot: bool, grace_elapsed: bool) -
     }
 }
 
-/// What a purge deletes of one disk. There is no step for a pack: packs are shared by every disk forked from the same pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PurgeStep {
-    Manifest,
-    Snapshots,
-    SnapshotIndex,
-    /// The export definition, last: a purge that fails part-way leaves it, the retry handle.
-    Definition,
-}
-
-pub fn purge_plan() -> (plan: [PurgeStep; 4])
-    ensures
-        plan@ == seq![PurgeStep::Manifest, PurgeStep::Snapshots, PurgeStep::SnapshotIndex, PurgeStep::Definition],
-{
-    [PurgeStep::Manifest, PurgeStep::Snapshots, PurgeStep::SnapshotIndex, PurgeStep::Definition]
-}
-
 // ---- The model the kernels are proven against: one pool of packs and its disks ----
 
 /// A pool: the packs in the store, and each live disk's manifest (the packs it names).
@@ -104,7 +85,7 @@ pub open spec fn named(pool: Pool, p: int) -> bool {
 pub enum PEvent {
     /// `child` is created from the disk `parent`'s manifest (a snapshot disk's), the manifest in the store before the child serves.
     Fork { parent: int, child: int },
-    /// `disk` is purged: its manifest (and snapshots) leave; the plan has no pack step.
+    /// `disk` is purged: its manifest (and snapshots) leave; no pack does.
     Purge { disk: int },
     /// The collector ran: it reclaims the packs it judged `Reclaim`, `grace_elapsed` deciding which of the unnamed.
     Gc { grace_elapsed: spec_fn(int) -> bool },

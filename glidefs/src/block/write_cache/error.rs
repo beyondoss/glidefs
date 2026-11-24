@@ -52,6 +52,11 @@ pub enum CacheError {
     #[error("flush skipped {crc_mismatched} block(s) that failed their CRC check; not publishing")]
     FlushSkippedBlocks { crc_mismatched: usize },
 
+    /// A flush failed and its claimed blocks could not be copied back from the flushing file: they stay SYNCING in it and the next flush
+    /// retries (`flush_kernel::Event::Stranded`). Nothing was dropped.
+    #[error("flush failed; {blocks} claimed block(s) could not be copied back and stay in the flushing file")]
+    FlushStranded { blocks: usize },
+
     #[error("Block evicted during flush — retry with backfill")]
     BlockEvicted,
 

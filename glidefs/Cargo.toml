@@ -33,6 +33,7 @@ mut_write_keeps_syncing = ["glidefs-kernels/mut_write_keeps_syncing"]
 mut_attach_keeps_deviceless = ["glidefs-kernels/mut_attach_keeps_deviceless"]
 mut_gc_reclaims_named = ["glidefs-kernels/mut_gc_reclaims_named"]
 mut_gc_ignores_manifests = ["glidefs-kernels/mut_gc_ignores_manifests"]
+mut_stranded_marked_absent = ["glidefs-kernels/mut_stranded_marked_absent"]
 mut_owner_check_outside_lock = []
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests

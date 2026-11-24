@@ -17,7 +17,8 @@
 //!   last write; after a deep sleep the wake on any node reads the same.
 //!
 //! Mutations (`scripts/verify-kernels.sh --features mut_x` must go red): `mut_evict_uncovered` (a SYNCING block is evicted whether or not the
-//! manifest names it), `mut_write_keeps_syncing` (a write to a SYNCING block leaves it SYNCING, so the eviction drops the newer content).
+//! manifest names it), `mut_write_keeps_syncing` (a write to a SYNCING block leaves it SYNCING, so the eviction drops the newer content),
+//! `mut_stranded_marked_absent` (a claimed block whose flush and SSD copy both failed is marked NOT_PRESENT: the guest's write is dropped).
 
 use vstd::prelude::*;
 
@@ -48,6 +49,8 @@ pub enum Event {
     Requeue,
     /// A clean block's local copy is dropped.
     Drop,
+    /// A failed flush could not copy a claimed block back to the SSD: its data is only in the flushing file, so it stays claimed.
+    Stranded,
 }
 
 pub open spec fn step_spec(p: Phase, e: Event) -> Phase {
@@ -57,11 +60,12 @@ pub open spec fn step_spec(p: Phase, e: Event) -> Phase {
         Event::Evict { covered } => if p == Phase::Syncing && covered { Phase::NotPresent } else { p },
         Event::Requeue => if p == Phase::Syncing { Phase::Dirty } else { p },
         Event::Drop => if p == Phase::Clean { Phase::NotPresent } else { p },
+        Event::Stranded => p,
     }
 }
 
 /// The phase of a block after `e`. The only way out of SYNCING toward the store is an `Evict` whose manifest covers the block.
-#[cfg(not(any(feature = "mut_evict_uncovered", feature = "mut_write_keeps_syncing")))]
+#[cfg(not(any(feature = "mut_evict_uncovered", feature = "mut_write_keeps_syncing", feature = "mut_stranded_marked_absent")))]
 pub fn step(p: Phase, e: Event) -> (r: Phase)
     ensures
         r == step_spec(p, e),
@@ -78,12 +82,13 @@ pub fn step(p: Phase, e: Event) -> (r: Phase)
 
 /// Mutations: `mut_evict_uncovered` evicts a SYNCING block whether or not the manifest names it; `mut_write_keeps_syncing` leaves a SYNCING
 /// block SYNCING when the guest writes it (the eviction then drops the newer content).
-#[cfg(any(feature = "mut_evict_uncovered", feature = "mut_write_keeps_syncing"))]
+#[cfg(any(feature = "mut_evict_uncovered", feature = "mut_write_keeps_syncing", feature = "mut_stranded_marked_absent"))]
 pub fn step(p: Phase, e: Event) -> (r: Phase)
     ensures
         r == step_spec(p, e),
 {
     match (e, p) {
+        (Event::Stranded, Phase::Syncing) if cfg!(feature = "mut_stranded_marked_absent") => Phase::NotPresent,
         (Event::Write, Phase::Syncing) if cfg!(feature = "mut_write_keeps_syncing") => Phase::Syncing,
         (Event::Write, _) => Phase::Dirty,
         (Event::Claim, Phase::Dirty) => Phase::Syncing,
@@ -121,6 +126,8 @@ pub enum VEvent {
     /// A read of a block not on the SSD fills it from the store.
     Backfill { b: int },
     Drop { b: int },
+    /// A failed flush could not copy the block back: it stays SYNCING, its data in the flushing file.
+    Strand { b: int },
 }
 
 /// What a read of block `b` returns: the SSD copy if the block is present, else the store's.
@@ -168,6 +175,7 @@ pub open spec fn vstep(v: Vol, e: VEvent) -> Vol {
             ..v
         },
         VEvent::Drop { b } => with_phase(v, b, step_spec((v.phase)(b), Event::Drop)),
+        VEvent::Strand { b } => with_phase(v, b, step_spec((v.phase)(b), Event::Stranded)),
     }
 }
 

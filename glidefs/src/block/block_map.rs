@@ -666,6 +666,24 @@ impl SparseStateMap {
             .is_ok()
     }
 
+    /// A flush failed and this claimed block's data was copied back to the active file: SYNCING → DIRTY (`flush_kernel::Event::Requeue`).
+    #[inline]
+    pub fn requeue_syncing(&self, idx: usize) -> bool {
+        let to = block_phase::next(SparseBlockState::SYNCING, Event::Requeue);
+        to != SparseBlockState::SYNCING && self.cas(idx, SparseBlockState::SYNCING, to).is_ok()
+    }
+
+    /// A flush failed and this claimed block could not be copied back: its data is only in the flushing file, so it stays SYNCING
+    /// (`flush_kernel::Event::Stranded`; `mut_stranded_marked_absent` marks it NOT_PRESENT). Returns whether it is still SYNCING.
+    #[inline]
+    pub fn strand_syncing(&self, idx: usize) -> bool {
+        let to = block_phase::next(SparseBlockState::SYNCING, Event::Stranded);
+        if to != SparseBlockState::SYNCING {
+            let _ = self.cas(idx, SparseBlockState::SYNCING, to);
+        }
+        self.get(idx) == SparseBlockState::SYNCING
+    }
+
     /// Single CAS: SYNCING → what the kernel says an eviction leaves (`flush_kernel::step`): NOT_PRESENT when `covered` (the manifest in the
     /// store names the content the flush uploaded), else the block stays SYNCING and this returns `false`. Every read of an evicted block goes
     /// to the store, so only a covered block may be evicted (`flush_kernel::thm_a_sleep_and_wake_reads_what_the_guest_wrote`).

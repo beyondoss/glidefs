@@ -583,6 +583,10 @@ pub(crate) struct CacheInner {
     pub(super) dirty_block_count: AtomicU64,
     pub(super) syncing_block_count: AtomicU64,
 
+    /// Test-only: blocks whose copy from the flushing file back to the active file fails (an injected SSD fault).
+    #[cfg(test)]
+    pub(super) copy_fault: parking_lot::Mutex<Vec<usize>>,
+
     /// Monotonic sequence counter for WAL replay ordering and snapshot versioning.
     /// Lock-free AtomicU64.
     pub(super) sequence: SequenceNumber,
@@ -1216,6 +1220,18 @@ impl CacheInner {
     pub(super) fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
         if self.state_map.transition_syncing_to_not_present(idx) {
             self.syncing_block_count.fetch_sub(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Give a claimed block back after a failed flush, its data copied to the active file: SYNCING→DIRTY (`flush_kernel::Event::Requeue`).
+    #[inline]
+    pub(super) fn requeue_syncing(&self, idx: usize) -> bool {
+        if self.state_map.requeue_syncing(idx) {
+            self.syncing_block_count.fetch_sub(1, Ordering::Release);
+            self.dirty_block_count.fetch_add(1, Ordering::Release);
             true
         } else {
             false

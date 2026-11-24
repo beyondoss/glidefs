@@ -54,6 +54,9 @@ mut_attach_keeps_deviceless = []
 mut_gc_reclaims_named = []
 mut_gc_ignores_manifests = []
 
+# A stranded SYNCING block (flush and SSD copy both failed) is marked NOT_PRESENT: Verus red on `flush_kernel::step`.
+mut_stranded_marked_absent = []
+
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
 vstd = "=0.0.0-2026-11-01-0251"

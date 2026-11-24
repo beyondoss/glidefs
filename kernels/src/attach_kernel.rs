@@ -46,30 +46,111 @@ pub fn attach_fate(needs_device: bool, registered: bool, saved: bool) -> (f: Fat
     if saved { Fate::Keep } else { Fate::Unwind }
 }
 
-/// The router's export map for the volume being attached.
-pub struct Export {
-    /// An entry for the volume is in the map.
+// ---- The model the kernel is proven against: the handler's real event sequence ----
+
+/// The attach of one volume, from `create_export` on. `over` is set when the handler ended (`Finish`) or the client went away
+/// (`ClientGone`); after it no step of the dropped future runs. `pending` is the unwind `AttachGuard::drop` spawned and has not run yet.
+pub struct Attach {
+    /// An entry for the volume is in the router's map.
     pub in_map: bool,
     /// Its block device is registered.
-    pub has_device: bool,
+    pub registered: bool,
+    /// Its definition (`export.json`) is saved.
+    pub saved: bool,
+    pub over: bool,
+    pub pending: bool,
 }
 
-/// The state the attach ends in when its client goes away with `registered` and `saved` done.
-pub open spec fn after_interruption(needs_device: bool, registered: bool, saved: bool) -> Export {
-    match fate_spec(needs_device, registered, saved) {
-        Fate::Keep => Export { in_map: true, has_device: registered },
-        Fate::Unwind => Export { in_map: false, has_device: false },
+pub enum AEvent {
+    /// `create_export` put the export in the map.
+    Create,
+    /// `save_export` completed (an await point of the `tokio::join!`).
+    Save,
+    /// `register_device` completed (the other arm of the join; either order).
+    Register,
+    /// The handler reached its end: it asks the kernel and, on `Unwind`, tears the export down before it answers.
+    Finish,
+    /// The client went away at this await point (the future is dropped): the guard asks the kernel and, on `Unwind`, spawns the teardown.
+    ClientGone,
+    /// The spawned teardown ran (`cleanup_failed_create`).
+    Cleanup,
+}
+
+pub open spec fn enabled(a: Attach, e: AEvent) -> bool {
+    match e {
+        AEvent::Create => !a.in_map && !a.over,
+        AEvent::Save | AEvent::Register | AEvent::Finish | AEvent::ClientGone => a.in_map && !a.over,
+        AEvent::Cleanup => a.pending,
     }
 }
 
-/// P.volume.an-interrupted-attach-leaves-no-export-without-a-device: a volume attach whose client goes away, at any step, leaves no export
-/// without a block device: an export that needs its device and remains in the map has it.
-pub proof fn thm_an_interrupted_attach_leaves_no_export_without_a_device(needs_device: bool, registered: bool, saved: bool)
+pub open spec fn astep(needs_device: bool, a: Attach, e: AEvent) -> Attach {
+    let fate = fate_spec(needs_device, a.registered, a.saved);
+    match e {
+        AEvent::Create => Attach { in_map: true, ..a },
+        AEvent::Save => Attach { saved: true, ..a },
+        AEvent::Register => Attach { registered: true, ..a },
+        AEvent::Finish => match fate {
+            Fate::Keep => Attach { over: true, ..a },
+            Fate::Unwind => Attach { in_map: false, registered: false, over: true, ..a },
+        },
+        AEvent::ClientGone => match fate {
+            Fate::Keep => Attach { over: true, ..a },
+            Fate::Unwind => Attach { over: true, pending: true, ..a },
+        },
+        AEvent::Cleanup => Attach { in_map: false, registered: false, pending: false, ..a },
+    }
+}
+
+pub open spec fn start() -> Attach {
+    Attach { in_map: false, registered: false, saved: false, over: false, pending: false }
+}
+
+/// The invariant over every reachable state: a device is registered only on an export in the map; an unwind in flight belongs to an ended
+/// attach; and once an attach ended with no unwind pending, an export that remains is saved and, if it needs its device, has it.
+pub open spec fn inv(needs_device: bool, a: Attach) -> bool {
+    &&& a.registered ==> a.in_map
+    &&& a.pending ==> a.over
+    &&& (a.over && !a.pending && a.in_map) ==> (a.saved && (!needs_device || a.registered))
+}
+
+pub proof fn lemma_the_start_is_in_the_invariant(needs_device: bool)
     ensures
-        ({
-            let e = after_interruption(needs_device, registered, saved);
-            e.in_map && needs_device ==> e.has_device
-        }),
+        inv(needs_device, start()),
+{
+}
+
+pub proof fn lemma_every_event_keeps_the_invariant(needs_device: bool, a: Attach, e: AEvent)
+    requires
+        inv(needs_device, a),
+        enabled(a, e),
+    ensures
+        inv(needs_device, astep(needs_device, a, e)),
+{
+}
+
+/// P.volume.an-interrupted-attach-leaves-no-export-without-a-device: a volume attach whose client goes away leaves no export without a block
+/// device. Over every reachable state (the invariant holds from the start through every interleaving of `Save`, `Register`, `ClientGone` at
+/// any await point, `Finish` and the spawned `Cleanup`): once the attach has ended and its unwind (if any) has run, an export that needs its
+/// device and remains in the map has it registered. And an unwind in flight can always run (`Cleanup` is enabled), after which none remains.
+pub proof fn thm_an_interrupted_attach_leaves_no_export_without_a_device(needs_device: bool, a: Attach)
+    requires
+        inv(needs_device, a),
+        a.over,
+        !a.pending,
+    ensures
+        a.in_map && needs_device ==> a.registered,
+{
+}
+
+pub proof fn thm_a_pending_unwind_always_runs(needs_device: bool, a: Attach)
+    requires
+        inv(needs_device, a),
+        a.pending,
+    ensures
+        enabled(a, AEvent::Cleanup),
+        !astep(needs_device, a, AEvent::Cleanup).in_map,
+        !astep(needs_device, a, AEvent::Cleanup).pending,
 {
 }
 
