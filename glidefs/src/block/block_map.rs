@@ -222,6 +222,38 @@ pub enum DirtyTransition {
     FromSyncing,
 }
 
+/// The kernel's block phases over the raw 2-bit states: `SparseStateMap`'s transitions take their target state from
+/// `glidefs_kernels::flush_kernel::step`.
+mod block_phase {
+    use super::SparseBlockState as S;
+    use glidefs_kernels::flush_kernel::{Event, Phase, step};
+
+    fn phase(raw: u8) -> Phase {
+        match raw {
+            S::NOT_PRESENT => Phase::NotPresent,
+            S::CLEAN => Phase::Clean,
+            S::DIRTY => Phase::Dirty,
+            S::SYNCING => Phase::Syncing,
+            other => unreachable!("invalid 2-bit block state: {other}"),
+        }
+    }
+
+    fn raw(p: Phase) -> u8 {
+        match p {
+            Phase::NotPresent => S::NOT_PRESENT,
+            Phase::Clean => S::CLEAN,
+            Phase::Dirty => S::DIRTY,
+            Phase::Syncing => S::SYNCING,
+        }
+    }
+
+    /// The raw state after `e` from the raw state `from`.
+    pub(super) fn next(from: u8, e: Event) -> u8 {
+        raw(step(phase(from), e))
+    }
+}
+use glidefs_kernels::flush_kernel::Event;
+
 /// Number of 2-bit entries packed into each `AtomicU8`.
 const ENTRIES_PER_BYTE: usize = 4;
 
@@ -602,15 +634,17 @@ impl SparseStateMap {
                 return DirtyTransition::AlreadyDirty;
             }
 
+            // The target is the kernel's: a guest write leaves the block DIRTY (`flush_kernel::step`).
+            let written = block_phase::next(current, Event::Write);
             if current == SparseBlockState::CLEAN
                 || current == SparseBlockState::NOT_PRESENT
             {
-                if self.cas(idx, current, SparseBlockState::DIRTY).is_ok() {
+                if self.cas(idx, current, written).is_ok() {
                     return DirtyTransition::FromCleanOrNotPresent;
                 }
             } else if current == SparseBlockState::SYNCING {
                 if self
-                    .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                    .cas(idx, SparseBlockState::SYNCING, written)
                     .is_ok()
                 {
                     return DirtyTransition::FromSyncing;
@@ -627,8 +661,18 @@ impl SparseStateMap {
     /// No retry loop — a single attempt. Caller is responsible for counters.
     #[inline]
     pub fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
-        self.cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
+        // The target is the kernel's: a claim takes a DIRTY block to SYNCING (`flush_kernel::step`).
+        self.cas(idx, SparseBlockState::DIRTY, block_phase::next(SparseBlockState::DIRTY, Event::Claim))
             .is_ok()
+    }
+
+    /// Single CAS: SYNCING → what the kernel says an eviction leaves (`flush_kernel::step`): NOT_PRESENT when `covered` (the manifest in the
+    /// store names the content the flush uploaded), else the block stays SYNCING and this returns `false`. Every read of an evicted block goes
+    /// to the store, so only a covered block may be evicted (`flush_kernel::thm_a_sleep_and_wake_reads_what_the_guest_wrote`).
+    #[inline]
+    pub fn evict_synced(&self, idx: usize, covered: bool) -> bool {
+        let to = block_phase::next(SparseBlockState::SYNCING, Event::Evict { covered });
+        to != SparseBlockState::SYNCING && self.cas(idx, SparseBlockState::SYNCING, to).is_ok()
     }
 
     /// Single CAS: SYNCING → NOT_PRESENT.
@@ -925,6 +969,33 @@ mod tests {
     /// pack-index Code path (level-1 bulk compress) actually uses, and agree with
     /// the stock `zstd::bulk::decompress`. A short/wrong decode here silently
     /// drops pack-index entries (no hash check on the index) → blocks read as zero.
+    /// A write to a block a flush is syncing makes it DIRTY again, so the eviction (which only takes SYNCING blocks) never drops the newer
+    /// content (`flush_kernel::step`; `mut_write_keeps_syncing` leaves it SYNCING).
+    #[test]
+    fn a_write_to_a_syncing_block_makes_it_dirty() {
+        let map = SparseStateMap::new(8);
+        assert_eq!(map.transition_to_dirty(3), DirtyTransition::FromCleanOrNotPresent);
+        assert!(map.transition_dirty_to_syncing(3));
+        assert_eq!(map.get(3), SparseBlockState::SYNCING);
+        assert_eq!(map.transition_to_dirty(3), DirtyTransition::FromSyncing);
+        assert_eq!(map.get(3), SparseBlockState::DIRTY);
+        // The eviction of the claimed content finds the block DIRTY: it stays, with the newer write.
+        assert!(!map.evict_synced(3, true));
+        assert_eq!(map.get(3), SparseBlockState::DIRTY);
+    }
+
+    /// A block leaves SYNCING for the store only once the manifest names it (`flush_kernel::step`; `mut_evict_uncovered` evicts it anyway).
+    #[test]
+    fn an_uncovered_eviction_leaves_the_block_syncing() {
+        let map = SparseStateMap::new(8);
+        map.transition_to_dirty(1);
+        assert!(map.transition_dirty_to_syncing(1));
+        assert!(!map.evict_synced(1, false));
+        assert_eq!(map.get(1), SparseBlockState::SYNCING);
+        assert!(map.evict_synced(1, true));
+        assert_eq!(map.get(1), SparseBlockState::NOT_PRESENT);
+    }
+
     #[test]
     fn zstd_decompress_roundtrips_all_sizes() {
         for &size in &[0usize, 1, 7, 31, 64, 100, 1000, 4096, 32 * 1024, 200 * 1024, 1024 * 1024] {

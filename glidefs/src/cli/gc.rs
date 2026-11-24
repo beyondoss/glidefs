@@ -21,6 +21,7 @@ use object_store::path::Path as ObjectPath;
 use tracing::{info, warn};
 
 use crate::block::content_store::ContentStore;
+use glidefs_kernels::pack_liveness;
 use crate::block::pack::PackId;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::config::Settings;
@@ -737,7 +738,9 @@ async fn reconcile_prefix(
 
         stats.known_packs += 1;
 
-        if live_packs.contains(&(chunk_idx, pack_id)) {
+        // A pack a live manifest names is kept, whichever disk's manifest it is: a disk forked from a snapshot disk names its packs in its
+        // own manifest, so deleting the snapshot disk never makes them dead (`pack_liveness::pack_verdict`).
+        if pack_liveness::pack_verdict(live_packs.contains(&(chunk_idx, pack_id)), false, false) == pack_liveness::Verdict::Keep {
             // Definitely live — revive if previously marked dead
             let key = pack_key(chunk_idx, pack_id);
             if state.dead_packs.contains_key(&key) {
@@ -838,9 +841,10 @@ async fn reconcile_prefix(
             delta.newly_dead_packs.push((key, now_ts.clone()));
         }
 
-        let is_eligible = state.is_pack_eligible(chunk_idx, pack_id, grace_period)
+        let grace_elapsed = state.is_pack_eligible(chunk_idx, pack_id, grace_period)
             || (grace_period.is_zero() && is_new);
-        if is_eligible {
+        // Nothing live names this pack (pass 1 and pass 2): the kernel reclaims it once its grace period has elapsed.
+        if pack_liveness::pack_verdict(false, false, grace_elapsed) == pack_liveness::Verdict::Reclaim {
             stats.eligible_for_deletion += 1;
             if try_claim_delete_slot(budget) {
                 eligible.push((chunk_idx, pack_id));
@@ -1163,6 +1167,37 @@ mod tests {
         assert!(!state
             .dead_packs
             .contains_key(&pack_key(chunk_idx, pack_c)));
+    }
+
+    /// A disk forked from a snapshot disk keeps every pack it names after the snapshot disk is deleted and the collector runs
+    /// (`pack_liveness::thm_a_snapshot_child_disk_does_not_depend_on_its_snapshot_disk`; `mut_gc_ignores_manifests` and
+    /// `mut_gc_reclaims_named` turn its proof red). The child's manifest is a copy of the snapshot disk's, put in the store at the fork.
+    #[tokio::test]
+    async fn a_snapshot_child_disk_keeps_its_packs_after_the_snapshot_disk_is_deleted() {
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/pool");
+        let chunk_idx = 0u32;
+        let (shared, parent_only): (PackId, PackId) = (0x1111_1111_1111_1111, 0x2222_2222_2222_2222);
+        for pack in [shared, parent_only] {
+            content_store.put_chunk_pack(chunk_idx, pack, vec![0u8; 100]).await.unwrap();
+        }
+        let mut parent = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        parent.append_pack(chunk_idx, shared, None);
+        parent.append_pack(chunk_idx, parent_only, None);
+        content_store.put_manifest("snapshot-disk", parent.serialize().unwrap(), None).await.unwrap();
+        // The fork: the child's manifest is the snapshot disk's, then the child names only what it keeps.
+        let mut child = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        child.append_pack(chunk_idx, shared, None);
+        content_store.put_manifest("child", child.serialize().unwrap(), None).await.unwrap();
+
+        // The snapshot disk is deleted (a purge removes its manifest, never a pack), then the collector runs with no grace.
+        content_store.delete_manifest("snapshot-disk").await.unwrap();
+        let mut state = new_gc_state_for_test();
+        let report = reconcile_prefix_for_test(&content_store, &mut state, Duration::ZERO, 100, false).await.unwrap();
+
+        assert_eq!(report.packs_deleted(), 1, "only the pack no manifest names is reclaimed");
+        assert!(content_store.head_chunk_pack(chunk_idx, shared).await.unwrap(), "the child's pack is still readable");
+        assert!(!content_store.head_chunk_pack(chunk_idx, parent_only).await.unwrap());
     }
 
     #[tokio::test]

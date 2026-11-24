@@ -497,12 +497,10 @@ impl WriteCache<Active> {
         if !flushing_path.exists() {
             // Predecessor finished the flush before exiting. Demote
             // SYNCING → NOT_PRESENT so reads go through S3.
+            // The flushing file is removed only after the manifest sync and the checkpoint, so its absence says the manifest names these
+            // blocks: covered (`flush_kernel::step`).
             for idx in &syncing_blocks {
-                let _ = self.inner.state_map.cas(
-                    *idx,
-                    SparseBlockState::SYNCING,
-                    SparseBlockState::NOT_PRESENT,
-                );
+                let _ = self.inner.state_map.evict_synced(*idx, true);
             }
             tracing::info!(
                 invalidated = syncing_blocks.len(),
@@ -1650,6 +1648,9 @@ impl WriteCache<Active> {
         // async-safe across awaits). Serialize from a brief `.read()`
         // guard, drop, then PUT. Concurrent flushers are serialized by
         // `flush_lock` (held by the caller).
+        // Whether the manifest in the store names what this flush uploaded (nothing new to name: every block deduped against packs it
+        // already names). The eviction below is the kernel's `Evict { covered }` (`flush_kernel::step`): without it no block leaves SYNCING.
+        let mut manifest_covers = !need_sync;
         if need_sync {
             let manifest_bytes = volume_manifest.read().serialize()?;
             let expected_etag = self.inner.manifest_etag.lock().clone();
@@ -1665,6 +1666,7 @@ impl WriteCache<Active> {
                 {
                     Ok(new_etag) => {
                         *self.inner.manifest_etag.lock() = new_etag;
+                        manifest_covers = true;
                         last_err = None;
                         break;
                     }
@@ -1732,7 +1734,7 @@ impl WriteCache<Active> {
         {
             let _df = self.inner.data_file.write();
             for &chunk_index in &flushed_blocks {
-                if !self.inner.transition_syncing_to_not_present(chunk_index) {
+                if !self.inner.evict_synced(chunk_index, manifest_covers) {
                     total_stats.blocks_cas_failed += 1;
                 }
             }

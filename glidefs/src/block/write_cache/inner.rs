@@ -1222,6 +1222,18 @@ impl CacheInner {
         }
     }
 
+    /// Evict a flushed block: SYNCING→NOT_PRESENT, only when `covered` (the manifest in the store names the content the flush uploaded;
+    /// `flush_kernel::step`). Counters as `transition_syncing_to_not_present`.
+    #[inline]
+    pub(super) fn evict_synced(&self, idx: usize, covered: bool) -> bool {
+        if self.state_map.evict_synced(idx, covered) {
+            self.syncing_block_count.fetch_sub(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Count present blocks (for metrics/logging).
     #[allow(dead_code)]
     pub(super) fn count_present(&self) -> usize {

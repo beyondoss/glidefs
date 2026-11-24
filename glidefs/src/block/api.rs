@@ -5,6 +5,7 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::block::metrics::prometheus_header;
+use glidefs_kernels::attach_kernel;
 use crate::block::registry::FromRef;
 use crate::block::router::{ExportInfo, ExportRouter, RouterError};
 use crate::block::write_cache::CacheError;
@@ -550,6 +551,10 @@ async fn create_or_attach_volume(
 
     match create_result {
         Ok(()) => {
+            // From here the export is in the map without its definition or its device: if the client goes away (this future is dropped)
+            // before the attach is whole, the guard asks `attach_kernel::attach_fate` and unwinds it.
+            let needs_device = cfg!(target_os = "linux") && transport == "ublk";
+            let mut attach = AttachGuard::new(router, name, &transport, needs_device);
             // Attach-time fence + seize, BEFORE persisting the index, registering
             // the device, or serving any I/O. A rejected attach has uploaded zero
             // data packs, so there is nothing to orphan — this is what prevents
@@ -558,6 +563,7 @@ async fn create_or_attach_volume(
             match router.enforce_attach_fence(name, my_gen, my_lease).await {
                 Ok(crate::block::fence::Fence::Grant) => {}
                 Ok(crate::block::fence::Fence::Reject) => {
+                    attach.finish();
                     router.cleanup_failed_create(name, &transport).await;
                     return error_response(
                         StatusCode::CONFLICT,
@@ -568,6 +574,7 @@ async fn create_or_attach_volume(
                     );
                 }
                 Err(e) => {
+                    attach.finish();
                     router.cleanup_failed_create(name, &transport).await;
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -584,7 +591,7 @@ async fn create_or_attach_volume(
             }
 
             // Persist the index entry and register the device concurrently.
-            // save_export MUST succeed; register_device is best-effort.
+            // save_export MUST succeed; register_device must succeed for a transport that exists only as its device.
             let t_io = Instant::now();
             #[cfg(target_os = "linux")]
             let (save_result, register_result) = tokio::join!(
@@ -593,32 +600,46 @@ async fn create_or_attach_volume(
             );
             #[cfg(not(target_os = "linux"))]
             let save_result = router.save_export(&effective).await;
-
-            if let Err(e) = save_result {
-                // Without teardown, the in-memory entry silently shadows the
-                // missing S3 export.json — retries hit create_export's
-                // idempotency check and never re-attempt the S3 write.
-                router.cleanup_failed_create(name, &transport).await;
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &format!(
-                        "Export definition not persisted to S3 ({e}); \
-                         in-memory state cleaned up, retry the request"
-                    ),
-                );
-            }
-            // A ublk export without its device is unusable and a retry would hit the idempotency check
-            // above: tear it down and say why, never answer 201 with no device.
+            attach.saved = save_result.is_ok();
             #[cfg(target_os = "linux")]
-            if let Err(e) = register_result {
-                // NBD exports are also served over TCP, so a missing /dev/nbdN is not a failure;
-                // a ublk export exists only as its device.
-                if transport == "ublk" {
-                    router.cleanup_failed_create(name, &transport).await;
+            {
+                attach.registered = register_result.is_ok();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                attach.registered = true;
+            }
+
+            // The kernel decides whether the export stays. Without its definition, a retry would hit create_export's idempotency check
+            // and never re-attempt the S3 write; a ublk export without its device is unusable and a retry would hit the same check:
+            // tear it down and say why, never answer 201 with no device. An NBD export is also served over TCP, so a missing /dev/nbdN
+            // is not a failure.
+            if attach_kernel::attach_fate(needs_device, attach.registered, attach.saved) == attach_kernel::Fate::Unwind {
+                attach.finish();
+                router.cleanup_failed_create(name, &transport).await;
+                if let Err(e) = save_result {
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &format!(
+                            "Export definition not persisted to S3 ({e}); \
+                             in-memory state cleaned up, retry the request"
+                        ),
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                if let Err(e) = register_result {
                     return device_error_response(name, &e);
                 }
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("attach of '{name}' did not complete; in-memory state cleaned up, retry the request"),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if let Err(e) = register_result {
                 warn!(export = %name, error = %e, "device registration failed");
             }
+            attach.finish();
             let _ = transport;
 
             tracing::info!(
@@ -645,6 +666,56 @@ async fn create_or_attach_volume(
             error_response(StatusCode::GONE, &format!("lineage_lost: {e}"))
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// The attach of a volume between `create_export` and the end of `create_or_attach_volume`. If the future is dropped before
+/// [`Self::finish`] (the client went away, the request was cancelled), the drop asks `attach_kernel::attach_fate` with what the attach had
+/// done and, when it says `Unwind`, tears the export down in the background (`cleanup_failed_create`), so no export is left without its
+/// block device. The idempotent re-PUT then creates it afresh.
+struct AttachGuard {
+    router: Arc<ExportRouter>,
+    name: String,
+    transport: String,
+    needs_device: bool,
+    registered: bool,
+    saved: bool,
+    finished: bool,
+}
+
+impl AttachGuard {
+    fn new(router: &Arc<ExportRouter>, name: &str, transport: &str, needs_device: bool) -> Self {
+        Self {
+            router: Arc::clone(router),
+            name: name.to_string(),
+            transport: transport.to_string(),
+            needs_device,
+            registered: false,
+            saved: false,
+            finished: false,
+        }
+    }
+
+    /// The attach ended on its own path (success, or it has unwound the export itself): nothing for the drop to do.
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if attach_kernel::attach_fate(self.needs_device, self.registered, self.saved) == attach_kernel::Fate::Keep {
+            return;
+        }
+        warn!(export = %self.name, "attach interrupted before it was whole; tearing the export down");
+        let router = Arc::clone(&self.router);
+        let (name, transport) = (std::mem::take(&mut self.name), std::mem::take(&mut self.transport));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { router.cleanup_failed_create(&name, &transport).await });
+        }
     }
 }
 

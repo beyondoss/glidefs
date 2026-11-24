@@ -42,6 +42,18 @@ mut_attach_admits_older = []
 # The revision takes the token's high bits: the same test.
 mut_token_revision_dominates = []
 
+# A SYNCING block is evicted whether or not the manifest names it: Verus red on `flush_kernel::step`.
+mut_evict_uncovered = []
+# A write to a SYNCING block leaves it SYNCING (the eviction drops the newer content): the same.
+mut_write_keeps_syncing = []
+
+# An export whose definition is saved is kept whether or not its device is registered: Verus red on `attach_kernel::attach_fate`.
+mut_attach_keeps_deviceless = []
+
+# A named pack past its grace period is reclaimed; only snapshots name a pack: Verus red on `pack_liveness::pack_verdict`.
+mut_gc_reclaims_named = []
+mut_gc_ignores_manifests = []
+
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
 vstd = "=0.0.0-2026-11-01-0251"

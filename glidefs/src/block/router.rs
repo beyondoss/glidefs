@@ -1436,23 +1436,29 @@ impl ExportRouter {
     /// retry handle: a purge that fails part-way leaves it in place, so the
     /// next purge finds the volume and runs every step again.
     async fn purge_s3_state(&self, name: &str, cs: &ContentStore) -> Result<(), RouterError> {
+        use glidefs_kernels::pack_liveness::{PurgeStep, purge_plan};
+        // The plan is the kernel's (`pack_liveness::purge_plan`): this disk's manifest, snapshots, snapshot index and, last, its definition. No
+        // step touches a pack: packs are shared by every disk forked from the same pool, and only the collector reclaims one, and only one no
+        // manifest names, so a disk forked from this one keeps every pack it names.
         let mut first_err: Option<RouterError> = None;
-        if let Err(e) = cs.delete_manifest(name).await {
-            warn!("Failed to delete manifest from S3: {}", e);
-            first_err.get_or_insert(RouterError::ContentStore(e));
+        for step in purge_plan() {
+            let result: Result<(), RouterError> = match step {
+                PurgeStep::Manifest => cs.delete_manifest(name).await.map_err(RouterError::ContentStore),
+                PurgeStep::Snapshots => cs.delete_all_snapshots(name).await.map_err(RouterError::ContentStore),
+                PurgeStep::SnapshotIndex => self.delete_snapshot_index_entries(name).await.map(|_| ()),
+                PurgeStep::Definition => {
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
+                    return self.delete_export_definition(name).await;
+                }
+            };
+            if let Err(e) = result {
+                warn!("Failed to purge {:?} of '{}' from S3: {}", step, name, e);
+                first_err.get_or_insert(e);
+            }
         }
-        if let Err(e) = cs.delete_all_snapshots(name).await {
-            warn!("Failed to delete snapshots from S3: {}", e);
-            first_err.get_or_insert(RouterError::ContentStore(e));
-        }
-        if let Err(e) = self.delete_snapshot_index_entries(name).await {
-            warn!("Failed to delete snapshot index entries from S3: {}", e);
-            first_err.get_or_insert(e);
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        self.delete_export_definition(name).await
+        Ok(())
     }
 
     /// Discover ALL exports under the global `{db_path}/exports/` prefix.
