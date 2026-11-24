@@ -3084,7 +3084,7 @@ async fn test_flush_recovery_skipped_block_stays_syncing() {
 ///
 /// Before the fix, even when all blocks recovered, if the stranded_syncing
 /// code path was taken (which requires unrecoverable SSD errors — tested
-/// separately in test_stranded_syncing_blocks_become_not_present), the
+/// separately in test_a_flush_that_cannot_copy_a_block_back_keeps_it), the
 /// flushing file would persist and block all future flushes. This test
 /// verifies the normal failure-recovery path still works and that a second
 /// flush proceeds.
@@ -3234,93 +3234,120 @@ async fn test_flush_failure_does_not_block_subsequent_flush() {
     }
 }
 
-/// Prove: stranded SYNCING blocks from unrecoverable SSD errors are marked
-/// NOT_PRESENT (accepting data loss) rather than staying SYNCING forever.
-///
-/// Manually drives the recovery path to simulate partial SSD failure, then
-/// verifies stranded blocks → NOT_PRESENT and flushing file cleanup.
+/// A flush whose upload fails and whose SSD copy-back of one block also fails keeps that block, never drops it
+/// (`flush_kernel::Event::Stranded`; `mut_stranded_marked_absent` marks it NOT_PRESENT and this test goes red): the flush errors, the block stays
+/// SYNCING in the flushing file and reads back what the guest wrote, and once the fault clears the next flush stores it.
 #[tokio::test]
-async fn test_stranded_syncing_blocks_become_not_present() {
+async fn test_a_flush_that_cannot_copy_a_block_back_keeps_it() {
+    use async_trait::async_trait;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ObjStore, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult, Result as ObjectStoreResult,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// An object store whose writes fail while `fail` is set.
+    #[derive(Debug)]
+    struct ToggleStore {
+        inner: InMemory,
+        fail: AtomicBool,
+    }
+    impl std::fmt::Display for ToggleStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ToggleStore")
+        }
+    }
+    #[async_trait]
+    impl ObjStore for ToggleStore {
+        async fn put_opts(&self, p: &object_store::path::Path, d: PutPayload, o: PutOptions) -> ObjectStoreResult<PutResult> {
+            if self.fail.load(Ordering::Relaxed) {
+                Err(object_store::Error::Generic { store: "ToggleStore", source: "fail".into() })
+            } else {
+                self.inner.put_opts(p, d, o).await
+            }
+        }
+        async fn put_multipart_opts(&self, p: &object_store::path::Path, o: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            if self.fail.load(Ordering::Relaxed) {
+                Err(object_store::Error::Generic { store: "ToggleStore", source: "fail".into() })
+            } else {
+                self.inner.put_multipart_opts(p, o).await
+            }
+        }
+        async fn get_opts(&self, p: &object_store::path::Path, o: GetOptions) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(p, o).await
+        }
+        async fn delete(&self, p: &object_store::path::Path) -> ObjectStoreResult<()> {
+            self.inner.delete(p).await
+        }
+        fn list(&self, p: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&object_store::path::Path>) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, a: &object_store::path::Path, b: &object_store::path::Path) -> ObjectStoreResult<()> {
+            self.inner.copy(a, b).await
+        }
+        async fn copy_if_not_exists(&self, a: &object_store::path::Path, b: &object_store::path::Path) -> ObjectStoreResult<()> {
+            self.inner.copy_if_not_exists(a, b).await
+        }
+    }
+
     let dir = TempDir::new().unwrap();
     let config = bottomless_config(dir.path());
+    let toggle = Arc::new(ToggleStore { inner: InMemory::new(), fail: AtomicBool::new(false) });
+    let store: Arc<dyn object_store::ObjectStore> = toggle.clone();
+    let content_store = crate::block::content_store::ContentStore::new(store, "test-bucket");
+    let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(1024 * 1024, 4096)));
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let metrics = crate::block::metrics::ExportMetrics::new();
 
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-
-    // Write known data to blocks 0, 1, 2.
     for i in 0u8..3 {
-        cache.write(i as u64 * 4096, &vec![i + 0x70; 4096]).unwrap();
+        cache.write(i as u64 * 4096, &vec![i + 0xA0; 4096]).unwrap();
     }
 
-    // Rotate: data moves to flushing file, blocks become SYNCING.
-    let snapshot = cache.rotate_and_snapshot().unwrap();
-    assert_eq!(snapshot.len(), 3);
+    // Both faults: the upload fails and block 1 cannot be copied back to the SSD.
+    toggle.fail.store(true, Ordering::Relaxed);
+    cache.inner.copy_fault.lock().push(1);
+    let err = cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest, None).await.unwrap_err();
+    assert!(matches!(err, CacheError::FlushStranded { blocks: 1 }), "the flush says a block is stranded: {err}");
 
-    // Simulate partial recovery: blocks 0 and 2 succeed, block 1 fails.
-    // This mirrors the flush_dirty_inner error path.
-    {
-        let block_size = config.block_size;
-        let df = cache.inner.data_file.write();
-        let mut recovered = std::collections::HashSet::new();
-        if let Some(ref ff) = *cache.inner.flushing_file.lock() {
-            for &idx in &snapshot {
-                if idx == 1 {
-                    // Simulate SSD read failure — skip this block.
-                    continue;
-                }
-                let offset = idx as u64 * block_size as u64;
-                let mut buf = vec![0u8; block_size];
-                ff.read_exact_at(&mut buf, offset).unwrap();
-                df.write_all_at(&buf, offset).unwrap();
-                recovered.insert(idx);
-            }
-        }
-
-        let stranded_syncing = snapshot.iter().any(|&idx| {
-            !recovered.contains(&idx)
-                && cache.inner.state_map.get(idx) == SparseBlockState::SYNCING
-        });
-        assert!(stranded_syncing, "block 1 should be stranded");
-
-        drop(df);
-        cache.inner.flushing_active.store(false, Ordering::Release);
-        cache.inner.rotation_seq.store(0, Ordering::Release);
-
-        // Apply the fix: stranded blocks → NOT_PRESENT.
-        for &idx in &snapshot {
-            if !recovered.contains(&idx)
-                && cache.inner.state_map.get(idx) == SparseBlockState::SYNCING
-            {
-                cache.inner.transition_syncing_to_not_present(idx);
-            }
-        }
-
-        // Clean up flushing file (the fix always does this now).
-        drop(cache.inner.flushing_file.lock().take());
-        if config.flushing_path().exists() {
-            let _ = std::fs::remove_file(config.flushing_path());
-        }
-
-        // Transition recovered blocks to DIRTY.
-        for &idx in &recovered {
-            cache.inner.transition_to_dirty(idx);
-        }
-    }
-
-    // Stranded block 1: NOT_PRESENT (data loss accepted).
-    assert_eq!(
-        cache.inner.state_map.get(1),
-        SparseBlockState::NOT_PRESENT,
-        "stranded block 1 must be NOT_PRESENT, not stuck as SYNCING"
-    );
-
-    // Recovered blocks 0, 2: DIRTY.
+    // Block 1 is kept: SYNCING, its data in the flushing file, which stays. Blocks 0 and 2 were given back.
+    assert_eq!(cache.inner.state_map.get(1), SparseBlockState::SYNCING, "a stranded block is never marked NOT_PRESENT");
+    assert!(cache.inner.flushing_file.lock().is_some());
+    assert!(config.flushing_path().exists());
     assert_eq!(cache.inner.state_map.get(0), SparseBlockState::DIRTY);
     assert_eq!(cache.inner.state_map.get(2), SparseBlockState::DIRTY);
+    for i in 0u8..3 {
+        let got = cache
+            .read(i as u64 * 4096, 4096, &clean_cache, &pack_index_cache, &volume_manifest, &content_store, &metrics)
+            .await
+            .unwrap();
+        assert!(got.iter().all(|&b| b == i + 0xA0), "block {i} reads back what the guest wrote");
+    }
 
-    // Flushing file fully cleaned up.
-    assert!(cache.inner.flushing_file.lock().is_none());
+    // The fault persists: the next flush fails the same way and still drops nothing.
+    assert!(cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest, None).await.is_err());
+    assert_eq!(cache.inner.state_map.get(1), SparseBlockState::SYNCING);
+
+    // The faults clear: the next flush copies block 1 back, stores every block, and they read back.
+    toggle.fail.store(false, Ordering::Relaxed);
+    cache.inner.copy_fault.lock().clear();
+    cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest, None).await.expect("the flush succeeds once the faults clear");
+    for i in 0usize..3 {
+        assert_eq!(cache.inner.state_map.get(i), SparseBlockState::NOT_PRESENT);
+    }
     assert!(!config.flushing_path().exists());
+    for i in 0u8..3 {
+        let got = cache
+            .read(i as u64 * 4096, 4096, &clean_cache, &pack_index_cache, &volume_manifest, &content_store, &metrics)
+            .await
+            .unwrap();
+        assert!(got.iter().all(|&b| b == i + 0xA0), "block {i} reads back from the store");
+    }
 }
 
 // ====================================================================

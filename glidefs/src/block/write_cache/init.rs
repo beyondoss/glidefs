@@ -341,6 +341,8 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
+            #[cfg(test)]
+            copy_fault: parking_lot::Mutex::new(Vec::new()),
             sequence,
             wal,
             export_name,
@@ -440,6 +442,8 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
+            #[cfg(test)]
+            copy_fault: parking_lot::Mutex::new(Vec::new()),
             sequence,
             wal,
             export_name,

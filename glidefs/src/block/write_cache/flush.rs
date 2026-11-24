@@ -497,12 +497,10 @@ impl WriteCache<Active> {
         if !flushing_path.exists() {
             // Predecessor finished the flush before exiting. Demote
             // SYNCING → NOT_PRESENT so reads go through S3.
+            // The flushing file is removed only after the manifest sync and the checkpoint, so its absence says the manifest names these
+            // blocks: covered (`flush_kernel::step`).
             for idx in &syncing_blocks {
-                let _ = self.inner.state_map.cas(
-                    *idx,
-                    SparseBlockState::SYNCING,
-                    SparseBlockState::NOT_PRESENT,
-                );
+                let _ = self.inner.state_map.evict_synced(*idx, true);
             }
             tracing::info!(
                 invalidated = syncing_blocks.len(),
@@ -1091,6 +1089,17 @@ impl WriteCache<Active> {
                         return Ok((FlushStats::default(), seq_cutpoint));
                     }
                 }
+            } else if self.inner.has_any_syncing() {
+                // The caller holds `flush_lock`, so no flush is in flight: SYNCING blocks here are the ones an earlier flush could not give
+                // back (upload and SSD copy both failed). Retry the copy; once nothing is stranded the flushing file goes and this flush
+                // proceeds, otherwise they stay SYNCING in it and this flush fails (never drops them).
+                use crate::block::block_map::SparseBlockState;
+                let claimed: Vec<usize> = self.inner.state_map.iter_with_state(SparseBlockState::SYNCING).collect();
+                let (recovered, stranded) = self.requeue_claimed(&claimed);
+                if !stranded.is_empty() {
+                    return Err(CacheError::FlushStranded { blocks: stranded.len() });
+                }
+                self.release_flushing_file(&recovered);
             } else {
                 debug!("flush: flushing file still exists (pending manifest sync), skipping");
                 return Ok((FlushStats::default(), seq_cutpoint));
@@ -1146,140 +1155,95 @@ impl WriteCache<Active> {
             .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache, crcs)
             .await;
 
-        if result.is_err() {
-            // Copy block data from flushing to active BEFORE transitioning
-            // state. If we transition SYNCING→DIRTY first, a concurrent read
-            // sees DIRTY, reads the new active file (which is empty for these
-            // blocks), and serves zeros.
-            //
-            // Write-lock data_file to prevent concurrent writes from
-            // interleaving with the copy. Without this, a write could:
-            // 1. CAS SYNCING→DIRTY, promote, pwrite new data
-            // 2. Then our copy overwrites that new data with stale flushing data
-            // Lock ordering: data_file.write() THEN flushing_file.lock().
-            // Must match sync_read_local_block (data_file.read() → flushing_file)
-            // to avoid deadlock.
-            let block_size = self.inner.config.block_size;
-            let df = self.inner.data_file.write();
-            let mut recovered = std::collections::HashSet::with_capacity(snapshot.len());
-            if let Some(ref ff) = *self.inner.flushing_file.lock() {
-                for &idx in &snapshot {
-                    if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
-                        // Already re-dirtied by a concurrent write — data is
-                        // in the active file. Safe to transition.
-                        recovered.insert(idx);
-                        continue;
-                    }
-                    let offset = idx as u64 * block_size as u64;
-                    let valid_bytes = std::cmp::min(
-                        block_size as u64,
-                        self.inner.config.device_size.saturating_sub(offset),
-                    ) as usize;
-                    if valid_bytes > 0 {
-                        let mut buf = vec![0u8; valid_bytes];
-                        match ff.read_exact_at(&mut buf, offset) {
-                            Ok(()) => {
-                                if let Err(e) = df.write_all_at(&buf, offset) {
-                                    // Cannot copy block to active file. Leave it
-                                    // SYNCING — crash recovery will handle it.
-                                    // Do NOT mark dirty: the active file has zeros.
-                                    warn!(
-                                        block = idx,
-                                        error = %e,
-                                        "pwrite to active file failed during flush \
-                                         recovery — block left SYNCING"
-                                    );
-                                    continue;
-                                }
-                                recovered.insert(idx);
-                            }
-                            Err(e) => {
-                                // Cannot read block from flushing file. Leave it
-                                // SYNCING — crash recovery will handle it.
-                                // Do NOT mark dirty: the active file has zeros.
-                                warn!(
-                                    block = idx,
-                                    error = %e,
-                                    "pread from flushing file failed during flush \
-                                     recovery — block left SYNCING"
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        recovered.insert(idx);
-                    }
+        if let Err(flush_err) = &result {
+            let (recovered, stranded) = self.requeue_claimed(&snapshot);
+            if !stranded.is_empty() {
+                // Both the upload failed and the SSD copy of these blocks failed: their data exists only in the flushing file. They stay
+                // SYNCING and the flushing file stays, owned by the cache (`flush_kernel::Event::Stranded`: a stranded block never leaves
+                // SYNCING), and every later flush retries giving them back before it rotates. Dropping them would lose what the guest wrote.
+                for &idx in &stranded {
+                    self.inner.state_map.strand_syncing(idx);
                 }
-            } else {
-                // No flushing file — blocks not in SYNCING were already
-                // handled by concurrent writes. Only transition those.
-                for &idx in &snapshot {
-                    if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
-                        recovered.insert(idx);
-                    }
-                }
-            }
-            // Check if any blocks are still stranded in SYNCING (recovery
-            // failed for them — both the S3 upload and the SSD copy failed).
-            let stranded_syncing = snapshot
-                .iter()
-                .any(|&idx| {
-                    !recovered.contains(&idx)
-                        && self.inner.state_map.get(idx) == SparseBlockState::SYNCING
-                });
-
-            drop(df);
-            self.inner.flushing_active.store(false, Ordering::Release);
-            self.inner.rotation_seq.store(0, Ordering::Release);
-
-            if stranded_syncing {
-                // Stranded SYNCING blocks: both the S3 upload failed AND the
-                // SSD copy (flushing→active) failed. The data exists only in
-                // the flushing file's open fd, but the SSD can't read it
-                // reliably (that's why recovery failed). Keeping the flushing
-                // file alive would permanently block all future flushes —
-                // every subsequent flush_dirty_inner call sees the flushing
-                // file on disk + flushing_file=Some and returns early.
-                //
-                // Accept data loss for the unrecoverable blocks: transition
-                // them to NOT_PRESENT so the read path fetches from S3 (if a
-                // previous flush succeeded) or returns zeros (if not). This
-                // is strictly better than losing ALL future flushes for every
-                // block on this export.
-                let mut stranded_count = 0u64;
-                for &idx in &snapshot {
-                    if !recovered.contains(&idx)
-                        && self.inner.state_map.get(idx) == SparseBlockState::SYNCING
-                    {
-                        self.inner.transition_syncing_to_not_present(idx);
-                        stranded_count += 1;
-                    }
+                for &idx in &recovered {
+                    self.inner.requeue_syncing(idx);
                 }
                 tracing::error!(
-                    stranded_blocks = stranded_count,
-                    "DATA LOSS: {stranded_count} blocks could not be recovered \
-                     after flush failure (S3 upload failed + SSD copy failed). \
-                     Blocks marked NOT_PRESENT to unblock future flushes."
+                    stranded_blocks = stranded.len(),
+                    flush_error = %flush_err,
+                    "flush failed and {} block(s) could not be copied back to the SSD; they stay SYNCING in the flushing file and the next flush retries",
+                    stranded.len()
                 );
+                return Err(CacheError::FlushStranded { blocks: stranded.len() });
             }
-            // Drop the flushing file and delete the physical file so future
-            // flush cycles can rotate normally. For the stranded case, the
-            // unrecoverable blocks have already been marked NOT_PRESENT above.
-            drop(self.inner.flushing_file.lock().take());
-            let flushing_path = self.inner.config.flushing_path();
-            // Synchronous remove: this is the cold takeover-recovery path (runs
-            // once after a flush failure), and it sits in the same lexical scope
-            // as the just-dropped data_file write guard — keeping it sync avoids
-            // an await inside that scope. remove_file on a missing path returns
-            // NotFound, which we ignore.
-            let _ = std::fs::remove_file(&flushing_path);
-            // Only transition blocks whose data was successfully recovered.
-            for &idx in &recovered {
-                self.inner.transition_to_dirty(idx);
-            }
+            self.release_flushing_file(&recovered);
         }
 
         result.map(|stats| (stats, seq_cutpoint))
+    }
+
+    /// Give back the blocks a flush claimed and could not store: copy each still-SYNCING block's data from the flushing file to the active
+    /// file (under the data-file write lock, so no write interleaves). Returns the blocks safe to re-dirty (copied, or already re-dirtied by a
+    /// write) and the blocks whose copy failed, whose data is only in the flushing file.
+    ///
+    /// Lock ordering: data_file.write() THEN flushing_file.lock() (as `sync_read_local_block`).
+    fn requeue_claimed(&self, snapshot: &[usize]) -> (std::collections::HashSet<usize>, Vec<usize>) {
+        use crate::block::block_map::SparseBlockState;
+        use std::os::unix::fs::FileExt;
+        let block_size = self.inner.config.block_size;
+        let df = self.inner.data_file.write();
+        let mut recovered = std::collections::HashSet::with_capacity(snapshot.len());
+        let mut stranded = Vec::new();
+        let ff = self.inner.flushing_file.lock();
+        for &idx in snapshot {
+            if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                // Already re-dirtied by a concurrent write: its data is in the active file.
+                recovered.insert(idx);
+                continue;
+            }
+            let offset = idx as u64 * block_size as u64;
+            let valid_bytes = std::cmp::min(block_size as u64, self.inner.config.device_size.saturating_sub(offset)) as usize;
+            if valid_bytes == 0 {
+                recovered.insert(idx);
+                continue;
+            }
+            #[cfg(test)]
+            if self.inner.copy_fault.lock().contains(&idx) {
+                stranded.push(idx);
+                continue;
+            }
+            let copied = match ff.as_ref() {
+                Some(ff) => {
+                    let mut buf = vec![0u8; valid_bytes];
+                    match ff.read_exact_at(&mut buf, offset).and_then(|()| df.write_all_at(&buf, offset)) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(block = idx, error = %e, "copy from the flushing file to the active file failed");
+                            false
+                        }
+                    }
+                }
+                None => false,
+            };
+            if copied {
+                recovered.insert(idx);
+            } else {
+                stranded.push(idx);
+            }
+        }
+        (recovered, stranded)
+    }
+
+    /// Nothing is stranded: drop the flushing file so the next flush can rotate, and re-dirty the blocks that were copied back.
+    fn release_flushing_file(&self, recovered: &std::collections::HashSet<usize>) {
+        self.inner.flushing_active.store(false, Ordering::Release);
+        self.inner.rotation_seq.store(0, Ordering::Release);
+        drop(self.inner.flushing_file.lock().take());
+        // Synchronous remove: cold recovery path. NotFound is fine.
+        let _ = std::fs::remove_file(self.inner.config.flushing_path());
+        for &idx in recovered {
+            // A block no longer SYNCING was re-dirtied by a write: nothing to give back.
+            self.inner.requeue_syncing(idx);
+        }
     }
 
     /// Inner body of flush_dirty_inner, factored out for error recovery.
@@ -1650,6 +1614,9 @@ impl WriteCache<Active> {
         // async-safe across awaits). Serialize from a brief `.read()`
         // guard, drop, then PUT. Concurrent flushers are serialized by
         // `flush_lock` (held by the caller).
+        // Whether the manifest in the store names what this flush uploaded (nothing new to name: every block deduped against packs it
+        // already names). The eviction below is the kernel's `Evict { covered }` (`flush_kernel::step`): without it no block leaves SYNCING.
+        let mut manifest_covers = !need_sync;
         if need_sync {
             let manifest_bytes = volume_manifest.read().serialize()?;
             let expected_etag = self.inner.manifest_etag.lock().clone();
@@ -1665,6 +1632,7 @@ impl WriteCache<Active> {
                 {
                     Ok(new_etag) => {
                         *self.inner.manifest_etag.lock() = new_etag;
+                        manifest_covers = true;
                         last_err = None;
                         break;
                     }
@@ -1732,7 +1700,7 @@ impl WriteCache<Active> {
         {
             let _df = self.inner.data_file.write();
             for &chunk_index in &flushed_blocks {
-                if !self.inner.transition_syncing_to_not_present(chunk_index) {
+                if !self.inner.evict_synced(chunk_index, manifest_covers) {
                     total_stats.blocks_cas_failed += 1;
                 }
             }

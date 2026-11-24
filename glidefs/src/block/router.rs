@@ -1431,6 +1431,8 @@ impl ExportRouter {
     /// retry handle: a purge that fails part-way leaves it in place, so the
     /// next purge finds the volume and runs every step again.
     async fn purge_s3_state(&self, name: &str, cs: &ContentStore) -> Result<(), RouterError> {
+        // Deletes this disk's manifest, snapshots, snapshot index and, last, its definition. No pack: packs are shared by every disk
+        // forked from the same pool, and only the collector reclaims one (`pack_liveness`), and only one no manifest names.
         let mut first_err: Option<RouterError> = None;
         if let Err(e) = cs.delete_manifest(name).await {
             warn!("Failed to delete manifest from S3: {}", e);
