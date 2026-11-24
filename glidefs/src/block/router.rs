@@ -2338,6 +2338,7 @@ impl ExportRouter {
         // snapshot→location mapping, not the caller. Only index a snapshot whose
         // versioned key was actually persisted.
         let snapshot_id = crate::block::registry::snapshot_id(name, result.sequence);
+        let mut indexed = false;
         if result.snapshot_persisted {
             // Lineage: the parent volume's own source, if any.
             let parent = self.load_export(name).await.ok().flatten().and_then(|c| c.source);
@@ -2349,15 +2350,19 @@ impl ExportRouter {
                 label: tag.map(|t| t.to_string()),
                 parent,
             };
-            if let Err(e) = self.save_snapshot_entry(&entry).await {
-                // Non-fatal: the snapshot bytes are durable; only the logical
-                // index entry failed. Surface it but don't fail the snapshot.
-                warn!(
-                    export = %name,
-                    snapshot_id = %snapshot_id,
-                    error = %e,
-                    "failed to persist snapshot index entry"
-                );
+            match self.save_snapshot_entry(&entry).await {
+                Ok(()) => indexed = true,
+                Err(e) => {
+                    // The snapshot is not reported persisted (below): `snapshot:<id>` resolves through this entry on every node, so a
+                    // snapshot without it cannot be forked anywhere. The caller retries; an owned retry answers this same sequence and
+                    // writes the entry again.
+                    warn!(
+                        export = %name,
+                        snapshot_id = %snapshot_id,
+                        error = %e,
+                        "failed to persist snapshot index entry; the snapshot is not reported persisted"
+                    );
+                }
             }
         }
 
@@ -2365,7 +2370,9 @@ impl ExportRouter {
             manifest_etag: result.manifest_etag,
             sequence: result.sequence,
             snapshot_id,
-            snapshot_persisted: result.snapshot_persisted,
+            // Persisted means obtainable from the store on any node: its manifest and its index entry are both there
+            // (`snapshot_objects::thm_a_reported_snapshot_is_fetchable_in_every_run`).
+            snapshot_persisted: glidefs_kernels::snapshot_objects::snapshot_reported(result.snapshot_persisted, indexed),
             tag: tag.map(|t| t.to_string()),
         })
     }
@@ -5361,6 +5368,185 @@ mod tests {
         );
         // Idempotent.
         router.delete_export_snapshot("snap-idx", snap.sequence).await.unwrap();
+    }
+
+    /// An object store whose snapshot-index PUTs fail while `fail_index` is set: the snapshot manifest and the packs are stored, the index
+    /// entry that `snapshot:<id>` resolves through is not.
+    #[derive(Debug)]
+    struct IndexFailingStore {
+        inner: object_store::memory::InMemory,
+        fail_index: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for IndexFailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "IndexFailingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for IndexFailingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("index/snapshots/") && self.fail_index.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "IndexFailingStore",
+                    source: Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "simulated index PUT outage")),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// P.snapshot.a-snapshot-taken-on-one-node-is-obtainable-on-a-second-node, on one store with two routers (two nodes, two cache dirs): a cut
+    /// whose index entry could not be saved is not reported persisted (`snapshot_objects::snapshot_reported`, red under
+    /// `mut_report_without_index`) and the second node cannot resolve it; the owner's retry answers the same sequence, saves the entry, and the
+    /// second node resolves the snapshot.
+    #[tokio::test]
+    async fn test_a_snapshot_is_obtainable_on_a_second_node_only_once_it_is_reported_and_outlives_its_source() {
+        use crate::block::registry::FromRef;
+        let store = Arc::new(IndexFailingStore {
+            inner: object_store::memory::InMemory::new(),
+            fail_index: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let node_a = create_test_router_on(&dir_a, store.clone()).await;
+        let node_b = create_test_router_on(&dir_b, store.clone()).await;
+
+        node_a.create_export(test_export_config("source"), false, None, None).await.unwrap();
+        let data = vec![0xAB; 128 * 1024];
+        node_a.get_handler("source").await.unwrap().write(0, &data, false).await.unwrap();
+
+        store.fail_index.store(true, Ordering::SeqCst);
+        let first = node_a.snapshot_export_owned("source", None, Some("cap-a")).await.unwrap();
+        assert!(!first.snapshot_persisted, "the index entry was not saved, so the snapshot is not reported persisted");
+        assert!(
+            matches!(node_b.resolve_source(&FromRef::Snapshot(first.snapshot_id.clone())).await, Err(RouterError::SourceNotFound(_))),
+            "the second node cannot resolve a snapshot with no index entry"
+        );
+
+        // The store recovers: the owner's retry answers the same cut and is now reported persisted.
+        store.fail_index.store(false, Ordering::SeqCst);
+        let retry = node_a.snapshot_export_owned("source", None, Some("cap-a")).await.unwrap();
+        assert_eq!(retry.sequence, first.sequence, "the retry answers the cut the first try made");
+        assert_eq!(retry.snapshot_id, first.snapshot_id);
+        assert!(retry.snapshot_persisted, "the retry saved the index entry and is reported persisted");
+
+        let src = node_b.resolve_source(&FromRef::Snapshot(retry.snapshot_id.clone())).await.unwrap();
+        assert_eq!(src.snapshot_sequence, Some(first.sequence), "the second node resolves the snapshot from the store alone");
+    }
+
+    /// P.snapshot.a-sandbox-created-from-a-filesystem-snapshot-has-the-files-the-snapshot-captured-after-the-source-is-gone: the clone, taken on the
+    /// second node, holds what the snapshot captured (not the write after it) once the first node purges the source (its manifest, snapshots,
+    /// snapshot index entries and definition go; no pack does).
+    #[tokio::test]
+    async fn test_a_clone_on_a_second_node_reads_the_snapshot_after_the_source_is_purged() {
+        use crate::block::registry::FromRef;
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let node_a = create_test_router_on(&dir_a, store.clone()).await;
+        let node_b = create_test_router_on(&dir_b, store.clone()).await;
+
+        node_a.create_export(test_export_config("source"), false, None, None).await.unwrap();
+        let data = vec![0xAB; 128 * 1024];
+        node_a.get_handler("source").await.unwrap().write(0, &data, false).await.unwrap();
+        let snap = node_a.snapshot_export_owned("source", None, Some("cap-a")).await.unwrap();
+        assert!(snap.snapshot_persisted);
+        // A write after the cut is not in the snapshot.
+        node_a.get_handler("source").await.unwrap().write(0, &[0xCD; 4096], false).await.unwrap();
+
+        let src = node_b.resolve_source(&FromRef::Snapshot(snap.snapshot_id.clone())).await.unwrap();
+        let clone_config = ExportConfig { s3_prefix: src.pool.clone(), ..test_export_config("clone") };
+        node_b
+            .create_export(clone_config, false, src.manifest_name.as_deref(), src.snapshot_sequence)
+            .await
+            .unwrap();
+
+        node_a.remove_export("source", true).await.unwrap();
+
+        let got = node_b.get_handler("clone").await.unwrap().read(0, 128 * 1024).await.unwrap();
+        assert_eq!(got.as_ref(), &data[..], "the clone holds the files the snapshot captured, with the source gone");
+    }
+
+    /// The two places `snapshot_objects`'s model takes from the code. (1) A cut is reported persisted only through `snapshot_reported`, fed by
+    /// whether its index entry was saved: `indexed` becomes true in the `Ok` arm of the entry's save and nowhere else, and no other
+    /// `snapshot_persisted` is built. (2) A fork from a snapshot copies the snapshot's manifest as the child's own and puts it in the store before
+    /// `create_export` returns, reading the source only from the store (the snapshot's manifest, or the cache of that immutable object), never
+    /// from this node's disk.
+    /// The first local-disk marker in the part of a fork that handles the source, if any.
+    fn fork_source_reads_local_disk(span: &str) -> Option<&'static str> {
+        ["std::fs", "tokio::fs", "File::open", "cache_dir"].into_iter().find(|m| span.contains(m))
+    }
+
+    /// The pin can fail: a local read placed BEFORE the store read is seen, one after the copy is not the source's.
+    #[test]
+    fn snapshot_objects_structure_pin_goes_red_on_a_local_read_before_the_store_read() {
+        let before = "let b = std::fs::read(path); let s = get_snapshot(manifest_name, seq); let mut vm = fork_vm;";
+        let clean = "let s = get_snapshot(manifest_name, seq); let mut vm = fork_vm;";
+        let copy = |t: &str| t.find("let mut vm = fork_vm;").unwrap();
+        assert_eq!(fork_source_reads_local_disk(&before[..copy(before)]), Some("std::fs"));
+        assert_eq!(fork_source_reads_local_disk(&clean[..copy(clean)]), None);
+    }
+
+    #[test]
+    fn snapshot_objects_structure() {
+        fn body<'a>(src: &'a str, head: &str) -> &'a str {
+            let start = src.find(head).unwrap_or_else(|| panic!("no {head}"));
+            let rest = &src[start..];
+            &rest[..rest.find("\n    }\n").unwrap_or_else(|| panic!("no end of {head}"))]
+        }
+        let src = include_str!("router.rs");
+        let cut = body(src, "async fn snapshot_export_owned_inner");
+        assert_eq!(cut.matches("snapshot_reported(").count(), 1, "one verdict on the report");
+        assert_eq!(cut.matches("snapshot_persisted:").count(), 1, "one place builds the response's snapshot_persisted");
+        assert!(
+            cut.contains("snapshot_persisted: glidefs_kernels::snapshot_objects::snapshot_reported(result.snapshot_persisted, indexed)"),
+            "the response's snapshot_persisted is the kernel's verdict"
+        );
+        assert_eq!(cut.matches("indexed = true").count(), 1, "indexed is set once");
+        assert!(
+            cut.find("match self.save_snapshot_entry(&entry).await").unwrap() < cut.find("Ok(()) => indexed = true").unwrap(),
+            "indexed follows a successful save of the entry"
+        );
+
+        let create = body(src, "pub async fn create_export(");
+        let fork = &create[create.find("// Fork path: load VolumeManifest").unwrap()..create.find("created from manifest (fork)").unwrap()];
+        let read = fork.find("get_snapshot(manifest_name, seq)").expect("the fork reads the snapshot from the store");
+        let copy = fork.find("let mut vm = fork_vm;").expect("the child's manifest is a copy of the snapshot's");
+        let put = fork.find(".put_manifest(&name, manifest_bytes, None)").expect("the child's manifest is put in the store");
+        assert!(read < copy && copy < put, "the order is: read the snapshot, copy it, store the copy");
+        // Everything from the fork's start to the copy sees the source; the child's own fresh cache (`cache_dir`) opens after it.
+        let bad = fork_source_reads_local_disk(&fork[..copy]);
+        assert!(bad.is_none(), "the fork must not read the source from this node's disk: {bad:?}");
     }
 
     #[tokio::test]

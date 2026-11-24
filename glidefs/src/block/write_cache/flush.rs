@@ -1080,7 +1080,7 @@ impl WriteCache<Active> {
                             error = %e,
                             "orphaned flushing file exists but cannot be removed — flush blocked"
                         );
-                        return Ok((FlushStats::default(), seq_cutpoint));
+                        return Ok((FlushStats { rotation_blocked: true, ..FlushStats::default() }, seq_cutpoint));
                     }
                 }
             } else if self.inner.has_any_syncing() {
@@ -1096,7 +1096,7 @@ impl WriteCache<Active> {
                 self.release_flushing_file(&recovered);
             } else {
                 debug!("flush: flushing file still exists (pending manifest sync), skipping");
-                return Ok((FlushStats::default(), seq_cutpoint));
+                return Ok((FlushStats { rotation_blocked: true, ..FlushStats::default() }, seq_cutpoint));
             }
         }
 
@@ -1348,6 +1348,8 @@ impl WriteCache<Active> {
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
             total_stats.blocks_crc_mismatched += batch.stats.blocks_crc_mismatched;
             total_stats.blocks_crc_raced += batch.stats.blocks_crc_raced;
+            // Every block a batch skips is counted as a CRC mismatch: `cut_publish::pass_verdict` reads "no mismatch" as "no skip".
+            debug_assert_eq!(batch.skipped.len(), batch.stats.blocks_crc_mismatched, "a skipped block is always counted");
 
             // Transition skipped blocks back to DIRTY.
             //
@@ -1842,29 +1844,32 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         max_passes: usize,
     ) -> Result<(FlushStats, u64), CacheError> {
+        use glidefs_kernels::cut_publish::{pass_verdict, Verdict};
         let mut pass = 1;
         loop {
             let (stats, seq) = self
                 .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
                 .await?;
-            if stats.blocks_crc_mismatched == 0 {
-                return Ok((stats, seq));
+            // Unexplained mismatch = possible cache-file corruption: retrying would re-read the same bytes with no baseline and upload
+            // them; only write races are retried. A pass that never rotated flushed nothing. The kernel decides
+            // (`cut_publish::thm_a_published_cut_holds_every_write_acked_before_it`).
+            match pass_verdict(stats.blocks_crc_mismatched, stats.blocks_crc_raced, stats.rotation_blocked, pass, max_passes) {
+                Verdict::Publish => return Ok((stats, seq)),
+                Verdict::Fail if stats.rotation_blocked => return Err(CacheError::FlushBlocked),
+                Verdict::Fail => {
+                    return Err(CacheError::FlushSkippedBlocks {
+                        crc_mismatched: stats.blocks_crc_mismatched,
+                    });
+                }
+                Verdict::Retry => {
+                    warn!(
+                        pass,
+                        raced = stats.blocks_crc_raced,
+                        "flush skipped blocks that raced a write; re-flushing before publishing"
+                    );
+                    pass += 1;
+                }
             }
-            // Unexplained mismatch = possible cache-file corruption: retrying
-            // would re-read the same bytes with no baseline and upload them.
-            // Only write races are retried.
-            let unexplained = stats.blocks_crc_mismatched - stats.blocks_crc_raced;
-            if unexplained > 0 || pass >= max_passes {
-                return Err(CacheError::FlushSkippedBlocks {
-                    crc_mismatched: stats.blocks_crc_mismatched,
-                });
-            }
-            warn!(
-                pass,
-                raced = stats.blocks_crc_raced,
-                "flush skipped blocks that raced a write; re-flushing before publishing"
-            );
-            pass += 1;
         }
     }
 
