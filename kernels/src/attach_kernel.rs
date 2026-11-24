@@ -178,6 +178,7 @@ pub open spec fn drop_fate_spec(needs_device: bool, registered: bool, saved: boo
 }
 
 #[cfg(not(feature = "mut_drop_counts_inflight_registration"))]
+#[allow(unused_variables)]
 pub fn drop_fate(needs_device: bool, registered: bool, saved: bool, registering: bool) -> (f: Fate)
     ensures
         f == drop_fate_spec(needs_device, registered, saved, registering),
