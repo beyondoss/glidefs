@@ -37,6 +37,9 @@ mut_token_revision_dominates = []
 mut_seize_stamps_the_lower = []
 # `detach_kernel`: a detach reports before the device is drained (the remaining count is taken as 0): Verus only.
 mut_detach_reports_before_flush = []
+# A drain pass with blocks still syncing ends the drain; a failed final manifest sync owes nothing: Verus only (`detach_kernel`).
+mut_drained_ignores_syncing = []
+mut_detach_ignores_the_final_sync = []
 
 [dependencies]
 # The `verus!` macro and the spec library. A normal build erases every proof; only a `cargo verus` build checks them.
