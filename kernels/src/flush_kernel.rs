@@ -9,7 +9,7 @@
 //!   sync, a failed flush and a drop of a clean block. [`inv`] is its inductive invariant and [`vstep`] calls [`step_spec`] for every phase.
 //!
 //! Theorems (the rows' whole text, no bound on the blocks):
-//! * [`thm_a_volume_roundtrips_through_attach_and_detach`]: a drained volume (no dirty or syncing block: the detach's `drained_spec`) read after
+//! * [`thm_a_volume_roundtrips_through_attach_and_detach`]: a drained volume (no dirty or syncing block; [`thm_a_reported_detach_leaves_a_volume_that_reads_what_was_written`] composes it with `detach_kernel::drained_spec`) read after
 //!   a reattach returns every block's last write, whatever the node's cache held before.
 //! * [`thm_a_stop_and_start_keeps_the_volume`]: the same, and the reattached volume is again in the invariant, so every later stop and start
 //!   keeps it too.
@@ -20,6 +20,7 @@
 //! manifest names it), `mut_write_keeps_syncing` (a write to a SYNCING block leaves it SYNCING, so the eviction drops the newer content),
 //! `mut_stranded_marked_absent` (a claimed block whose flush and SSD copy both failed is marked NOT_PRESENT: the guest's write is dropped).
 
+use crate::detach_kernel::drained_spec;
 use vstd::prelude::*;
 
 verus! {
@@ -288,6 +289,27 @@ pub proof fn thm_a_sleep_and_wake_reads_what_the_guest_wrote(v: Vol)
     if drained(v) {
         lemma_a_drained_volume_reads_the_store_at_its_last_write(v);
     }
+}
+
+/// The block counters agree with the phases: `dirty == 0` exactly when no block is DIRTY, `syncing == 0` exactly when none is SYNCING
+/// (`WriteCache::{dirty,syncing}_block_count`, kept by the `transition_*` methods that call [`step`]).
+pub open spec fn counts_match(v: Vol, dirty: u64, syncing: u64) -> bool {
+    &&& dirty == 0 <==> forall|b: int| #[trigger] (v.phase)(b) != Phase::Dirty
+    &&& syncing == 0 <==> forall|b: int| #[trigger] (v.phase)(b) != Phase::Syncing
+}
+
+/// The detach's decision (`detach_kernel::drained_spec`, what `Router::teardown_export` waits for) implies the volume is drained, so the
+/// reattach reads every block's last write: the composition of the detach kernel and this one.
+pub proof fn thm_a_reported_detach_leaves_a_volume_that_reads_what_was_written(v: Vol, claimed: u64, dirty: u64, syncing: u64)
+    requires
+        inv(v),
+        counts_match(v, dirty, syncing),
+        drained_spec(claimed, dirty, syncing),
+    ensures
+        drained(v),
+        forall|b: int| read(reattach(v), b) == (v.latest)(b),
+{
+    lemma_a_drained_volume_reads_the_store_at_its_last_write(v);
 }
 
 } // verus!
