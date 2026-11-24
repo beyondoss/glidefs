@@ -35,7 +35,7 @@ impl WriteCache<Initializing> {
 
         // Load block states (or create fresh)
         let num_blocks = config.num_blocks();
-        let (state_map, mut dirty_count, persisted_max_seq, rotation_seq) =
+        let (state_map, persisted_max_seq, rotation_seq) =
             CacheInner::load_metadata(&config)?;
         let present_count = state_map.count_present();
 
@@ -93,7 +93,6 @@ impl WriteCache<Initializing> {
                     if current != SparseBlockState::DIRTY {
                         let _ = state_map.cas(block_index, current, SparseBlockState::DIRTY);
                     }
-                    dirty_count += 1;
                 }
             }
         }
@@ -308,9 +307,16 @@ impl WriteCache<Initializing> {
         for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
             if state == SparseBlockState::CLEAN {
                 let _ = state_map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT);
-                dirty_count = dirty_count.saturating_sub(1);
             }
         }
+
+        // The counters are the blocks' final phases, counted once recovery has settled every block: never deltas carried through the steps
+        // above (a demoted CLEAN block, a WAL entry over a SYNCING block), which left the dirty counter below the DIRTY blocks, at 0 over
+        // some, so the scheduler skipped them and a detach reported drained.
+        let final_phases: Vec<u8> = state_map.iter_present().map(|(_, s)| s).collect();
+        let counts = glidefs_kernels::block_counters::recount(&final_phases);
+        drop(final_phases);
+        let dirty_count = counts.dirty;
 
         // NOTE: DIRTY blocks may have ssd_active=0 after crash recovery
         // (rotation cleared ssd_active, flushing file was dropped before
@@ -339,8 +345,8 @@ impl WriteCache<Initializing> {
             state_map,
             promote_claim: super::inner::PromoteClaimBitmap::new(),
             num_blocks,
-            dirty_block_count: AtomicU64::new(dirty_count as u64),
-            syncing_block_count: AtomicU64::new(0),
+            dirty_block_count: AtomicU64::new(counts.dirty),
+            syncing_block_count: AtomicU64::new(counts.syncing),
             #[cfg(test)]
             copy_fault: parking_lot::Mutex::new(Vec::new()),
             sequence,

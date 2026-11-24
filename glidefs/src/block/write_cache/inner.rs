@@ -1721,17 +1721,18 @@ impl CacheInner {
 
     /// Load block states and presence from metadata file.
     ///
-    /// Returns `(SparseStateMap, dirty_count, max_sequence, rotation_seq)`.
+    /// Returns `(SparseStateMap, max_sequence, rotation_seq)`. The block counters are not returned: `open` counts the final phases
+    /// after recovery (`block_counters::recount`).
     pub(super) fn load_metadata(
         config: &WriteCacheConfig,
-    ) -> Result<(SparseStateMap, usize, u64, u64), CacheError> {
+    ) -> Result<(SparseStateMap, u64, u64), CacheError> {
         let path = config.metadata_path();
         let num_blocks = config.num_blocks();
 
         if !path.exists() {
             // No metadata file -- all blocks are NOT_PRESENT
             debug!(path = %path.display(), "no metadata file, starting fresh");
-            return Ok((SparseStateMap::new(num_blocks), 0, 0, 0));
+            return Ok((SparseStateMap::new(num_blocks), 0, 0));
         }
 
         let mut file = File::open(&path)?;
@@ -1790,8 +1791,6 @@ impl CacheInner {
         }
 
         let state_map = SparseStateMap::new(num_blocks);
-        let mut dirty_count = 0;
-
         // max_sequence persisted in v5+, defaults to 0 for older formats
         let mut persisted_max_seq: u64 = 0;
 
@@ -1817,14 +1816,8 @@ impl CacheInner {
                 continue; // skip out-of-bounds (shrink safety)
             }
 
-            // Count SYNCING and DIRTY blocks (both need eventual flush).
-            // SYNCING→DIRTY conversion is deferred to init.rs so crash
-            // recovery can use the SYNCING state to identify pre-rotation
-            // blocks whose data is in the flushing file.
-            if state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING {
-                dirty_count += 1;
-            }
-
+            // SYNCING→DIRTY conversion is deferred to init.rs so crash recovery can use the SYNCING state to identify
+            // pre-rotation blocks whose data is in the flushing file.
             // Populate state_map: first set_present (0->1), then CAS to target state
             // Ignore budget errors during load (no budget set yet).
             state_map.set_present(idx);
@@ -1870,11 +1863,10 @@ impl CacheInner {
         info!(
             path = %path.display(),
             blocks = num_blocks,
-            dirty = dirty_count,
             present = present_count,
             "loaded cache metadata"
         );
 
-        Ok((state_map, dirty_count, persisted_max_seq, rotation_seq))
+        Ok((state_map, persisted_max_seq, rotation_seq))
     }
 }

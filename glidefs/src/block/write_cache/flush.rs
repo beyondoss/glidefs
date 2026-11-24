@@ -500,7 +500,7 @@ impl WriteCache<Active> {
             // The flushing file is removed only after the manifest sync and the checkpoint, so its absence says the manifest names these
             // blocks: covered (`flush_kernel::step`).
             for idx in &syncing_blocks {
-                let _ = self.inner.state_map.evict_synced(*idx, true);
+                let _ = self.inner.evict_synced(*idx, true);
             }
             tracing::info!(
                 invalidated = syncing_blocks.len(),
@@ -528,14 +528,8 @@ impl WriteCache<Active> {
             }
             flushing_file.read_exact_at(&mut buf[..valid_bytes], offset)?;
             df_guard.write_all_at(&buf[..valid_bytes], offset)?;
-            let _ = self.inner.state_map.cas(
-                *idx,
-                SparseBlockState::SYNCING,
-                SparseBlockState::DIRTY,
-            );
-            self.inner
-                .dirty_block_count
-                .fetch_add(1, Ordering::Release);
+            // SYNCING -> DIRTY with both counters (`flush_kernel::Event::Requeue`).
+            self.inner.requeue_syncing(*idx);
             recovered += 1;
         }
         drop(df_guard);
