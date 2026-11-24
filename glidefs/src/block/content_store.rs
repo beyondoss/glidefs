@@ -1161,7 +1161,8 @@ mod tests {
             let deletes = d.matches(".delete(").count();
             assert_eq!(d.matches("purge_gate(").count(), deletes, "each delete has its gate: {d}");
             assert!(d.find("purge_gate(").unwrap() < d.find(".delete(").unwrap(), "the gate comes before the delete");
-            assert!(!d.contains("delete(&meta.location)") && !d.contains("delete(&path)"), "a delete takes the gate's target");
+            assert!(d.matches("target.key()").count() >= deletes, "a delete's path comes from the gate's target");
+            assert!(!d.contains("delete(&meta.location)"), "a delete takes the gate's target, not the listed location");
         }
         // `PurgeTarget` has one mint.
         let gate = include_str!("../../../kernels/src/purge_gate.rs");
