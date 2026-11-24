@@ -34,6 +34,9 @@ mut_delete_keeps_markers = []
 # A delete removes only the first owner's marker of its sequence.
 mut_delete_one_owner = []
 
+# A restarted export's counter ignores the store's cut sequences: glidefs `block::router::tests::test_a_relocated_export_cuts_above_every_earlier_cut`.
+mut_seed_ignores_store = []
+
 # The attach fence admits every token: glidefs `block::fence::tests::a_stale_generation_is_refused_whatever_its_revision`.
 mut_attach_admits_older = []
 # The revision takes the token's high bits: the same test.

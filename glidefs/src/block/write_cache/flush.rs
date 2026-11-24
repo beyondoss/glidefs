@@ -2141,6 +2141,13 @@ impl WriteCache<Active> {
         Ok(())
     }
 
+    /// Raise the write counter above every sequence the export has cut (`cuts`, from the store): the seed a node with no local state file needs
+    /// (`glidefs_kernels::seq_counter::seeded_value`).
+    pub fn seed_sequence(&self, cuts: &[u64]) {
+        let seed = glidefs_kernels::seq_counter::seeded_value(self.inner.sequence.current(), cuts);
+        self.inner.sequence.advance_to(seed);
+    }
+
     /// What `owner` cut of this export: one entry per owner marker, with whether its manifest exists.
     pub(crate) async fn owned_cut_view(
         &self,

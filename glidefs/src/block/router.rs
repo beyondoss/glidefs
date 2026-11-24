@@ -1827,6 +1827,12 @@ impl ExportRouter {
             let cache = WriteCache::open(cache_config)?;
             info!("Recovering write cache for export '{}'...", name);
             let cache = cache.finish_recovery().await?;
+            // The local state file and WAL seed the counter; a relocated export has neither, so the store's cuts raise it above every
+            // sequence the export has cut (`seq_counter::seeded_value`; `mut_seed_ignores_store` turns it red).
+            {
+                let cuts = content_store.cut_sequences(&name).await.map_err(RouterError::ContentStore)?;
+                cache.seed_sequence(&cuts);
+            }
             info!("Export '{}' cache ready", name);
 
             // Load existing manifest from S3 or start fresh.
@@ -4349,7 +4355,10 @@ mod tests {
     }
 
     async fn create_test_router(temp_dir: &TempDir) -> ExportRouter {
-        let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        create_test_router_on(temp_dir, Arc::new(object_store::memory::InMemory::new())).await
+    }
+
+    async fn create_test_router_on(temp_dir: &TempDir, s3: Arc<dyn ObjectStore>) -> ExportRouter {
         ExportRouter::new(RouterConfig {
             object_store: s3,
             db_path: "test".to_string(),
@@ -5142,6 +5151,28 @@ mod tests {
         assert_eq!(again.sequence, cut.sequence);
         // Another tag is unaffected.
         router.snapshot_export_owned("fence-vol", None, Some("cap-other")).await.unwrap();
+    }
+
+    /// A relocated export (the same store, a node with no local state file or WAL) cuts above every sequence the first node cut, so no later cut
+    /// reuses or sits below an earlier one (`seq_counter::seeded_value`; red under `mut_seed_ignores_store`).
+    #[tokio::test]
+    async fn test_a_relocated_export_cuts_above_every_earlier_cut() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let node_a = create_test_router_on(&dir_a, store.clone()).await;
+        node_a.create_export(test_export_config("move-vol"), false, None, None).await.unwrap();
+        let handler = node_a.get_handler("move-vol").await.unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
+        let first = node_a.snapshot_export_owned("move-vol", None, Some("cap-a")).await.unwrap();
+        node_a.remove_export("move-vol", false).await.unwrap();
+
+        let node_b = create_test_router_on(&dir_b, store).await;
+        node_b.create_export(test_export_config("move-vol"), false, None, None).await.unwrap();
+        let handler = node_b.get_handler("move-vol").await.unwrap();
+        handler.write(4096, &[0xBB; 4096], false).await.unwrap();
+        let second = node_b.snapshot_export_owned("move-vol", None, Some("cap-b")).await.unwrap();
+        assert!(second.sequence > first.sequence, "{} must be above {}", second.sequence, first.sequence);
+        assert_eq!(node_b.list_export_snapshots("move-vol").await.unwrap(), vec![first.sequence, second.sequence]);
     }
 
     /// An owned cut whose request is older than the bound writes no marker and no manifest, so a closed tag's marker can expire.
