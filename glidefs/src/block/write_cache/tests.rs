@@ -4251,3 +4251,111 @@ fn cut_hold_structure() {
         assert!(i - cfg < 400, "router.rs calls owned_cut_answer outside the flush lock");
     }
 }
+
+// ========================================================================
+// Block counters after a restart (P.volume.glidefs-block-counters-equal-the-block-phases)
+// ========================================================================
+
+/// The number of blocks of the cache's state map in `phase`.
+fn blocks_in(cache: &WriteCache<Active>, phase: u8) -> u64 {
+    cache.inner.state_map.iter_present().filter(|&(_, s)| s == phase).count() as u64
+}
+
+/// A restart over persisted CLEAN and DIRTY blocks: the dirty counter is the number of DIRTY blocks. `init.rs` took a CLEAN block's demotion
+/// off a counter that `load_metadata` never counted it in, so 4 CLEAN over 4 DIRTY blocks left the counter at 0 and the flush scheduler
+/// skipped the dirty blocks and a detach reported drained.
+#[tokio::test]
+async fn a_restart_counts_the_dirty_blocks_the_metadata_holds() {
+    let dir = TempDir::new().unwrap();
+    let config = test_config(dir.path());
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+        for i in 0..8u64 {
+            cache.write(i * 4096, &vec![0x40 + i as u8; 4096]).unwrap();
+        }
+        // Blocks 4..8 were flushed and are CLEAN; blocks 0..4 are DIRTY.
+        for i in 4..8usize {
+            cache
+                .inner
+                .state_map
+                .cas(i, SparseBlockState::DIRTY, SparseBlockState::CLEAN)
+                .unwrap();
+        }
+        cache.save_metadata().unwrap();
+    }
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+    assert_eq!(blocks_in(&cache, SparseBlockState::DIRTY), 4);
+    assert_eq!(cache.dirty_block_count(), 4, "the counter is the number of DIRTY blocks");
+    assert_eq!(cache.syncing_block_count(), blocks_in(&cache, SparseBlockState::SYNCING));
+}
+
+/// A restart whose WAL holds a write over a block the metadata has SYNCING (a rotation, then a guest write, then a crash): the block is
+/// DIRTY once and counts once. `init.rs` counted it in the load (SYNCING) and again for the WAL entry.
+#[tokio::test]
+async fn a_wal_entry_over_a_syncing_block_counts_it_once() {
+    let dir = TempDir::new().unwrap();
+    let config = bottomless_config(dir.path());
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+        cache.write(0, &vec![0x51; 4096]).unwrap();
+        cache.write(4096, &vec![0x52; 4096]).unwrap();
+        let snapshot = cache.rotate_and_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        cache.save_metadata().unwrap();
+        // Post-rotation write to block 0: SYNCING -> DIRTY, in the WAL after the metadata.
+        cache.write(0, &vec![0x53; 4096]).unwrap();
+    }
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+    let dirty = blocks_in(&cache, SparseBlockState::DIRTY);
+    assert_eq!(dirty, 2);
+    assert_eq!(cache.dirty_block_count(), dirty, "every block counts once");
+    assert_eq!(cache.syncing_block_count(), blocks_in(&cache, SparseBlockState::SYNCING));
+}
+
+/// The post-takeover recovery of blocks the predecessor left SYNCING takes them out of the syncing counter whichever way it ends: copied back
+/// (DIRTY) or evicted (the predecessor finished).
+#[tokio::test]
+async fn post_takeover_recovery_leaves_the_counters_at_the_phases() {
+    for finished in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let config = bottomless_config(dir.path());
+        let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+        for i in 0..3u64 {
+            cache.write(i * 4096, &vec![0x60 + i as u8; 4096]).unwrap();
+        }
+        assert_eq!(cache.rotate_and_snapshot().unwrap().len(), 3);
+        assert_eq!(cache.syncing_block_count(), 3);
+        if finished {
+            std::fs::remove_file(cache.inner.config.flushing_path()).unwrap();
+        }
+        cache.recover_pending_flush_file().unwrap();
+        assert_eq!(blocks_in(&cache, SparseBlockState::SYNCING), 0);
+        assert_eq!(cache.syncing_block_count(), 0, "finished={finished}");
+        assert_eq!(
+            cache.dirty_block_count(),
+            blocks_in(&cache, SparseBlockState::DIRTY),
+            "finished={finished}"
+        );
+    }
+}
+
+/// The kernel names the phases the way `SparseBlockState` does.
+#[test]
+fn the_counter_kernel_names_the_block_phases() {
+    use glidefs_kernels::block_counters as k;
+    assert_eq!(k::CLEAN, SparseBlockState::CLEAN);
+    assert_eq!(k::DIRTY, SparseBlockState::DIRTY);
+    assert_eq!(k::SYNCING, SparseBlockState::SYNCING);
+}
