@@ -5502,6 +5502,21 @@ mod tests {
     /// `snapshot_persisted` is built. (2) A fork from a snapshot copies the snapshot's manifest as the child's own and puts it in the store before
     /// `create_export` returns, reading the source only from the store (the snapshot's manifest, or the cache of that immutable object), never
     /// from this node's disk.
+    /// The first local-disk marker in the part of a fork that handles the source, if any.
+    fn fork_source_reads_local_disk(span: &str) -> Option<&'static str> {
+        ["std::fs", "tokio::fs", "File::open", "cache_dir"].into_iter().find(|m| span.contains(m))
+    }
+
+    /// The pin can fail: a local read placed BEFORE the store read is seen, one after the copy is not the source's.
+    #[test]
+    fn snapshot_objects_structure_pin_goes_red_on_a_local_read_before_the_store_read() {
+        let before = "let b = std::fs::read(path); let s = get_snapshot(manifest_name, seq); let mut vm = fork_vm;";
+        let clean = "let s = get_snapshot(manifest_name, seq); let mut vm = fork_vm;";
+        let copy = |t: &str| t.find("let mut vm = fork_vm;").unwrap();
+        assert_eq!(fork_source_reads_local_disk(&before[..copy(before)]), Some("std::fs"));
+        assert_eq!(fork_source_reads_local_disk(&clean[..copy(clean)]), None);
+    }
+
     #[test]
     fn snapshot_objects_structure() {
         fn body<'a>(src: &'a str, head: &str) -> &'a str {
@@ -5529,11 +5544,9 @@ mod tests {
         let copy = fork.find("let mut vm = fork_vm;").expect("the child's manifest is a copy of the snapshot's");
         let put = fork.find(".put_manifest(&name, manifest_bytes, None)").expect("the child's manifest is put in the store");
         assert!(read < copy && copy < put, "the order is: read the snapshot, copy it, store the copy");
-        // Only the span from the store read to the copy sees the source: the child's own fresh cache (`cache_dir`) is opened after it.
-        let source_span = &fork[read..copy];
-        for local in ["std::fs", "tokio::fs", "File::open", "cache_dir"] {
-            assert!(!source_span.contains(local), "the fork must not read the source from this node's disk: {local}");
-        }
+        // Everything from the fork's start to the copy sees the source; the child's own fresh cache (`cache_dir`) opens after it.
+        let bad = fork_source_reads_local_disk(&fork[..copy]);
+        assert!(bad.is_none(), "the fork must not read the source from this node's disk: {bad:?}");
     }
 
     #[tokio::test]
