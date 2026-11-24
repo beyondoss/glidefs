@@ -418,8 +418,9 @@ impl ContentStore {
             Err(e) => return Err(e.into()),
         }
         let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
-        let seq_name = format!("{sequence:020}");
-        let mut markers = Vec::new();
+        // Every marker of the export as `{owner}/{sequence:020}`; `glidefs_kernels::snapshot_owner::markers_to_delete` picks the ones of this
+        // sequence, whoever the owner (`mut_delete_keeps_markers`, `mut_delete_one_owner` turn its proof red).
+        let mut found: Vec<(ObjectPath, String, u64)> = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
             let meta = match result {
@@ -429,10 +430,24 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if meta.location.filename() == Some(seq_name.as_str()) {
-                markers.push(meta.location);
+            if let Some(rel) = meta.location.prefix_match(&prefix) {
+                let parts: Vec<_> = rel.collect();
+                if let [marker_owner, filename] = parts.as_slice()
+                    && let Ok(seq) = filename.as_ref().parse::<u64>()
+                {
+                    let owner = marker_owner.as_ref().to_string();
+                    found.push((meta.location.clone(), owner, seq));
+                }
             }
         }
+        let listed: Vec<glidefs_kernels::snapshot_owner::Marker<'_>> = found
+            .iter()
+            .map(|(_, o, s)| glidefs_kernels::snapshot_owner::Marker { owner: o.as_bytes(), sequence: *s })
+            .collect();
+        let markers: Vec<ObjectPath> = glidefs_kernels::snapshot_owner::markers_to_delete(&listed, sequence)
+            .into_iter()
+            .map(|i| found[i].0.clone())
+            .collect();
         for marker in markers {
             match self.object_store.delete(&marker).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}

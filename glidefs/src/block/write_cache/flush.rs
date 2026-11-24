@@ -2039,9 +2039,9 @@ impl WriteCache<Active> {
         // (`glidefs_kernels::snapshot_owner`: `a_retried_cut_returns_the_same_sequence`.)
         #[cfg(not(feature = "mut_owner_check_outside_lock"))]
         if let Some(owner) = owner {
-            let answer = self.owned_cut_answer(content_store, owner).await?;
+            let view = self.owned_cut_view(content_store, owner).await?;
             let closed = content_store.owner_closed(&self.inner.export_name, owner).await?;
-            match glidefs_kernels::snapshot_owner::owned_cut_decision(closed, answer) {
+            match glidefs_kernels::snapshot_owner::owned_cut_plan(&view, closed) {
                 glidefs_kernels::snapshot_owner::CutDecision::Answer(sequence) => {
                     return Ok(SnapshotResult {
                         manifest_etag: None,
@@ -2141,17 +2141,27 @@ impl WriteCache<Active> {
         Ok(())
     }
 
+    /// What `owner` cut of this export: one entry per owner marker, with whether its manifest exists.
+    pub(crate) async fn owned_cut_view(
+        &self,
+        content_store: &ContentStore,
+        owner: &str,
+    ) -> Result<Vec<(u64, bool)>, CacheError> {
+        let name = &self.inner.export_name;
+        let mut owned = Vec::new();
+        for sequence in content_store.list_snapshots_owned(name, owner).await? {
+            owned.push((sequence, content_store.get_snapshot(name, sequence).await?.is_some()));
+        }
+        Ok(owned)
+    }
+
     /// The sequence `owner` already cut of this export, if any: the highest owner marker that has a manifest.
     pub(crate) async fn owned_cut_answer(
         &self,
         content_store: &ContentStore,
         owner: &str,
     ) -> Result<Option<u64>, CacheError> {
-        let name = &self.inner.export_name;
-        let mut owned = Vec::new();
-        for sequence in content_store.list_snapshots_owned(name, owner).await? {
-            owned.push((sequence, content_store.get_snapshot(name, sequence).await?.is_some()));
-        }
+        let owned = self.owned_cut_view(content_store, owner).await?;
         Ok(glidefs_kernels::snapshot_owner::retry_answer(&owned))
     }
 }
