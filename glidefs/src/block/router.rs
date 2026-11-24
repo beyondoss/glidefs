@@ -1169,7 +1169,7 @@ impl ExportRouter {
         my_gen: u64,
         my_lease: u64,
     ) -> Result<crate::block::fence::Fence, RouterError> {
-        use crate::block::fence::{compose_token, fence_attach, Fence};
+        use crate::block::fence::Fence;
 
         let (content_store, volume_manifest, cache) = {
             let entry = self
@@ -1191,24 +1191,19 @@ impl ExportRouter {
                 let m = volume_manifest.read();
                 (m.generation, m.lease_revision)
             };
-            if fence_attach(stored_gen, stored_lease, my_gen, my_lease) == Fence::Reject {
+            // The decision is the proven kernel's (`fence_kernel::attach_seize`): grant iff the caller's composite token is at least the
+            // stored one, the volume then holds the caller's token (a refusal leaves the stored one), and a grant stamps only a higher token.
+            // The `0/0` caller against an unfenced volume is granted with equal tokens: nothing to stamp.
+            let d = crate::block::fence::attach_seize(stored_gen, stored_lease, my_gen, my_lease);
+            if d.fence == Fence::Reject {
                 return Ok(Fence::Reject);
             }
-
-            // Granted. The accepted token is the higher composite of the two
-            // (== my token once the fence passes, unless this is the 0/0 bypass).
-            // Decompose it back into (generation, lease_revision) to stamp.
-            let stored_token = compose_token(stored_gen, stored_lease);
-            let my_token = compose_token(my_gen, my_lease);
-            let effective_token = stored_token.max(my_token);
-            let effective_gen = (effective_token >> 64) as u64;
-            let effective_lease = (effective_token & u128::from(u64::MAX)) as u64;
+            let (effective_gen, effective_lease) = (d.holder_generation, d.holder_lease_revision);
             *cache.inner.current_generation.lock() = effective_gen;
             *cache.inner.current_lease_revision.lock() = effective_lease;
 
-            // No seize needed: a fully non-participating caller (0/0 bypass), or
-            // an equal-token re-attach that doesn't change the stored value.
-            if (my_gen == 0 && my_lease == 0) || effective_token == stored_token {
+            // No seize needed: an equal-token re-attach (which includes a fully non-participating 0/0 caller) doesn't change the stored value.
+            if !d.seize {
                 return Ok(Fence::Grant);
             }
 
@@ -3474,7 +3469,7 @@ impl ExportRouter {
                 .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
                 .await
                 .map_err(RouterError::Cache)?;
-            if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 {
+            if crate::block::detach::drained(stats.blocks_claimed as u64, cache.dirty_block_count(), cache.syncing_block_count()) {
                 info!("Export '{}' drained successfully", name);
                 return Ok(());
             }
@@ -3487,7 +3482,12 @@ impl ExportRouter {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
-        let remaining = cache.dirty_block_count();
+        let remaining = crate::block::detach::remaining_after_drain(
+            crate::block::detach::DrainEnd::Exhausted,
+            cache.dirty_block_count(),
+            cache.syncing_block_count(),
+            true,
+        );
         warn!(
             "drain hit iteration limit ({}), {} dirty blocks remain",
             MAX_DRAIN_ITERATIONS, remaining,
@@ -3740,6 +3740,25 @@ impl ExportRouter {
     /// **Idempotent**: If export doesn't exist, returns Ok(()) without error.
     pub async fn remove_export(&self, name: &str, purge: bool) -> Result<(), RouterError> {
         validate_export_name(name)?;
+        // A detach drains BEFORE the export leaves the map: a drain that cannot finish (the store is down, the manifest cannot be published)
+        // is an error the caller retries against the same export, whose dirty blocks and cache are still here. Removing first would make the
+        // retry find nothing to remove and report a detach that never flushed.
+        if !purge {
+            let parts = self.exports.get(name).map(|e| {
+                let s = e.value();
+                (Arc::clone(&s.cache), Arc::clone(&s.content_store), Arc::clone(&s.pack_index_cache), Arc::clone(&s.volume_manifest), Arc::clone(&s.metrics))
+            });
+            if let Some((cache, content_store, pack_index_cache, volume_manifest, metrics)) = parts {
+                let end = Self::drain_until_clean(name, &cache, &content_store, &pack_index_cache, &volume_manifest, &metrics).await;
+                // The final manifest sync is part of the gate: the export leaves the map only when nothing is owed (`detach::leaves_the_map`).
+                let final_sync_ok = end == crate::block::detach::DrainEnd::Fenced || cache.sync_manifest(&content_store, &volume_manifest).await.is_ok();
+                let (dirty, syncing) = (cache.dirty_block_count(), cache.syncing_block_count());
+                if !crate::block::detach::leaves_the_map(end, dirty, syncing, final_sync_ok) {
+                    let remaining = crate::block::detach::remaining_after_drain(end, dirty, syncing, final_sync_ok);
+                    return Err(RouterError::DrainIncomplete { name: name.to_string(), remaining, iterations: MAX_DRAIN_ITERATIONS });
+                }
+            }
+        }
         let state = {
             match self.exports.remove(name) {
                 Some((_k, state)) => state,
@@ -3814,7 +3833,7 @@ impl ExportRouter {
             }
         }
 
-        if remaining > 0 {
+        if !crate::block::detach::detach_reported(remaining) {
             return Err(RouterError::DrainIncomplete {
                 name: name.to_string(),
                 remaining,
@@ -3916,6 +3935,44 @@ impl ExportRouter {
         }
     }
 
+    /// The drain loop: flush to S3 pass by pass until a successful pass leaves nothing dirty, claimed or syncing (`detach::drained`), a newer
+    /// fence token supersedes this writer, or the passes run out. Errors back off (100 ms doubling to 5 s) and retry.
+    async fn drain_until_clean(
+        name: &str,
+        cache: &Arc<WriteCache<Active>>,
+        content_store: &Arc<ContentStore>,
+        pack_index_cache: &Arc<PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+        metrics: &Arc<ExportMetrics>,
+    ) -> crate::block::detach::DrainEnd {
+        use crate::block::detach::DrainEnd;
+        let mut backoff = Duration::from_millis(100);
+        for _ in 0..MAX_DRAIN_ITERATIONS {
+            match cache.flush_to_s3(content_store, pack_index_cache, volume_manifest).await {
+                Ok(stats) if crate::block::detach::drained(stats.blocks_claimed as u64, cache.dirty_block_count(), cache.syncing_block_count()) => {
+                    return DrainEnd::Done;
+                }
+                Ok(_) => {
+                    backoff = Duration::from_millis(100);
+                }
+                // Superseded by a newer fence token: the volume belongs to another holder now. Retrying cannot succeed and the dirty blocks
+                // were never committed (correctly dropped); looping here is what held an evacuated source's export for minutes.
+                Err(e @ CacheError::Fenced { .. }) => {
+                    metrics.record_flush_error();
+                    warn!("Teardown drain for '{}' abandoned: {}", name, e);
+                    return DrainEnd::Fenced;
+                }
+                Err(e) => {
+                    metrics.record_flush_error();
+                    warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        DrainEnd::Exhausted
+    }
+
     /// Drain dirty blocks, stop flush scheduler, and transition cache through
     /// the Draining typestate. Shared by `remove_export` and `shutdown`.
     ///
@@ -4003,59 +4060,22 @@ impl ExportRouter {
             //    breaking — matches the public ExportState::drain() behavior.
             //    Exponential backoff on consecutive errors prevents tight-looping
             //    when S3 is down (100 rapid retries → log spam + wasted network).
-            let mut drain_done = false;
-            let mut fenced_out = false;
-            let mut backoff = Duration::from_millis(100);
-            for _ in 0..MAX_DRAIN_ITERATIONS {
-                match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                    Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
-                        drain_done = true;
-                        break;
-                    }
-                    Ok(_) => {
-                        backoff = Duration::from_millis(100);
-                    }
-                    // Superseded by a newer fence token: the volume belongs to
-                    // another holder now. Retrying cannot succeed and the dirty
-                    // blocks were never committed (correctly dropped); looping
-                    // here is what held an evacuated source's export for
-                    // minutes.
-                    Err(e @ CacheError::Fenced { .. }) => {
-                        metrics.record_flush_error();
-                        warn!("Teardown drain for '{}' abandoned: {}", name, e);
-                        fenced_out = true;
-                        break;
-                    }
-                    Err(e) => {
-                        metrics.record_flush_error();
-                        warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
-                    }
-                }
-            }
-            let remaining = if drain_done {
-                0
-            } else {
-                cache.dirty_block_count()
-            };
-            if remaining > 0 {
-                warn!(
-                    "Teardown drain for '{}' incomplete, {} dirty blocks remain",
-                    name, remaining,
-                );
-            }
+            let end = Self::drain_until_clean(name, &cache, &content_store, &pack_index_cache, &volume_manifest, &metrics).await;
+            let fenced_out = end == crate::block::detach::DrainEnd::Fenced;
 
-            // Best-effort final manifest sync — persists references to any packs
-            // that were successfully uploaded even if the full drain didn't complete.
-            // A superseded writer never writes the manifest again.
-            if !fenced_out
-                && let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await
-            {
-                warn!(
-                    "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
-                    name, e,
-                );
+            // Final manifest sync — persists references to any packs that were successfully uploaded. A superseded writer never writes the
+            // manifest again. A failure is owed, never logged and reported: a detach whose manifest is not in the store is not a flush.
+            let final_sync_ok = if fenced_out {
+                true
+            } else if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
+                warn!("Final manifest sync for '{}' failed: {} — the detach is not reported", name, e);
+                false
+            } else {
+                true
+            };
+            let remaining = crate::block::detach::remaining_after_drain(end, cache.dirty_block_count(), cache.syncing_block_count(), final_sync_ok);
+            if remaining > 0 {
+                warn!("Teardown drain for '{}' incomplete, {} blocks owed", name, remaining);
             }
 
             remaining
@@ -6805,5 +6825,184 @@ mod tests {
              got 0x{:02x} — sub-block write destroyed unwritten data",
             second_4k[0],
         );
+    }
+
+    // ── A detach is reported only when the data is durable (P.volume.a-glidefs-detach-flushes-the-device-to-the-store) ──
+
+    /// An object store whose manifest PUTs fail while `fail_manifest` is set: pack uploads succeed, so a flush gets the data into S3 but
+    /// cannot publish the manifest that names it.
+    #[derive(Debug)]
+    struct ManifestFailingStore {
+        inner: object_store::memory::InMemory,
+        fail_manifest: std::sync::atomic::AtomicBool,
+        /// Manifest PUTs seen so far (attempts, failed or not), and the 1-based count from which they fail (`usize::MAX`: never).
+        manifest_puts: std::sync::atomic::AtomicUsize,
+        fail_from: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for ManifestFailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ManifestFailingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ManifestFailingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let is_manifest = location.as_ref().contains("manifests/");
+            let nth = if is_manifest { self.manifest_puts.fetch_add(1, Ordering::SeqCst) + 1 } else { 0 };
+            if is_manifest && (self.fail_manifest.load(Ordering::SeqCst) || nth >= self.fail_from.load(Ordering::SeqCst)) {
+                return Err(object_store::Error::Generic {
+                    store: "ManifestFailingStore",
+                    source: Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "simulated manifest PUT outage")),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A write, then every manifest PUT fails: the detach is NOT reported (`DrainIncomplete`), and once the store recovers the same detach is
+    /// reported and a fresh router reads the written data from the store. The drain's backoff sleeps run on a paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_detach_is_not_reported_while_the_manifest_cannot_be_published() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(ManifestFailingStore {
+            inner: object_store::memory::InMemory::new(),
+            fail_manifest: std::sync::atomic::AtomicBool::new(false),
+            manifest_puts: std::sync::atomic::AtomicUsize::new(0),
+            fail_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        let mk = |dir: &TempDir, store: Arc<dyn ObjectStore>| {
+            let cfg = RouterConfig {
+                object_store: store,
+                db_path: "test".to_string(),
+                cache_dir: dir.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+                pack_index_cache: None,
+                wal_sync: false,
+                max_s3_uploads: 0,
+                max_s3_downloads: 0,
+                default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+                ublk_nr_queues: 1,
+                ublk_max_devices: None,
+                nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
+                manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+                profile: None,
+            };
+            async move { ExportRouter::new(cfg).await.expect("router") }
+        };
+        let router = mk(&temp_dir, store.clone()).await;
+        router.create_export(test_export_config("durable"), false, None, None).await.unwrap();
+        let handler = router.get_handler("durable").await.unwrap();
+        handler.write(0, &[0xAB; 128 * 1024], false).await.unwrap();
+        drop(handler);
+
+        store.fail_manifest.store(true, Ordering::SeqCst);
+        let first = router.remove_export("durable", false).await;
+        assert!(first.is_err(), "the manifest could not be published, so the detach must not be reported: {first:?}");
+
+        // The export is still attached: the failed detach lost nothing, and the retry has its dirty blocks.
+        assert!(router.get_export_info("durable").await.is_some(), "a detach that was not reported leaves the export to retry");
+
+        // The store recovers; the S3 circuit breaker (opened by the outage) half-opens after its 30 s real-time reset.
+        store.fail_manifest.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(31));
+        let again = router.remove_export("durable", false).await;
+        assert!(again.is_ok(), "the retried detach is reported once the store recovers: {again:?}");
+
+        // Another node attaching the volume reads what was written.
+        let temp2 = TempDir::new().unwrap();
+        let other = mk(&temp2, store.clone()).await;
+        other.create_export(test_export_config("durable"), false, None, None).await.unwrap();
+        let h = other.get_handler("durable").await.unwrap();
+        let got = h.read(0, 4096).await.unwrap();
+        assert_eq!(&got[..4], &[0xAB; 4], "the written block is in the store for the next attach");
+    }
+
+    /// A clean drain pass, then the FINAL manifest sync fails: the detach is not reported, the export is still in the map, and the retry
+    /// resumes it and is reported (P.volume.a-glidefs-detach-flushes-the-device-to-the-store; Verus: `detach_kernel::leaves_the_map`).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_final_sync_keeps_the_export_for_the_retry() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(ManifestFailingStore {
+            inner: object_store::memory::InMemory::new(),
+            fail_manifest: std::sync::atomic::AtomicBool::new(false),
+            manifest_puts: std::sync::atomic::AtomicUsize::new(0),
+            fail_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        let cfg = RouterConfig {
+            object_store: store.clone(),
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+            ublk_nr_queues: 1,
+            ublk_max_devices: None,
+            nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
+        };
+        let router = ExportRouter::new(cfg).await.unwrap();
+        // Probe: how many manifest PUTs one clean detach of one written block makes (the last is the final sync).
+        router.create_export(test_export_config("probe"), false, None, None).await.unwrap();
+        router.get_handler("probe").await.unwrap().write(0, &[0x11; 128 * 1024], false).await.unwrap();
+        let before = store.manifest_puts.load(Ordering::SeqCst);
+        router.remove_export("probe", false).await.unwrap();
+        let per_detach = store.manifest_puts.load(Ordering::SeqCst) - before;
+        assert!(per_detach >= 2, "a detach drains and then syncs: {per_detach} manifest PUTs");
+
+        router.create_export(test_export_config("durable"), false, None, None).await.unwrap();
+        router.get_handler("durable").await.unwrap().write(0, &[0xCD; 128 * 1024], false).await.unwrap();
+        // A detach's manifest PUTs: the drain's, the gate's final sync, then the teardown's own pass and sync (two). Everything passes except the
+        // gate's final sync, the third from the end, and what follows it.
+        assert!(per_detach >= 4, "{per_detach} manifest PUTs per detach");
+        let start = store.manifest_puts.load(Ordering::SeqCst);
+        store.fail_from.store(start + per_detach - 2, Ordering::SeqCst);
+        let first = router.remove_export("durable", false).await;
+        assert!(first.is_err(), "the final manifest sync failed, so the detach must not be reported: {first:?}");
+        assert!(router.get_export_info("durable").await.is_some(), "the export stays in the map so the retry finds it");
+
+        store.fail_from.store(usize::MAX, Ordering::SeqCst);
+        let again = router.remove_export("durable", false).await;
+        assert!(again.is_ok(), "the retry resumes the owed sync and is reported: {again:?}");
+        assert!(router.get_export_info("durable").await.is_none());
     }
 }

@@ -3,6 +3,7 @@
 //! in each module's `verus!` block and `scripts/verify-kernels.sh` checks them.
 
 pub mod attach_kernel;
+pub mod detach_kernel;
 pub mod fence_kernel;
 pub mod flush_kernel;
 pub mod pack_liveness;
