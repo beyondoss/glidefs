@@ -332,9 +332,9 @@ impl ContentStore {
     #[instrument(skip(self), fields(name = %name))]
     pub async fn gc_closed_owners(&self, name: &str, bound_secs: u64) -> Result<usize, ContentStoreError> {
         self.check_circuit()?;
+        // Age is the store's own clock against the store's own `last_modified`, never this machine's clock (`parse_object_store::store_now_secs`).
         let prefix = ObjectPath::from(format!("{}/snapshot-owners/{}/", self.base_path, name));
-        let now = chrono::Utc::now();
-        let mut due = Vec::new();
+        let mut listed = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
             let meta = match result {
@@ -345,12 +345,21 @@ impl ContentStore {
                 }
             };
             if meta.location.filename() == Some("closed") {
-                let age = u64::try_from((now - meta.last_modified).num_seconds()).unwrap_or(0);
-                if glidefs_kernels::snapshot_owner::closed_marker_removable(age, bound_secs) {
-                    due.push(meta.location);
-                }
+                listed.push(meta);
             }
         }
+        // Read after the listing, so the clock is at or after the listing's own response; no reading yet means nothing is removed.
+        let Some(store_now) = crate::parse_object_store::store_now_secs() else {
+            return Ok(0);
+        };
+        let due: Vec<_> = listed
+            .into_iter()
+            .filter(|meta| {
+                let lm = u64::try_from(meta.last_modified.timestamp()).unwrap_or(u64::MAX);
+                glidefs_kernels::snapshot_owner::closed_marker_removable(lm, store_now, bound_secs)
+            })
+            .map(|meta| meta.location)
+            .collect();
         let n = due.len();
         for marker in due {
             match self.object_store.delete(&marker).await {

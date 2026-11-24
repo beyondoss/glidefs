@@ -72,6 +72,8 @@ mut_cut_steps_skip_the_lock = []
 
 # The closed marker's keep age leaves out the clock skew of reading S3's `last_modified` against GlideFS's clock: Verus red on `snapshot_owner::a_removed_closed_marker_has_no_late_cut_to_stop`.
 mut_keep_omits_clock_skew = []
+# The marker's age is read against this machine's clock (up to the skew ahead of S3's): the removal can come early.
+mut_removable_on_local_clock = []
 
 # The purge gate admits every key, a pack's included: Verus red on `purge_gate::not_a_pack`.
 mut_purge_gate_admits_packs = []

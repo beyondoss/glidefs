@@ -4383,6 +4383,8 @@ mod tests {
     }
 
     async fn create_test_router(temp_dir: &TempDir) -> ExportRouter {
+        // The in-memory store's clock is this machine's.
+        crate::parse_object_store::set_store_is_local();
         create_test_router_on(temp_dir, Arc::new(object_store::memory::InMemory::new())).await
     }
 

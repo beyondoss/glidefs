@@ -42,6 +42,7 @@ mut_detach_ignores_the_final_sync = ["glidefs-kernels/mut_detach_ignores_the_fin
 mut_export_leaves_before_the_final_sync = ["glidefs-kernels/mut_export_leaves_before_the_final_sync"]
 mut_owner_check_outside_lock = []
 mut_keep_omits_clock_skew = ["glidefs-kernels/mut_keep_omits_clock_skew"]
+mut_removable_on_local_clock = ["glidefs-kernels/mut_removable_on_local_clock"]
 mut_cut_steps_skip_the_lock = ["glidefs-kernels/mut_cut_steps_skip_the_lock"]
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests

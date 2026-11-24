@@ -17,6 +17,7 @@
 // under the License.
 
 use object_store::ClientOptions;
+use object_store::client::{HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector};
 
 /// The object-store client's request timeout when none is configured. `glidefs_kernels::snapshot_owner::STORE_WRITE_SLACK_SECS` is at least
 /// the slack's request-timeout terms (`slack_tests`).
@@ -44,8 +45,64 @@ use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use url::Url;
+
+/// The store's own clock, read from the `Date` header of its responses (S3 stamps `last_modified` and `Date` from one clock). The newest
+/// `Date` any response carried, in unix seconds, or 0 before the first. Every `Date` is at or before the store's clock now, so an age
+/// measured against it is never longer than the true age: the closed-marker removal errs toward keeping
+/// (`snapshot_owner::closed_marker_removable`).
+static STORE_DATE_SECS: AtomicI64 = AtomicI64::new(0);
+/// The store is on this machine (`file:`, `memory:`), so its clock is the local one.
+static STORE_IS_LOCAL: AtomicBool = AtomicBool::new(false);
+
+/// The store's clock now, in unix seconds: the local clock for a local store, else the newest response `Date`. `None` before any response
+/// carried one: the caller must not remove anything on an age it cannot measure.
+pub fn store_now_secs() -> Option<u64> {
+    if STORE_IS_LOCAL.load(Ordering::Acquire) {
+        return u64::try_from(chrono::Utc::now().timestamp()).ok();
+    }
+    u64::try_from(STORE_DATE_SECS.load(Ordering::Acquire)).ok().filter(|&d| d > 0)
+}
+
+/// Mark the store as local (tests that run the router on an in-memory store).
+pub fn set_store_is_local() {
+    STORE_IS_LOCAL.store(true, Ordering::Release);
+}
+
+fn record_store_date(resp: &HttpResponse) {
+    if let Some(date) = resp
+        .headers()
+        .get("date")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+    {
+        STORE_DATE_SECS.fetch_max(date.timestamp(), Ordering::AcqRel);
+    }
+}
+
+/// The reqwest client, recording the `Date` of every response.
+#[derive(Debug)]
+struct DateRecording(HttpClient);
+
+#[async_trait::async_trait]
+impl HttpService for DateRecording {
+    async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let resp = self.0.execute(req).await?;
+        record_store_date(&resp);
+        Ok(resp)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DateRecordingConnector(ReqwestConnector);
+
+impl HttpConnector for DateRecordingConnector {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        Ok(HttpClient::new(DateRecording(self.0.connect(options)?)))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -214,13 +271,20 @@ where
         .with_timeout(request_timeout);
 
     let store: Box<dyn ObjectStore> = match scheme {
-        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()),
-        ObjectStoreScheme::Memory => Box::new(InMemory::new()),
+        ObjectStoreScheme::Local => {
+            set_store_is_local();
+            Box::new(LocalFileSystem::new())
+        },
+        ObjectStoreScheme::Memory => {
+            set_store_is_local();
+            Box::new(InMemory::new())
+        },
         ObjectStoreScheme::AmazonS3 => {
             let builder = options.into_iter().fold(
                 object_store::aws::AmazonS3Builder::new()
                     .with_url(url.to_string())
-                    .with_client_options(client_options),
+                    .with_client_options(client_options)
+                    .with_http_connector(DateRecordingConnector::default()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -232,7 +296,8 @@ where
             let builder = options.into_iter().fold(
                 object_store::gcp::GoogleCloudStorageBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(client_options),
+                    .with_client_options(client_options)
+                    .with_http_connector(DateRecordingConnector::default()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -244,7 +309,8 @@ where
             let builder = options.into_iter().fold(
                 object_store::azure::MicrosoftAzureBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(client_options),
+                    .with_client_options(client_options)
+                    .with_http_connector(DateRecordingConnector::default()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
