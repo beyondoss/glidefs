@@ -17,9 +17,9 @@
 //! * [`thm_a_clone_holds_the_snapshots_files_after_its_source_is_gone`]: a disk forked from a snapshot keeps, through the source's purge and
 //!   any events after it that do not touch the child, the manifest the snapshot captured and every pack it names (P.snapshot.a-sandbox-created-from-a-filesystem-snapshot-has-the-files-the-snapshot-captured-after-the-source-is-gone).
 //!
-//! Mutation (`scripts/verify-kernels.sh --features mut_x` must go red): `mut_report_without_index` (a cut whose index entry was not saved
-//! is reported persisted). The collector's mutants (`mut_gc_reclaims_named`, `mut_gc_ignores_manifests`) turn `pack_liveness::pack_verdict`'s
-//! proof red, which is the spec this model's collector step calls.
+//! Mutations (`scripts/verify-kernels.sh --features mut_x` must go red): `mut_report_without_index` (a cut whose index entry was not saved
+//! is reported persisted); `mut_gc_reclaims_named` (the collector step reclaims a named pack past its grace period: the clone theorem goes red;
+//! it also turns `pack_liveness::pack_verdict`'s proof red). `mut_gc_ignores_manifests` turns `pack_verdict`'s proof red.
 
 #[cfg(verus_only)]
 use crate::pack_liveness::{verdict_spec, Verdict};
@@ -105,6 +105,18 @@ pub open spec fn fetchable(st: Store, x: Snap) -> bool {
     &&& forall|p: int| #[trigger] st.snaps[x].contains(p) ==> st.packs.contains(p)
 }
 
+/// The collector's verdict on a pack in this model: `pack_liveness::verdict_spec`, the contract of the `pack_verdict` that `reconcile_prefix`
+/// calls. Mutation `mut_gc_reclaims_named` reclaims a named pack once its grace period passed, which the clone theorem forbids.
+#[cfg(not(feature = "mut_gc_reclaims_named"))]
+pub open spec fn collector_verdict(in_manifest: bool, in_snapshot: bool, grace: bool) -> Verdict {
+    verdict_spec(in_manifest, in_snapshot, grace)
+}
+
+#[cfg(feature = "mut_gc_reclaims_named")]
+pub open spec fn collector_verdict(in_manifest: bool, in_snapshot: bool, grace: bool) -> Verdict {
+    if grace { Verdict::Reclaim } else { verdict_spec(in_manifest, in_snapshot, grace) }
+}
+
 pub open spec fn enabled(st: Store, e: Ev) -> bool {
     match e {
         Ev::Upload { p } => true,
@@ -137,7 +149,7 @@ pub open spec fn step(st: Store, e: Ev) -> Store {
         Ev::Gc { grace } => Store {
             packs: ISet::new(
                 |p: int|
-                    st.packs.contains(p) && verdict_spec(named_by_a_manifest(st, p), named_by_a_snapshot(st, p), grace(p)) != Verdict::Reclaim,
+                    st.packs.contains(p) && collector_verdict(named_by_a_manifest(st, p), named_by_a_snapshot(st, p), grace(p)) != Verdict::Reclaim,
             ),
             ..st
         },
