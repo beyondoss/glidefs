@@ -57,6 +57,11 @@ pub enum CacheError {
     #[error("flush failed; {blocks} claimed block(s) could not be copied back and stay in the flushing file")]
     FlushStranded { blocks: usize },
 
+    /// A flush could not rotate: an earlier flushing file stood in its way and could not be removed. It flushed nothing, so a cut that
+    /// ran it must not be published (`cut_publish::pass_verdict`).
+    #[error("flush could not rotate (an earlier flushing file is in the way); not publishing")]
+    FlushBlocked,
+
     #[error("Block evicted during flush — retry with backfill")]
     BlockEvicted,
 

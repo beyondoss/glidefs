@@ -99,6 +99,9 @@ pub struct FlushStats {
     /// Drives the flush scheduler's per-chunk age map for cooldown compaction.
     /// Empty when no packs were uploaded.
     pub touched_chunks: std::collections::HashSet<u32>,
+    /// The flush returned before it rotated, because an earlier flushing file stood in its way: it flushed nothing, though blocks may be
+    /// dirty. A cut never publishes after such a pass (`glidefs_kernels::cut_publish::pass_verdict`).
+    pub rotation_blocked: bool,
 }
 
 /// Result of a snapshot operation.

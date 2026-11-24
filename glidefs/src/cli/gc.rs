@@ -1200,6 +1200,48 @@ mod tests {
         assert!(!content_store.head_chunk_pack(chunk_idx, parent_only).await.unwrap());
     }
 
+    /// A clone of a snapshot keeps every pack the snapshot named after its source is deleted: the source's manifest and snapshots go (a purge
+    /// removes no pack) and the collector runs with no grace, twice (`snapshot_objects::thm_a_clone_holds_the_snapshots_files_after_its_source_is_gone`;
+    /// `mut_gc_reclaims_named` and `mut_gc_ignores_manifests` turn the proof of the verdict it calls red). The clone's manifest is the snapshot's
+    /// copy, put in the store at the fork; only a pack neither it nor any snapshot names is reclaimed.
+    #[tokio::test]
+    async fn a_snapshot_clone_keeps_its_packs_after_the_source_and_its_snapshots_are_deleted() {
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/pool");
+        let chunk_idx = 0u32;
+        let (captured, later, other_snapshot, nobody): (PackId, PackId, PackId, PackId) =
+            (0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 0x3333_3333_3333_3333, 0x4444_4444_4444_4444);
+        for pack in [captured, later, other_snapshot, nobody] {
+            content_store.put_chunk_pack(chunk_idx, pack, vec![0u8; 100]).await.unwrap();
+        }
+        // The source's snapshot 1 names `captured`; the source then wrote `later` (live manifest only); snapshot 2 names `other_snapshot`.
+        let mut at_cut = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        at_cut.append_pack(chunk_idx, captured, None);
+        content_store.put_snapshot("source", 1, at_cut.serialize().unwrap()).await.unwrap();
+        let mut at_cut_2 = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        at_cut_2.append_pack(chunk_idx, other_snapshot, None);
+        content_store.put_snapshot("source", 2, at_cut_2.serialize().unwrap()).await.unwrap();
+        let mut live = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        live.append_pack(chunk_idx, captured, None);
+        live.append_pack(chunk_idx, later, None);
+        content_store.put_manifest("source", live.serialize().unwrap(), None).await.unwrap();
+        // The fork of snapshot 1: the child's manifest is the snapshot's.
+        content_store.put_manifest("clone", at_cut.serialize().unwrap(), None).await.unwrap();
+
+        // The source is purged (its manifest and snapshots, never a pack).
+        content_store.delete_manifest("test", "source").await.unwrap();
+        content_store.delete_all_snapshots("test", "source").await.unwrap();
+
+        let mut state = new_gc_state_for_test();
+        for _ in 0..2 {
+            reconcile_prefix_for_test(&content_store, &mut state, Duration::ZERO, 100, false).await.unwrap();
+            assert!(content_store.head_chunk_pack(chunk_idx, captured).await.unwrap(), "the clone's pack is still readable");
+        }
+        for gone in [later, other_snapshot, nobody] {
+            assert!(!content_store.head_chunk_pack(chunk_idx, gone).await.unwrap(), "a pack nothing names is reclaimed");
+        }
+    }
+
     #[tokio::test]
     async fn test_gc_dry_run_doesnt_delete() {
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

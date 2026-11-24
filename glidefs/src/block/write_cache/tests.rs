@@ -3692,6 +3692,38 @@ async fn publish_flush_fails_on_unexplained_crc_skip() {
     );
 }
 
+/// A pass that never rotated flushed nothing, so no cut is published after it (`cut_publish::pass_verdict`: `blocked` is `Fail`): an
+/// earlier flushing file stands in the way and cannot be removed (a directory is at its path), a block is dirty, and the cut errors
+/// with `FlushBlocked` instead of publishing a manifest that lacks the write. Once the way is clear the same cut publishes it. Red under
+/// `mut_cut_ignores_blocked_flush`.
+#[tokio::test]
+async fn publish_flush_fails_when_the_rotation_is_blocked() {
+    let h = V2Harness::new().await;
+    h.cache.write(0, &vec![0xABu8; 4096]).unwrap();
+    let blocker = h.cache.inner().config.flushing_path();
+    std::fs::create_dir(&blocker).unwrap();
+
+    {
+        let _g = h.cache.flush_lock().lock().await;
+        let hold = glidefs_kernels::cut_hold::CutHold::under(&_g);
+        let res = h
+            .cache
+            .flush_until_no_skips(&hold, &h.content_store, &h.pack_index_cache, &h.volume_manifest, 3)
+            .await;
+        assert!(matches!(res, Err(super::CacheError::FlushBlocked)), "a pass that never rotated must not publish: {res:?}");
+    }
+    assert_eq!(h.cache.dirty_block_count(), 1, "the write is still dirty");
+
+    std::fs::remove_dir(&blocker).unwrap();
+    let _g = h.cache.flush_lock().lock().await;
+    let hold = glidefs_kernels::cut_hold::CutHold::under(&_g);
+    h.cache
+        .flush_until_no_skips(&hold, &h.content_store, &h.pack_index_cache, &h.volume_manifest, 3)
+        .await
+        .expect("the retry, with the way clear, flushes and publishes");
+    assert_eq!(h.cache.dirty_block_count(), 0, "the retried cut flushed the write");
+}
+
 /// The benign race: a write lands between the CRC drain and rotation, so the
 /// drained baseline is stale for the flushing file. The first pass skips the
 /// block; snapshot() must re-flush internally and succeed with the block's
