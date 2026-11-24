@@ -111,6 +111,15 @@ pub open spec fn inv(pool: Pool) -> bool {
     forall|d: int, p: int| pool.manifests.dom().contains(d) && #[trigger] pool.manifests[d].contains(p) ==> pool.packs.contains(p)
 }
 
+/// An empty pool (no disk, no pack) is in the invariant: the start of every sequence of events.
+pub proof fn lemma_the_empty_pool_is_in_the_invariant(pool: Pool)
+    requires
+        pool.manifests.dom() == Set::<int>::empty(),
+    ensures
+        inv(pool),
+{
+}
+
 pub proof fn lemma_every_event_keeps_the_invariant(pool: Pool, e: PEvent)
     requires
         inv(pool),

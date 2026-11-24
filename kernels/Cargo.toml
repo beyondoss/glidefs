@@ -51,7 +51,7 @@ mut_detach_ignores_the_final_sync = []
 mut_export_leaves_before_the_final_sync = []
 
 # A SYNCING block is evicted whether or not the manifest names it: Verus red on `flush_kernel::step`.
-mut_evict_uncovered = []
+mut_evict_before_manifest = []
 # A write to a SYNCING block leaves it SYNCING (the eviction drops the newer content): the same.
 mut_write_keeps_syncing = []
 

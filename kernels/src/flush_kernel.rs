@@ -16,7 +16,7 @@
 //! * [`thm_a_sleep_and_wake_reads_what_the_guest_wrote`]: in every reachable state (light sleep: the volume stays attached) a read returns the
 //!   last write; after a deep sleep the wake on any node reads the same.
 //!
-//! Mutations (`scripts/verify-kernels.sh --features mut_x` must go red): `mut_evict_uncovered` (a SYNCING block is evicted whether or not the
+//! Mutations (`scripts/verify-kernels.sh --features mut_x` must go red): `mut_evict_before_manifest` (a SYNCING block is evicted whether or not the
 //! manifest names it), `mut_write_keeps_syncing` (a write to a SYNCING block leaves it SYNCING, so the eviction drops the newer content),
 //! `mut_stranded_marked_absent` (a claimed block whose flush and SSD copy both failed is marked NOT_PRESENT: the guest's write is dropped).
 
@@ -67,10 +67,12 @@ pub open spec fn step_spec(p: Phase, e: Event) -> Phase {
 }
 
 /// The phase of a block after `e`. The only way out of SYNCING toward the store is an `Evict` whose manifest covers the block.
-#[cfg(not(any(feature = "mut_evict_uncovered", feature = "mut_write_keeps_syncing", feature = "mut_stranded_marked_absent")))]
+#[cfg(not(any(feature = "mut_evict_before_manifest", feature = "mut_write_keeps_syncing", feature = "mut_stranded_marked_absent")))]
 pub fn step(p: Phase, e: Event) -> (r: Phase)
     ensures
         r == step_spec(p, e),
+        // A block leaves SYNCING for the store only by an eviction whose manifest names the uploaded content.
+        (p is Syncing && r is NotPresent) ==> e == (Event::Evict { covered: true }),
 {
     match (e, p) {
         (Event::Write, _) => Phase::Dirty,
@@ -82,19 +84,21 @@ pub fn step(p: Phase, e: Event) -> (r: Phase)
     }
 }
 
-/// Mutations: `mut_evict_uncovered` evicts a SYNCING block whether or not the manifest names it; `mut_write_keeps_syncing` leaves a SYNCING
+/// Mutations: `mut_evict_before_manifest` evicts a SYNCING block whether or not the manifest names it; `mut_write_keeps_syncing` leaves a SYNCING
 /// block SYNCING when the guest writes it (the eviction then drops the newer content).
-#[cfg(any(feature = "mut_evict_uncovered", feature = "mut_write_keeps_syncing", feature = "mut_stranded_marked_absent"))]
+#[cfg(any(feature = "mut_evict_before_manifest", feature = "mut_write_keeps_syncing", feature = "mut_stranded_marked_absent"))]
 pub fn step(p: Phase, e: Event) -> (r: Phase)
     ensures
         r == step_spec(p, e),
+        // A block leaves SYNCING for the store only by an eviction whose manifest names the uploaded content.
+        (p is Syncing && r is NotPresent) ==> e == (Event::Evict { covered: true }),
 {
     match (e, p) {
         (Event::Stranded, Phase::Syncing) if cfg!(feature = "mut_stranded_marked_absent") => Phase::NotPresent,
         (Event::Write, Phase::Syncing) if cfg!(feature = "mut_write_keeps_syncing") => Phase::Syncing,
         (Event::Write, _) => Phase::Dirty,
         (Event::Claim, Phase::Dirty) => Phase::Syncing,
-        (Event::Evict { covered: _ }, Phase::Syncing) if cfg!(feature = "mut_evict_uncovered") => Phase::NotPresent,
+        (Event::Evict { covered: _ }, Phase::Syncing) if cfg!(feature = "mut_evict_before_manifest") => Phase::NotPresent,
         (Event::Evict { covered: true }, Phase::Syncing) => Phase::NotPresent,
         (Event::Requeue, Phase::Syncing) => Phase::Dirty,
         (Event::Drop, Phase::Clean) => Phase::NotPresent,

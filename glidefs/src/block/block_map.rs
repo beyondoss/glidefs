@@ -1002,7 +1002,7 @@ mod tests {
         assert_eq!(map.get(3), SparseBlockState::DIRTY);
     }
 
-    /// A block leaves SYNCING for the store only once the manifest names it (`flush_kernel::step`; `mut_evict_uncovered` evicts it anyway).
+    /// A block leaves SYNCING for the store only once the manifest names it (`flush_kernel::step`; `mut_evict_before_manifest` evicts it anyway).
     #[test]
     fn an_uncovered_eviction_leaves_the_block_syncing() {
         let map = SparseStateMap::new(8);
